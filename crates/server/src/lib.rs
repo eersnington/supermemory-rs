@@ -64,6 +64,7 @@ fn router_with_port(
     let api = Router::new()
         .route("/documents", post(create_document))
         .route("/documents/{id}", get(get_document))
+        .route("/search", post(v3_search))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     let search = Router::new()
         .route("/search", post(search))
@@ -117,7 +118,7 @@ async fn landing_page(State(state): State<AppState>) -> Response {
     <article class="card"><h2>Search</h2><p>Search completed documents through the V4 endpoint.</p><pre><button class="copy-btn">copy</button><code>curl -X POST http://localhost:{port}/v4/search \
   -H 'Authorization: Bearer {escaped_key}' \
   -H 'Content-Type: application/json' \
-  -d '{{"q":"remember"}}'</code></pre></article>
+  -d '{{"q":"remember","searchMode":"documents"}}'</code></pre></article>
     <article class="card"><h2>Local API key</h2><p>Use this key for SDKs or non-loopback clients.</p><pre><button class="copy-btn">copy</button><code>{escaped_key}</code></pre></article>
   </section>
   <nav><a href="/v4/reference">API reference</a><a href="/v4/openapi">OpenAPI document</a><a href="https://supermemory.ai/docs/self-hosting/overview">Self-hosting docs</a><a href="https://github.com/supermemoryai/supermemory">GitHub</a></nav>
@@ -341,12 +342,277 @@ async fn get_document(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[expect(clippy::struct_excessive_bools, reason = "v0.0.5 wire contract")]
+struct V3SearchRequest {
+    q: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+    #[serde(default)]
+    chunk_threshold: f32,
+    #[serde(default)]
+    document_threshold: f32,
+    container_tag: Option<String>,
+    container_tags: Option<Vec<String>>,
+    doc_id: Option<String>,
+    filters: Option<Value>,
+    #[serde(default)]
+    include_full_docs: bool,
+    #[serde(default)]
+    include_summary: bool,
+    #[serde(default = "default_true", rename = "onlyMatchingChunks")]
+    _only_matching_chunks: bool,
+    #[serde(default)]
+    rerank: bool,
+    #[serde(default)]
+    #[serde(rename = "rewriteQuery")]
+    _rewrite_query: bool,
+    #[serde(rename = "categoriesFilter")]
+    _categories_filter: Option<Vec<String>>,
+    filepath: Option<String>,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V3SearchResponse {
+    results: Vec<V3DocumentResult>,
+    timing: f64,
+    total: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V3DocumentResult {
+    chunks: Vec<V3ChunkResult>,
+    created_at: String,
+    document_id: String,
+    metadata: Option<Map<String, Value>>,
+    score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    title: Option<String>,
+    updated_at: String,
+    #[serde(rename = "type")]
+    document_type: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V3ChunkResult {
+    content: String,
+    is_relevant: bool,
+    score: f64,
+    position: usize,
+}
+
+async fn v3_search(
+    State(state): State<AppState>,
+    Json(request): Json<V3SearchRequest>,
+) -> Result<Json<V3SearchResponse>, ApiError> {
+    let started = std::time::Instant::now();
+    validate_search_basics(&request.q, request.limit, request.chunk_threshold)?;
+    if !request.document_threshold.is_finite() || !(0.0..=1.0).contains(&request.document_threshold)
+    {
+        return Err(ApiError::Validation(
+            "documentThreshold must be between 0 and 1",
+        ));
+    }
+    if request.doc_id.as_ref().is_some_and(|id| id.len() > 255) {
+        return Err(ApiError::Validation("docId must be at most 255 characters"));
+    }
+    validate_container_tag(request.container_tag.as_deref())?;
+    if let Some(tags) = request.container_tags.as_ref() {
+        for tag in tags {
+            validate_container_tag(Some(tag))?;
+        }
+    }
+    let filters = request.filters.as_ref().map(parse_filter).transpose()?;
+    let tags = request.container_tag.map_or_else(
+        || {
+            request
+                .container_tags
+                .unwrap_or_else(|| vec!["sm_project_default".to_owned()])
+        },
+        |tag| vec![tag],
+    );
+    let query = request.q.trim().to_owned();
+    let query_vector = embed_query(state.embeddings.as_ref(), query.clone()).await?;
+    let candidate_limit = if request.rerank {
+        request.limit.max((request.limit * 3).min(30))
+    } else {
+        request.limit
+    };
+    let options = storage::SearchOptions {
+        container_tags: tags,
+        document_id: request.doc_id,
+        filepath: request.filepath,
+        filters,
+    };
+    let storage = Arc::clone(&state.storage);
+    let hits = tokio::task::spawn_blocking(move || {
+        let storage = storage.lock().map_err(|_| ApiError::StorageUnavailable)?;
+        query_vector
+            .map_or_else(
+                || storage.search(&query, candidate_limit),
+                |vector| {
+                    storage.search_semantic(
+                        vector.as_slice(),
+                        "Xenova/bge-base-en-v1.5:q8:mean:normalized",
+                        candidate_limit,
+                        request.chunk_threshold,
+                        &options,
+                    )
+                },
+            )
+            .map_err(ApiError::Storage)
+    })
+    .await
+    .map_err(ApiError::DatabaseExecutor)??;
+    let results = group_v3_results(
+        hits,
+        request.limit,
+        request.include_summary,
+        request.include_full_docs,
+    );
+    let total = results.iter().map(|result| result.chunks.len()).sum();
+    Ok(Json(V3SearchResponse {
+        results,
+        timing: started.elapsed().as_secs_f64() * 1_000.0,
+        total,
+    }))
+}
+
+fn group_v3_results(
+    hits: Vec<storage::SearchHit>,
+    limit: usize,
+    include_summary: bool,
+    include_full_docs: bool,
+) -> Vec<V3DocumentResult> {
+    let mut results: Vec<V3DocumentResult> = Vec::new();
+    for hit in hits.into_iter().take(limit) {
+        let chunk = V3ChunkResult {
+            content: hit.chunk,
+            is_relevant: true,
+            score: hit.score,
+            position: hit.position,
+        };
+        if let Some(existing) = results
+            .iter_mut()
+            .find(|result| result.document_id == hit.document_id)
+        {
+            existing.score = existing.score.max(hit.score);
+            existing.chunks.push(chunk);
+            continue;
+        }
+        let summary = include_summary
+            .then(|| metadata_string(&hit.metadata, "summary"))
+            .flatten();
+        let content = include_full_docs.then_some(hit.document_content);
+        results.push(V3DocumentResult {
+            chunks: vec![chunk],
+            created_at: hit.created_at,
+            document_id: hit.document_id,
+            metadata: Some(hit.metadata.clone()),
+            score: hit.score,
+            summary,
+            content,
+            title: metadata_string(&hit.metadata, "title"),
+            updated_at: hit.updated_at,
+            document_type: metadata_string(&hit.metadata, "type"),
+        });
+    }
+    results
+}
+
+fn metadata_string(metadata: &Map<String, Value>, key: &str) -> Option<String> {
+    metadata.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn validate_search_basics(query: &str, limit: usize, threshold: f32) -> Result<(), ApiError> {
+    if query.trim().is_empty() {
+        return Err(ApiError::Validation("Search query cannot be empty"));
+    }
+    if !(1..=100).contains(&limit) {
+        return Err(ApiError::Validation("limit must be between 1 and 100"));
+    }
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return Err(ApiError::Validation(
+            "chunkThreshold must be between 0 and 1",
+        ));
+    }
+    Ok(())
+}
+
+async fn embed_query(
+    embeddings: Option<&Arc<memory_engine::EmbeddingModel>>,
+    query: String,
+) -> Result<Option<memory_engine::EmbeddingVector>, ApiError> {
+    let Some(embeddings) = embeddings else {
+        return Ok(None);
+    };
+    let embeddings = Arc::clone(embeddings);
+    tokio::task::spawn_blocking(move || embeddings.embed(&[query]))
+        .await
+        .map_err(ApiError::DatabaseExecutor)?
+        .map_err(ApiError::Embedding)?
+        .into_iter()
+        .next()
+        .map(Some)
+        .ok_or(ApiError::EmptyEmbedding)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchRequest {
     q: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
     #[serde(default = "default_search_threshold")]
     threshold: f32,
+    container_tag: Option<String>,
+    filters: Option<Value>,
+    #[serde(default)]
+    include: SearchInclude,
+    #[serde(default)]
+    rerank: bool,
+    #[serde(default)]
+    aggregate: bool,
+    #[serde(default)]
+    #[serde(rename = "rewriteQuery")]
+    _rewrite_query: bool,
+    #[serde(default)]
+    search_mode: SearchMode,
+    filepath: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[expect(clippy::struct_excessive_bools, reason = "v0.0.5 wire contract")]
+struct SearchInclude {
+    #[serde(default, rename = "documents")]
+    _documents: bool,
+    #[serde(default, rename = "summaries")]
+    _summaries: bool,
+    #[serde(default, rename = "relatedMemories")]
+    _related_memories: bool,
+    #[serde(default, rename = "forgottenMemories")]
+    _forgotten_memories: bool,
+    #[serde(default)]
+    chunks: bool,
+}
+
+#[derive(Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum SearchMode {
+    #[default]
+    Memories,
+    Hybrid,
+    Documents,
 }
 
 const fn default_search_limit() -> usize {
@@ -358,14 +624,52 @@ const fn default_search_threshold() -> f32 {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchResponse {
-    results: Vec<storage::SearchHit>,
+    results: Vec<ChunkSearchResult>,
+    timing: f64,
+    total: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChunkSearchResult {
+    id: String,
+    chunk: String,
+    metadata: Option<Map<String, Value>>,
+    filepath: Option<String>,
+    updated_at: String,
+    similarity: f64,
+    version: u8,
+    context: EmptyContext,
+    documents: Vec<SearchDocument>,
+    chunks: Vec<Value>,
+}
+
+#[derive(Serialize)]
+struct EmptyContext {
+    parents: Vec<Value>,
+    children: Vec<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchDocument {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    document_type: Option<String>,
+    metadata: Option<Map<String, Value>>,
+    created_at: String,
+    updated_at: String,
 }
 
 async fn search(
     State(state): State<AppState>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ApiError> {
+    let started = std::time::Instant::now();
     if request.q.trim().is_empty() {
         return Err(ApiError::Validation("q must not be empty"));
     }
@@ -376,6 +680,23 @@ async fn search(
         return Err(ApiError::Validation(
             "threshold must be a finite number between 0 and 1",
         ));
+    }
+    if request.aggregate && request.rerank {
+        return Err(ApiError::AggregateAndRerank);
+    }
+    validate_container_tag(request.container_tag.as_deref())?;
+    let filters = request.filters.as_ref().map(parse_filter).transpose()?;
+    let search_mode = if request.include.chunks && request.search_mode == SearchMode::Memories {
+        SearchMode::Hybrid
+    } else {
+        request.search_mode
+    };
+    if search_mode == SearchMode::Memories {
+        return Ok(Json(SearchResponse {
+            results: Vec::new(),
+            timing: started.elapsed().as_secs_f64() * 1_000.0,
+            total: 0,
+        }));
     }
     let query = request.q.trim().to_owned();
     let query_vector = if let Some(embeddings) = state.embeddings.as_ref() {
@@ -396,17 +717,29 @@ async fn search(
     let storage = Arc::clone(&state.storage);
     let limit = request.limit;
     let threshold = request.threshold;
+    let options = storage::SearchOptions {
+        container_tags: vec![
+            request
+                .container_tag
+                .unwrap_or_else(|| "sm_project_default".to_owned()),
+        ],
+        document_id: None,
+        filepath: request.filepath,
+        filters,
+    };
+    let candidate_limit = limit.saturating_mul(if request.aggregate { 5 } else { 3 });
     let results = tokio::task::spawn_blocking(move || {
         let storage = storage.lock().map_err(|_| ApiError::StorageUnavailable)?;
         query_vector
             .map_or_else(
-                || storage.search(&query, limit),
+                || storage.search(&query, candidate_limit),
                 |vector| {
                     storage.search_semantic(
                         vector.as_slice(),
                         "Xenova/bge-base-en-v1.5:q8:mean:normalized",
-                        limit,
+                        candidate_limit,
                         threshold,
+                        &options,
                     )
                 },
             )
@@ -414,7 +747,180 @@ async fn search(
     })
     .await
     .map_err(ApiError::DatabaseExecutor)??;
-    Ok(Json(SearchResponse { results }))
+    let results: Vec<_> = results
+        .into_iter()
+        .take(limit)
+        .map(chunk_search_result)
+        .collect();
+    let total = results.len();
+    Ok(Json(SearchResponse {
+        results,
+        timing: started.elapsed().as_secs_f64() * 1_000.0,
+        total,
+    }))
+}
+
+fn chunk_search_result(hit: storage::SearchHit) -> ChunkSearchResult {
+    let title = hit
+        .metadata
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let document_type = hit
+        .metadata
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let document = SearchDocument {
+        id: hit.custom_id.unwrap_or_else(|| hit.document_id.clone()),
+        title,
+        document_type,
+        metadata: Some(hit.metadata.clone()),
+        created_at: hit.created_at,
+        updated_at: hit.updated_at.clone(),
+    };
+    ChunkSearchResult {
+        id: hit.id,
+        chunk: hit.chunk,
+        metadata: Some(hit.metadata),
+        filepath: hit.filepath,
+        updated_at: hit.updated_at,
+        similarity: hit.score,
+        version: 1,
+        context: EmptyContext {
+            parents: Vec::new(),
+            children: Vec::new(),
+        },
+        documents: vec![document],
+        chunks: Vec::new(),
+    }
+}
+
+fn validate_container_tag(container_tag: Option<&str>) -> Result<(), ApiError> {
+    if container_tag.is_some_and(|tag| {
+        tag.chars().count() > 100
+            || tag.is_empty()
+            || !tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-'))
+    }) {
+        return Err(ApiError::Validation(
+            "containerTag may only contain up to 100 alphanumeric characters, hyphens, underscores, and colons",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_filter(value: &Value) -> Result<storage::FilterExpression, ApiError> {
+    let parsed = if let Some(value) = value.as_str() {
+        serde_json::from_str(value)
+            .map_err(|_| ApiError::Validation("filters must be valid JSON"))?
+    } else {
+        value.clone()
+    };
+    let mut conditions = 0;
+    parse_filter_at(&parsed, 0, &mut conditions)
+}
+
+fn parse_filter_at(
+    value: &Value,
+    depth: usize,
+    conditions: &mut usize,
+) -> Result<storage::FilterExpression, ApiError> {
+    if depth > 8 {
+        return Err(ApiError::Validation(
+            "filter structure is too complex; use at most 8 nesting levels",
+        ));
+    }
+    let object = value
+        .as_object()
+        .ok_or(ApiError::Validation("invalid filter condition structure"))?;
+    if let Some(values) = object.get("AND").or_else(|| object.get("OR")) {
+        let values = values
+            .as_array()
+            .ok_or(ApiError::Validation("AND and OR filters must be arrays"))?;
+        *conditions = conditions.saturating_add(values.len());
+        if values.len() > 200 || *conditions > 200 {
+            return Err(ApiError::Validation(
+                "too many filter conditions; use at most 200 conditions",
+            ));
+        }
+        let nested = values
+            .iter()
+            .map(|value| parse_filter_at(value, depth + 1, conditions))
+            .collect::<Result<Vec<_>, _>>()?;
+        return if object.contains_key("AND") {
+            Ok(storage::FilterExpression::And(nested))
+        } else {
+            Ok(storage::FilterExpression::Or(nested))
+        };
+    }
+    *conditions = conditions.saturating_add(1);
+    if *conditions > 200 {
+        return Err(ApiError::Validation(
+            "too many filter conditions; use at most 200 conditions",
+        ));
+    }
+    let key = object
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or(ApiError::Validation("filter key must be a string"))?;
+    let value = object
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or(ApiError::Validation("filter value must be a string"))?;
+    let kind = match object
+        .get("filterType")
+        .and_then(Value::as_str)
+        .unwrap_or("metadata")
+    {
+        "metadata" => storage::FilterKind::Metadata,
+        "numeric" => storage::FilterKind::Numeric,
+        "array_contains" => storage::FilterKind::ArrayContains,
+        "string_contains" => storage::FilterKind::StringContains,
+        _ => return Err(ApiError::Validation("invalid filterType")),
+    };
+    if matches!(kind, storage::FilterKind::Numeric)
+        && (value.trim().is_empty() || value.parse::<f64>().is_err())
+    {
+        return Err(ApiError::Validation(
+            "numeric filter value must be a valid number",
+        ));
+    }
+    let numeric_operator = match object
+        .get("numericOperator")
+        .and_then(Value::as_str)
+        .unwrap_or("=")
+    {
+        ">" => storage::NumericOperator::Greater,
+        "<" => storage::NumericOperator::Less,
+        ">=" => storage::NumericOperator::GreaterOrEqual,
+        "<=" => storage::NumericOperator::LessOrEqual,
+        "=" => storage::NumericOperator::Equal,
+        _ => return Err(ApiError::Validation("invalid numericOperator")),
+    };
+    Ok(storage::FilterExpression::Condition(
+        storage::FilterCondition {
+            key: key.to_owned(),
+            value: value.to_owned(),
+            kind,
+            numeric_operator,
+            negate: boolean_field(object.get("negate"))?,
+            ignore_case: boolean_field(object.get("ignoreCase"))?,
+        },
+    ))
+}
+
+fn boolean_field(value: Option<&Value>) -> Result<bool, ApiError> {
+    match value {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::String(value)) if value == "true" => Ok(true),
+        Some(Value::String(value)) if value == "false" => Ok(false),
+        Some(_) => Err(ApiError::Validation(
+            "filter boolean fields must be true or false",
+        )),
+    }
 }
 
 /// Processes at most one queued document, returning whether work was claimed.
@@ -703,6 +1209,8 @@ enum ApiError {
     Embedding(#[source] memory_engine::EmbeddingError),
     #[error("query embedding returned no vector")]
     EmptyEmbedding,
+    #[error("cannot aggregate and rerank the same search")]
+    AggregateAndRerank,
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -719,6 +1227,14 @@ impl IntoResponse for ApiError {
                 StatusCode::NOT_FOUND,
                 Json(ErrorBody {
                     error: "Document not found",
+                    details: None,
+                }),
+            )
+                .into_response(),
+            Self::AggregateAndRerank => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "Cannot use both aggregate and rerank simultaneously",
                     details: None,
                 }),
             )

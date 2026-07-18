@@ -139,7 +139,13 @@ fn normalized_vectors_are_published_and_ranked_exactly() {
         .expect("publish second");
 
     let hits = storage
-        .search_semantic(&[1.0, 0.0], "fixture-model", 10, 0.0)
+        .search_semantic(
+            &[1.0, 0.0],
+            "fixture-model",
+            10,
+            0.0,
+            &storage::SearchOptions::default(),
+        )
         .expect("semantic search");
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].document_id, first.id);

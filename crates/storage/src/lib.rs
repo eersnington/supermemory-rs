@@ -68,6 +68,60 @@ pub struct SearchHit {
     pub document_id: String,
     pub chunk: String,
     pub score: f64,
+    pub position: usize,
+    pub custom_id: Option<String>,
+    pub metadata: Map<String, Value>,
+    pub filepath: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub document_content: String,
+}
+
+/// Organization-local document constraints applied before semantic ranking.
+#[derive(Debug, Clone, Default)]
+pub struct SearchOptions {
+    pub container_tags: Vec<String>,
+    pub document_id: Option<String>,
+    pub filepath: Option<String>,
+    pub filters: Option<FilterExpression>,
+}
+
+/// Boolean metadata filter tree used by V3 and V4 search.
+#[derive(Debug, Clone)]
+pub enum FilterExpression {
+    And(Vec<FilterExpression>),
+    Or(Vec<FilterExpression>),
+    Condition(FilterCondition),
+}
+
+/// One metadata comparison in a search filter.
+#[derive(Debug, Clone)]
+pub struct FilterCondition {
+    pub key: String,
+    pub value: String,
+    pub kind: FilterKind,
+    pub numeric_operator: NumericOperator,
+    pub negate: bool,
+    pub ignore_case: bool,
+}
+
+/// Comparison behavior for a metadata condition.
+#[derive(Debug, Clone, Copy)]
+pub enum FilterKind {
+    Metadata,
+    Numeric,
+    ArrayContains,
+    StringContains,
+}
+
+/// Numeric comparison operator.
+#[derive(Debug, Clone, Copy)]
+pub enum NumericOperator {
+    Greater,
+    Less,
+    GreaterOrEqual,
+    LessOrEqual,
+    Equal,
 }
 
 /// Stored representation returned by the HTTP API.
@@ -409,7 +463,7 @@ impl Storage {
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StorageError> {
         let query = format!("\"{}\"", query.replace('"', "\"\""));
         let mut statement = self.connection.prepare(
-            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, -bm25(document_chunks_fts) FROM document_chunks_fts JOIN document_chunks ON document_chunks.id=document_chunks_fts.rowid JOIN documents ON documents.id=document_chunks.document_id WHERE document_chunks_fts MATCH ?1 AND documents.org_id=?2 AND documents.status='done' ORDER BY bm25(document_chunks_fts), document_chunks.ordinal LIMIT ?3",
+            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, -bm25(document_chunks_fts), document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.content FROM document_chunks_fts JOIN document_chunks ON document_chunks.id=document_chunks_fts.rowid JOIN documents ON documents.id=document_chunks.document_id WHERE document_chunks_fts MATCH ?1 AND documents.org_id=?2 AND documents.status='done' ORDER BY bm25(document_chunks_fts), document_chunks.ordinal LIMIT ?3",
         ).map_err(StorageError::Read)?;
         statement
             .query_map(params![query, self.local_org_id, limit], |row| {
@@ -418,6 +472,13 @@ impl Storage {
                     document_id: row.get(1)?,
                     chunk: row.get(2)?,
                     score: row.get(3)?,
+                    position: row.get(4)?,
+                    custom_id: row.get(5)?,
+                    metadata: parse_json(&row.get::<_, String>(6)?, 6)?,
+                    filepath: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    document_content: row.get(10)?,
                 })
             })
             .map_err(StorageError::Read)?
@@ -435,11 +496,12 @@ impl Storage {
         model_id: &str,
         limit: usize,
         threshold: f32,
+        options: &SearchOptions,
     ) -> Result<Vec<SearchHit>, StorageError> {
         validate_vector(query, query.len())?;
         let dimensions = query.len();
         let mut statement = self.connection.prepare(
-            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, chunk_embeddings.vector, document_chunks.ordinal FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?1 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?3 AND documents.status='done'",
+            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, chunk_embeddings.vector, document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.container_tags, documents.content FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?1 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?3 AND documents.status='done'",
         ).map_err(StorageError::Read)?;
         let rows = statement
             .query_map(params![model_id, dimensions, self.local_org_id], |row| {
@@ -449,12 +511,46 @@ impl Storage {
                     row.get::<_, String>(2)?,
                     row.get::<_, Vec<u8>>(3)?,
                     row.get::<_, usize>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             })
             .map_err(StorageError::Read)?;
         let mut hits = Vec::new();
         for row in rows {
-            let (id, document_id, chunk, bytes, ordinal) = row.map_err(StorageError::Read)?;
+            let (
+                id,
+                document_id,
+                chunk,
+                bytes,
+                ordinal,
+                custom_id,
+                metadata,
+                filepath,
+                created_at,
+                updated_at,
+                container_tags,
+                document_content,
+            ) = row.map_err(StorageError::Read)?;
+            let metadata: Map<String, Value> =
+                serde_json::from_str(&metadata).map_err(StorageError::DeserializeSearchData)?;
+            let container_tags: Vec<String> = serde_json::from_str(&container_tags)
+                .map_err(StorageError::DeserializeSearchData)?;
+            if !matches_search_options(
+                &document_id,
+                custom_id.as_deref(),
+                &container_tags,
+                filepath.as_deref(),
+                &metadata,
+                options,
+            ) {
+                continue;
+            }
             let vector = decode_vector(&bytes, dimensions)?;
             let score: f32 = query
                 .iter()
@@ -468,6 +564,13 @@ impl Storage {
                         document_id,
                         chunk,
                         score: f64::from(score),
+                        position: ordinal,
+                        custom_id,
+                        metadata,
+                        filepath,
+                        created_at,
+                        updated_at,
+                        document_content,
                     },
                     ordinal,
                 ));
@@ -768,6 +871,113 @@ fn decode_vector(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>, StorageErr
     Ok(vector)
 }
 
+fn matches_search_options(
+    document_id: &str,
+    custom_id: Option<&str>,
+    container_tags: &[String],
+    filepath: Option<&str>,
+    metadata: &Map<String, Value>,
+    options: &SearchOptions,
+) -> bool {
+    if options
+        .document_id
+        .as_deref()
+        .is_some_and(|wanted| wanted != document_id && Some(wanted) != custom_id)
+    {
+        return false;
+    }
+    if !options.container_tags.is_empty()
+        && !options
+            .container_tags
+            .iter()
+            .any(|wanted| container_tags.contains(wanted))
+    {
+        return false;
+    }
+    if options.filepath.as_deref().is_some_and(|wanted| {
+        if let Some(prefix) = wanted.strip_suffix('/') {
+            !filepath.is_some_and(|actual| actual.starts_with(prefix))
+        } else {
+            filepath != Some(wanted)
+        }
+    }) {
+        return false;
+    }
+    options
+        .filters
+        .as_ref()
+        .is_none_or(|filter| matches_filter(filter, metadata))
+}
+
+fn matches_filter(filter: &FilterExpression, metadata: &Map<String, Value>) -> bool {
+    match filter {
+        FilterExpression::And(filters) => filters
+            .iter()
+            .all(|filter| matches_filter(filter, metadata)),
+        FilterExpression::Or(filters) => filters
+            .iter()
+            .any(|filter| matches_filter(filter, metadata)),
+        FilterExpression::Condition(condition) => {
+            let matched = metadata
+                .get(&condition.key)
+                .is_some_and(|value| matches_condition(condition, value));
+            matched != condition.negate
+        }
+    }
+}
+
+fn matches_condition(condition: &FilterCondition, value: &Value) -> bool {
+    match condition.kind {
+        FilterKind::Metadata => comparable_text(value)
+            .is_some_and(|actual| equal_text(&actual, &condition.value, condition.ignore_case)),
+        FilterKind::StringContains => comparable_text(value)
+            .is_some_and(|actual| contains_text(&actual, &condition.value, condition.ignore_case)),
+        FilterKind::ArrayContains => value.as_array().is_some_and(|values| {
+            values.iter().any(|value| {
+                comparable_text(value).is_some_and(|actual| {
+                    equal_text(&actual, &condition.value, condition.ignore_case)
+                })
+            })
+        }),
+        FilterKind::Numeric => value.as_f64().is_some_and(|actual| {
+            condition.value.parse::<f64>().ok().is_some_and(|wanted| {
+                match condition.numeric_operator {
+                    NumericOperator::Greater => actual > wanted,
+                    NumericOperator::Less => actual < wanted,
+                    NumericOperator::GreaterOrEqual => actual >= wanted,
+                    NumericOperator::LessOrEqual => actual <= wanted,
+                    NumericOperator::Equal => actual.total_cmp(&wanted).is_eq(),
+                }
+            })
+        }),
+    }
+}
+
+fn comparable_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn equal_text(actual: &str, wanted: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        actual.to_lowercase() == wanted.to_lowercase()
+    } else {
+        actual == wanted
+    }
+}
+
+fn contains_text(actual: &str, wanted: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        actual.to_lowercase().contains(&wanted.to_lowercase())
+    } else {
+        actual.contains(wanted)
+    }
+}
+
 fn merge_metadata(
     existing: &Map<String, Value>,
     incoming: &Map<String, Value>,
@@ -1061,6 +1271,8 @@ pub enum StorageError {
     Read(#[source] rusqlite::Error),
     #[error("failed to serialize document data: {0}")]
     Serialize(#[source] serde_json::Error),
+    #[error("failed to decode stored search metadata; rebuild the affected document: {0}")]
+    DeserializeSearchData(#[source] serde_json::Error),
     #[error("the operating system random source failed; no identifier was generated: {0}")]
     Random(getrandom::Error),
     #[error("embedding dimensions must be greater than zero, found {dimensions}")]

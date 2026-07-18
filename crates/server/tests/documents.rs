@@ -290,13 +290,13 @@ async fn submitted_document_is_processed_and_searchable() {
         Request::post("/v4/search")
             .header("authorization", "Bearer secret")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"q":"kingfisher"}"#))
+            .body(Body::from(r#"{"q":"kingfisher","searchMode":"documents"}"#))
             .expect("request"),
     );
     let response = app.oneshot(search).await.expect("search response");
     assert_eq!(response.status(), StatusCode::OK);
     let searched = body(response).await;
-    assert_eq!(searched["results"][0]["documentId"], id);
+    assert_eq!(searched["results"][0]["documents"][0]["id"], id);
 }
 
 #[tokio::test]
@@ -329,7 +329,15 @@ async fn submitted_document_is_embedded_and_semantically_searchable() {
             Request::post("/v3/documents")
                 .header("authorization", "Bearer secret")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"content": content}).to_string()))
+                .body(Body::from(
+                    json!({
+                        "content": content,
+                        "metadata": {
+                            "topic": if content.contains("sky") { "weather" } else { "database" }
+                        }
+                    })
+                    .to_string(),
+                ))
                 .expect("request"),
         );
         app.clone().oneshot(create).await.expect("create response");
@@ -340,12 +348,33 @@ async fn submitted_document_is_embedded_and_semantically_searchable() {
         );
     }
 
+    let v3_search = remote(
+        Request::post("/v3/search")
+            .header("authorization", "Bearer secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "q": "What color is the sky?",
+                    "chunkThreshold": 0,
+                    "filters": {
+                        "AND": [{"key": "topic", "value": "weather"}]
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+    );
+    let v3 = body(app.clone().oneshot(v3_search).await.expect("v3 search")).await;
+    assert_eq!(v3["results"].as_array().map(Vec::len), Some(1));
+    assert_eq!(v3["results"][0]["chunks"][0]["isRelevant"], true);
+    assert_eq!(v3["total"], 1);
+
     let search = remote(
         Request::post("/v4/search")
             .header("authorization", "Bearer secret")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"q":"What color is the sky?","threshold":0}"#,
+                r#"{"q":"What color is the sky?","threshold":0,"searchMode":"documents"}"#,
             ))
             .expect("request"),
     );
@@ -354,4 +383,14 @@ async fn submitted_document_is_embedded_and_semantically_searchable() {
         searched["results"][0]["chunk"],
         "The sky is blue on a clear day."
     );
+}
+
+#[tokio::test]
+async fn v4_defaults_to_memory_results_instead_of_document_chunks() {
+    let response = request("POST", "/v4/search", json!({"q":"anything"}), true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = body(response).await;
+    assert_eq!(response["results"], json!([]));
+    assert_eq!(response["total"], 0);
+    assert!(response["timing"].is_number());
 }
