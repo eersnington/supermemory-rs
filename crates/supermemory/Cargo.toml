@@ -10,9 +10,13 @@ name = "supermemory-rs"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm.workspace = true
 clap.workspace = true
+getrandom.workspace = true
 memory-engine = { path = "../memory-engine" }
+pbkdf2.workspace = true
 server = { path = "../server" }
+sha2.workspace = true
 storage = { path = "../storage" }
 thiserror.workspace = true
 tokio.workspace = true

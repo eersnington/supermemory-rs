@@ -1,5 +1,7 @@
 //! Application configuration and startup.
 
+pub mod credentials;
+
 use std::{
     fs::OpenOptions,
     io::{self, IsTerminal, Write},
@@ -95,6 +97,20 @@ async fn start(config: Config) -> Result<(), StartupError> {
         .ok()
         .filter(|key| !key.is_empty())
         .map_or_else(|| load_or_create_api_key(data_dir), Ok)?;
+    let legacy_data_dir = std::env::var_os("HOME").map_or_else(
+        || PathBuf::from(".supermemory"),
+        |home| PathBuf::from(home).join(".supermemory"),
+    );
+    let provider_values = credentials::load_or_import(data_dir, &legacy_data_dir)?;
+    let provider_config = memory_engine::ProviderConfig::from_values(|key| {
+        std::env::var(key)
+            .ok()
+            .or_else(|| provider_values.get(key).cloned())
+    });
+    let provider = provider_config
+        .map(memory_engine::MemoryProvider::new)
+        .transpose()?
+        .map(std::sync::Arc::new);
 
     let database = config.database.clone();
     let database_started = Instant::now();
@@ -123,15 +139,23 @@ async fn start(config: Config) -> Result<(), StartupError> {
         "BGE 768d ready",
         model_started.elapsed(),
     );
+    if let Some(provider) = provider.as_ref() {
+        print_success(
+            "memory provider",
+            provider.kind().as_str(),
+            model_started.elapsed(),
+        );
+    }
     print_step("http server", &format!("port {}", config.bind.port()));
     let address = config.bind;
     let database = config.database.clone();
     let displayed_api_key = api_key.clone();
-    server::serve_with_embeddings_ready(
+    server::serve_with_services_ready(
         address,
         Some(api_key),
         storage,
         Some(embeddings),
+        provider,
         move || {
             print_success(
                 "http server",
@@ -337,6 +361,10 @@ pub enum StartupError {
     ModelExecutor(#[source] tokio::task::JoinError),
     #[error(transparent)]
     Embedding(#[from] memory_engine::EmbeddingError),
+    #[error(transparent)]
+    Credentials(#[from] credentials::CredentialError),
+    #[error(transparent)]
+    Provider(#[from] memory_engine::ProviderError),
     #[error(transparent)]
     Server(#[from] server::ServerError),
 }

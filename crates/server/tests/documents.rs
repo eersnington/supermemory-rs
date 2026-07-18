@@ -290,13 +290,18 @@ async fn submitted_document_is_processed_and_searchable() {
         Request::post("/v4/search")
             .header("authorization", "Bearer secret")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"q":"kingfisher","searchMode":"documents"}"#))
+            .body(Body::from(
+                r#"{"q":"kingfisher","searchMode":"documents","threshold":0}"#,
+            ))
             .expect("request"),
     );
     let response = app.oneshot(search).await.expect("search response");
     assert_eq!(response.status(), StatusCode::OK);
     let searched = body(response).await;
-    assert_eq!(searched["results"][0]["documents"][0]["id"], id);
+    assert_eq!(
+        searched["results"][0]["documents"][0]["id"], id,
+        "{searched}"
+    );
 }
 
 #[tokio::test]

@@ -2,11 +2,16 @@
 
 mod chunking;
 mod embedding;
+mod provider;
 
 pub use chunking::{
     ChunkingError, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, chunk_text, normalize_extracted_text,
 };
 pub use embedding::{BGE_DIMENSIONS, EmbeddingError, EmbeddingModel, EmbeddingVector};
+pub use provider::{
+    MemoryCandidate, MemoryProvider, ParentRelation, ProviderConfig, ProviderError, ProviderKind,
+    RelationKind, TemporalContext,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
