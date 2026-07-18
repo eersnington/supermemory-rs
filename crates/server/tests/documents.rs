@@ -63,6 +63,36 @@ async fn health_is_public() {
 }
 
 #[tokio::test]
+async fn landing_page_exposes_local_examples_without_caching_the_key() {
+    let response = request("GET", "/", json!({}), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let html = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("HTML");
+    assert!(html.contains("supermemory<span>-RS</span>"));
+    assert!(html.contains("Bearer secret"));
+    assert!(html.contains("/v4/reference"));
+}
+
+#[tokio::test]
+async fn openapi_and_reference_are_public() {
+    let openapi = request("GET", "/v4/openapi", json!({}), false).await;
+    assert_eq!(openapi.status(), StatusCode::OK);
+    assert_eq!(body(openapi).await["openapi"], "3.1.0");
+    assert_eq!(
+        request("GET", "/v4/reference", json!({}), false)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn post_rejects_missing_credentials_with_details() {
     let response = request("POST", "/v3/documents", json!({"content":"x"}), false).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

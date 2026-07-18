@@ -114,6 +114,12 @@ impl Storage {
         })
     }
 
+    /// Returns the organization used for local unauthenticated requests.
+    #[must_use]
+    pub fn local_organization_id(&self) -> &str {
+        &self.local_org_id
+    }
+
     /// Sanitizes, identifies, updates, and if needed queues a document atomically.
     ///
     /// # Errors

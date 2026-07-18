@@ -1,6 +1,7 @@
 //! Application configuration and startup.
 
 use std::{
+    fs::OpenOptions,
     io::{self, IsTerminal, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -59,16 +60,17 @@ async fn start(config: Config) -> Result<(), StartupError> {
     init_tracing()?;
     let boot = Instant::now();
     print_banner();
-    let api_key = std::env::var("SUPERMEMORY_API_KEY")
-        .ok()
-        .filter(|key| !key.is_empty());
-
     if let Some(parent) = config.database.parent() {
         std::fs::create_dir_all(parent).map_err(|source| StartupError::CreateDataDirectory {
             path: parent.to_path_buf(),
             source,
         })?;
     }
+    let data_dir = config.database.parent().unwrap_or_else(|| Path::new("."));
+    let api_key = std::env::var("SUPERMEMORY_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .map_or_else(|| load_or_create_api_key(data_dir), Ok)?;
 
     let database = config.database.clone();
     let database_started = Instant::now();
@@ -79,22 +81,65 @@ async fn start(config: Config) -> Result<(), StartupError> {
     let storage = tokio::task::spawn_blocking(move || storage::Storage::open(database))
         .await
         .map_err(StartupError::DatabaseExecutor)??;
+    let organization_id = storage.local_organization_id().to_owned();
     let storage = std::sync::Arc::new(std::sync::Mutex::new(storage));
     print_success("local SQLite storage", "ready", database_started.elapsed());
     print_step("http server", &format!("port {}", config.bind.port()));
     let address = config.bind;
     let database = config.database.clone();
-    let has_api_key = api_key.is_some();
-    server::serve_with_ready(address, api_key, storage, move || {
+    let displayed_api_key = api_key.clone();
+    server::serve_with_ready(address, Some(api_key), storage, move || {
         print_success(
             "http server",
             &format!("listening on http://localhost:{}", address.port()),
             boot.elapsed(),
         );
-        print_ready(address.port(), &database, has_api_key, boot.elapsed());
+        print_ready(
+            address.port(),
+            &database,
+            &displayed_api_key,
+            &organization_id,
+            boot.elapsed(),
+        );
     })
     .await?;
     Ok(())
+}
+
+fn load_or_create_api_key(data_dir: &Path) -> Result<String, StartupError> {
+    let path = data_dir.join("api-key");
+    match std::fs::read_to_string(&path) {
+        Ok(value) if !value.trim().is_empty() => return Ok(value.trim().to_owned()),
+        Ok(_) => return Err(StartupError::EmptyApiKeyFile { path }),
+        Err(source) if source.kind() != io::ErrorKind::NotFound => {
+            return Err(StartupError::ReadApiKey { path, source });
+        }
+        Err(_) => {}
+    }
+
+    let key = format!("sm_{}{}", storage::generate_id()?, storage::generate_id()?);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            writeln!(file, "{key}").map_err(|source| StartupError::WriteApiKey {
+                path: path.clone(),
+                source,
+            })?;
+            Ok(key)
+        }
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            std::fs::read_to_string(&path)
+                .map(|value| value.trim().to_owned())
+                .map_err(|source| StartupError::ReadApiKey { path, source })
+        }
+        Err(source) => Err(StartupError::WriteApiKey { path, source }),
+    }
 }
 
 fn init_tracing() -> Result<(), StartupError> {
@@ -151,46 +196,54 @@ fn print_success(label: &str, detail: &str, elapsed: std::time::Duration) {
     }
 }
 
-fn print_ready(port: u16, database: &Path, has_api_key: bool, elapsed: std::time::Duration) {
+fn print_ready(
+    port: u16,
+    database: &Path,
+    api_key: &str,
+    organization_id: &str,
+    elapsed: std::time::Duration,
+) {
     if !io::stdout().is_terminal() {
         return;
     }
-    let mut rows = vec![
+    let rows = vec![
         ("url", format!("http://localhost:{port}")),
         ("database", format!("local SQLite ({})", database.display())),
         ("search", "SQLite FTS5".to_owned()),
         ("workflow", "durable local worker".to_owned()),
+        ("api key", api_key.to_owned()),
+        ("org id", organization_id.to_owned()),
         ("boot", format_duration(elapsed)),
     ];
-    if has_api_key {
-        rows.insert(4, ("auth", "loopback + bearer API key".to_owned()));
-    }
     let label_width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
-    let content_width = rows
+    let line_width = rows
         .iter()
-        .map(|(_, value)| label_width + value.len() + 4)
+        .map(|(_, value)| label_width + value.len() + 2)
         .chain([19])
         .max()
         .unwrap_or(19);
-    let horizontal = "─".repeat(content_width + 4);
+    let horizontal = "─".repeat(line_width + 4);
     println!("\n\x1b[38;5;81m╭{horizontal}╮{RESET}");
+    let title = "→ supermemory ready";
     println!(
-        "\x1b[38;5;81m│{RESET}  \x1b[38;5;45m→{RESET} {BOLD}\x1b[38;5;45msupermemory ready{RESET}{}\x1b[38;5;81m│{RESET}",
-        " ".repeat(content_width.saturating_sub(18))
+        "\x1b[38;5;81m│{RESET}  \x1b[38;5;45m→{RESET} {BOLD}\x1b[38;5;45msupermemory ready{RESET}{}  \x1b[38;5;81m│{RESET}",
+        " ".repeat(line_width.saturating_sub(title.len()))
     );
     println!(
         "\x1b[38;5;81m│{RESET}{}\x1b[38;5;81m│{RESET}",
-        " ".repeat(content_width + 4)
+        " ".repeat(line_width + 4)
     );
     for (label, value) in rows {
-        let row = format!("  {label:>label_width$}  {BOLD}{value}{RESET}");
-        let visible = label_width + value.len() + 4;
+        let visible = label_width + value.len() + 2;
         println!(
-            "\x1b[38;5;81m│{RESET}{row}{}  \x1b[38;5;81m│{RESET}",
-            " ".repeat(content_width.saturating_sub(visible))
+            "\x1b[38;5;81m│{RESET}  {DIM}{label:>label_width$}{RESET}  {BOLD}{value}{RESET}{}  \x1b[38;5;81m│{RESET}",
+            " ".repeat(line_width.saturating_sub(visible))
         );
     }
     println!("\x1b[38;5;81m╰{horizontal}╯{RESET}\n");
+    println!(
+        "  {DIM}the api key above is auto-applied for unauthenticated localhost requests.{RESET}\n"
+    );
     let _ = io::stdout().flush();
 }
 
@@ -210,6 +263,20 @@ fn format_duration(duration: std::time::Duration) -> String {
 pub enum StartupError {
     #[error("failed to create data directory {path}: {source}")]
     CreateDataDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("local API key file {path} is empty; remove it to generate a replacement")]
+    EmptyApiKeyFile { path: PathBuf },
+    #[error("failed to read local API key from {path}; existing data was not modified: {source}")]
+    ReadApiKey {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to securely create local API key at {path}: {source}")]
+    WriteApiKey {
         path: PathBuf,
         #[source]
         source: std::io::Error,
