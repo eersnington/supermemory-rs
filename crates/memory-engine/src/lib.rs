@@ -1,5 +1,11 @@
 //! Core document lifecycle types and invariants.
 
+mod chunking;
+
+pub use chunking::{
+    ChunkingError, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, chunk_text, normalize_extracted_text,
+};
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

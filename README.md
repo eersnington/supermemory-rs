@@ -6,15 +6,29 @@ Development follows the [semantic porting guidelines](docs/semantic-porting.md):
 
 ## Current status
 
-The executable currently serves public `GET /health` plus `POST /v3/documents` and `GET /v3/documents/:id`. Documents are scoped to a generated, persisted local organization. Creation implements v0.0.5-compatible content sanitization, SHA-1 duplicate identity, organization/container-scoped custom IDs, and atomic upsert/job behavior. Ordered schema migrations are tracked in `schema_migrations`.
+The executable currently serves public `GET /health`, document creation and lookup under `/v3/documents`, and provisional lexical search at `POST /v4/search`. Documents are scoped to a generated, persisted local organization. A durable worker processes queued documents into a SQLite FTS5 index, and interrupted jobs are recovered when the process restarts. Creation implements v0.0.5-compatible content sanitization, SHA-1 duplicate identity, organization/container-scoped custom IDs, and atomic upsert/job behavior. Ordered schema migrations are tracked in `schema_migrations`.
 
-Start it with a private bearer key in the environment:
+Start it directly for loopback-only access:
 
 ```sh
-SUPERMEMORY_API_KEY=replace-with-a-private-key cargo run -p supermemory
+supermemory-rs
 ```
 
-The default address is `127.0.0.1:6767`. Processing workers, search, retrieval-quality parity, and the generated-key setup wizard are not implemented.
+Set `SUPERMEMORY_API_KEY` only when non-loopback clients need bearer authentication.
+
+The default address is `127.0.0.1:6767`. Processing now uses the recovered v0.0.5 chunk-size limits, extraction normalization, Markdown detection, heading sections, UTF-16 length accounting, recursive word splitting, overlap, and short-chunk merging. Specialized Markdown table/code splitting and exact Compromise sentence boundaries still need parity fixtures. Embeddings, memory extraction, retrieval-quality parity, and the generated-key setup wizard are not implemented yet.
+
+Submit and search a document:
+
+```sh
+curl -X POST http://127.0.0.1:6767/v3/documents \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"A distinctive kingfisher observation"}'
+
+curl -X POST http://127.0.0.1:6767/v4/search \
+  -H 'Content-Type: application/json' \
+  -d '{"q":"kingfisher","limit":10}'
+```
 
 Requests normally require the configured bearer key. For local development compatibility, requests with no `Authorization` or session cookie automatically use the local identity only when the TCP peer address is IPv4 or IPv6 loopback. Supplying an invalid bearer key still fails. When using a reverse proxy, requests are authenticated as connections from the proxy; do not run an unauthenticated proxy on the same host.
 

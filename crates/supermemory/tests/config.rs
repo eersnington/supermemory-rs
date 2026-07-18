@@ -31,6 +31,12 @@ fn config_uses_compatibility_default_port() {
 }
 
 #[test]
+fn config_uses_stable_per_user_database_by_default() {
+    let config = Config::try_parse_from(["supermemory-rs"]).expect("config");
+    assert!(config.database.ends_with(".supermemory-rs/supermemory.db"));
+}
+
+#[test]
 fn config_does_not_expose_api_key_argument() {
     assert!(Config::try_parse_from(["supermemory", "--api-key", "secret"]).is_err());
 }

@@ -8,7 +8,13 @@ use serde_json::{Map, Value};
 use sha1::{Digest, Sha1};
 use thiserror::Error;
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../../../migrations/0001_initial.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../../../migrations/0001_initial.sql")),
+    (
+        2,
+        include_str!("../../../migrations/0002_searchable_chunks.sql"),
+    ),
+];
 const BASE58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const LOCAL_SLUG: &str = "local";
 
@@ -32,6 +38,23 @@ pub struct UpsertResult {
     pub id: String,
     pub status: String,
     pub enqueued: bool,
+}
+
+/// A claimed document job whose processing happens outside the database lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedJob {
+    pub id: String,
+    pub document_id: String,
+    pub content: String,
+}
+
+/// A full-text search result.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub document_id: String,
+    pub chunk: String,
+    pub score: f64,
 }
 
 /// Stored representation returned by the HTTP API.
@@ -135,6 +158,131 @@ impl Storage {
             identifier,
         )?
         .map(|found| found.document))
+    }
+
+    /// Atomically claims the oldest available document job.
+    ///
+    /// # Errors
+    /// Returns an error if the claim transaction cannot be read, written, or committed.
+    pub fn claim_job(&mut self) -> Result<Option<ClaimedJob>, StorageError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StorageError::Write)?;
+        let job = tx
+            .query_row(
+                "SELECT jobs.id, documents.id, documents.content FROM jobs JOIN documents ON documents.id=jobs.document_id WHERE jobs.status='queued' AND jobs.available_at <= CURRENT_TIMESTAMP ORDER BY jobs.created_at, jobs.rowid LIMIT 1",
+                [],
+                |row| Ok(ClaimedJob { id: row.get(0)?, document_id: row.get(1)?, content: row.get(2)? }),
+            )
+            .optional()
+            .map_err(StorageError::Read)?;
+        let Some(job) = job else {
+            tx.commit().map_err(StorageError::Write)?;
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE jobs SET status='extracting', attempts=attempts+1, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND status='queued'",
+            [&job.id],
+        )
+        .map_err(StorageError::Write)?;
+        tx.execute(
+            "UPDATE documents SET status='extracting', updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            [&job.document_id],
+        )
+        .map_err(StorageError::Write)?;
+        tx.commit().map_err(StorageError::Write)?;
+        Ok(Some(job))
+    }
+
+    /// Replaces a document's searchable chunks and completes its claimed job atomically.
+    ///
+    /// # Errors
+    /// Returns an error if searchable content or lifecycle state cannot be persisted.
+    pub fn complete_job(
+        &mut self,
+        job: &ClaimedJob,
+        chunks: &[String],
+    ) -> Result<(), StorageError> {
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        tx.execute(
+            "DELETE FROM document_chunks WHERE document_id=?1",
+            [&job.document_id],
+        )
+        .map_err(StorageError::Write)?;
+        for (ordinal, content) in chunks.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO document_chunks (document_id, ordinal, content) VALUES (?1, ?2, ?3)",
+                params![job.document_id, ordinal, content],
+            )
+            .map_err(StorageError::Write)?;
+        }
+        tx.execute(
+            "UPDATE jobs SET status='done', last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND status='extracting'",
+            [&job.id],
+        )
+        .map_err(StorageError::Write)?;
+        tx.execute(
+            "UPDATE documents SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            [&job.document_id],
+        )
+        .map_err(StorageError::Write)?;
+        tx.commit().map_err(StorageError::Write)
+    }
+
+    /// Marks a claimed job and its document failed while preserving prior indexed content.
+    ///
+    /// # Errors
+    /// Returns an error if the failure state cannot be persisted atomically.
+    pub fn fail_job(&mut self, job: &ClaimedJob, error: &str) -> Result<(), StorageError> {
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        tx.execute(
+            "UPDATE jobs SET status='failed', last_error=?2, updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            params![job.id, error],
+        )
+        .map_err(StorageError::Write)?;
+        tx.execute(
+            "UPDATE documents SET status='failed', updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            [&job.document_id],
+        )
+        .map_err(StorageError::Write)?;
+        tx.commit().map_err(StorageError::Write)
+    }
+
+    /// Deletes a claimed document whose extracted content produced no chunks.
+    ///
+    /// # Errors
+    /// Returns an error if the document cleanup transaction cannot be committed.
+    pub fn delete_empty_document(&mut self, job: &ClaimedJob) -> Result<(), StorageError> {
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        tx.execute(
+            "DELETE FROM documents WHERE id=?1 AND status='extracting'",
+            [&job.document_id],
+        )
+        .map_err(StorageError::Write)?;
+        tx.commit().map_err(StorageError::Write)
+    }
+
+    /// Searches completed local documents using `SQLite` FTS5 relevance.
+    ///
+    /// # Errors
+    /// Returns an error if the search query cannot be executed or decoded.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StorageError> {
+        let query = format!("\"{}\"", query.replace('"', "\"\""));
+        let mut statement = self.connection.prepare(
+            "SELECT documents.id, document_chunks.content, -bm25(document_chunks_fts) FROM document_chunks_fts JOIN document_chunks ON document_chunks.id=document_chunks_fts.rowid JOIN documents ON documents.id=document_chunks.document_id WHERE document_chunks_fts MATCH ?1 AND documents.org_id=?2 AND documents.status='done' ORDER BY bm25(document_chunks_fts), document_chunks.ordinal LIMIT ?3",
+        ).map_err(StorageError::Read)?;
+        statement
+            .query_map(params![query, self.local_org_id, limit], |row| {
+                Ok(SearchHit {
+                    document_id: row.get(0)?,
+                    chunk: row.get(1)?,
+                    score: row.get(2)?,
+                })
+            })
+            .map_err(StorageError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Read)
     }
 
     /// Returns the current migration version.
@@ -485,6 +633,11 @@ fn initialize(connection: &mut Connection) -> Result<String, StorageError> {
     )?;
     validate_columns(
         &tx,
+        "document_chunks",
+        &["id", "document_id", "ordinal", "content"],
+    )?;
+    validate_columns(
+        &tx,
         "jobs",
         &[
             "id",
@@ -517,6 +670,16 @@ fn initialize(connection: &mut Connection) -> Result<String, StorageError> {
         .map_err(StorageError::Migrate)?;
         id
     };
+    tx.execute(
+        "UPDATE jobs SET status='queued', available_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE status IN ('extracting','chunking','embedding','indexing')",
+        [],
+    )
+    .map_err(StorageError::Migrate)?;
+    tx.execute(
+        "UPDATE documents SET status='queued', updated_at=CURRENT_TIMESTAMP WHERE id IN (SELECT document_id FROM jobs WHERE status='queued') AND status IN ('extracting','chunking','embedding','indexing')",
+        [],
+    )
+    .map_err(StorageError::Migrate)?;
     tx.commit().map_err(StorageError::Migrate)?;
     Ok(org_id)
 }

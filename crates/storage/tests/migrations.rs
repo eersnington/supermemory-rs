@@ -46,7 +46,7 @@ fn concurrent_file_open_serializes_migration_and_seed() {
         .into_iter()
         .map(|handle| handle.join().expect("thread").expect("open"))
         .collect();
-    assert!(versions.iter().all(|version| *version == 1));
+    assert!(versions.iter().all(|version| *version == 2));
 
     let connection = Connection::open(&path).expect("inspect migrated database");
     let organizations = connection

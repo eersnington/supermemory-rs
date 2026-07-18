@@ -9,13 +9,13 @@ use axum::{
     response::Response,
 };
 use serde_json::{Value, json};
-use server::{SharedStorage, router};
+use server::{SharedStorage, process_next_job, router};
 use storage::Storage;
 use tower::ServiceExt;
 
 fn app() -> axum::Router {
     let storage: SharedStorage = Arc::new(Mutex::new(Storage::in_memory().expect("storage")));
-    router("secret".to_owned(), storage)
+    router(Some("secret".to_owned()), storage)
 }
 
 fn with_peer(mut request: Request<Body>, peer: SocketAddr) -> Request<Body> {
@@ -101,6 +101,37 @@ async fn localhost_without_authentication_material_uses_local_identity() {
             StatusCode::OK
         );
     }
+}
+
+#[tokio::test]
+async fn server_without_api_key_remains_loopback_only() {
+    let storage: SharedStorage = Arc::new(Mutex::new(Storage::in_memory().expect("storage")));
+    let app = router(None, storage);
+    let local = Request::post("/v3/documents")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"content":"local"}"#))
+        .expect("request");
+    assert_eq!(
+        app.clone()
+            .oneshot(with_peer(local, SocketAddr::from(([127, 0, 0, 1], 1234))))
+            .await
+            .expect("response")
+            .status(),
+        StatusCode::OK
+    );
+
+    let remote_request = Request::post("/v3/documents")
+        .header("authorization", "Bearer arbitrary")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"content":"remote"}"#))
+        .expect("request");
+    assert_eq!(
+        app.oneshot(remote(remote_request))
+            .await
+            .expect("response")
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
@@ -200,4 +231,35 @@ async fn get_returns_contract_not_found_body() {
     let response = request("GET", "/v3/documents/missing", json!({}), true).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(body(response).await, json!({"error":"Document not found"}));
+}
+
+#[tokio::test]
+async fn submitted_document_is_processed_and_searchable() {
+    let storage: SharedStorage = Arc::new(Mutex::new(Storage::in_memory().expect("storage")));
+    let app = router(Some("secret".to_owned()), Arc::clone(&storage));
+    let create = remote(
+        Request::post("/v3/documents")
+            .header("authorization", "Bearer secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"content":"A distinctive kingfisher observation"}"#,
+            ))
+            .expect("request"),
+    );
+    let created = body(app.clone().oneshot(create).await.expect("create response")).await;
+    let id = created["id"].as_str().expect("document id");
+
+    assert!(process_next_job(storage).await.expect("worker"));
+
+    let search = remote(
+        Request::post("/v4/search")
+            .header("authorization", "Bearer secret")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"q":"kingfisher"}"#))
+            .expect("request"),
+    );
+    let response = app.oneshot(search).await.expect("search response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let searched = body(response).await;
+    assert_eq!(searched["results"][0]["documentId"], id);
 }

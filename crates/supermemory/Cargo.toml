@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "supermemory-rs"
+path = "src/main.rs"
+
 [dependencies]
 clap.workspace = true
 server = { path = "../server" }

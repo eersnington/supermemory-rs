@@ -20,29 +20,34 @@ use storage::{Storage, UpsertDocument};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::time::{Duration, sleep};
 
 /// Safely shared application storage.
 pub type SharedStorage = Arc<Mutex<Storage>>;
 
 #[derive(Clone)]
 struct AppState {
-    api_key_hash: [u8; 32],
+    api_key_hash: Option<[u8; 32]>,
     storage: SharedStorage,
 }
 
 /// Builds the complete HTTP application.
-pub fn router(api_key: String, storage: SharedStorage) -> Router {
+pub fn router(api_key: Option<String>, storage: SharedStorage) -> Router {
     let state = AppState {
-        api_key_hash: Sha256::digest(api_key).into(),
+        api_key_hash: api_key.map(|key| Sha256::digest(key).into()),
         storage,
     };
     let api = Router::new()
         .route("/documents", post(create_document))
         .route("/documents/{id}", get(get_document))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
+    let search = Router::new()
+        .route("/search", post(search))
+        .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
         .route("/health", get(health))
         .nest("/v3", api)
+        .nest("/v4", search)
         .with_state(state)
 }
 
@@ -53,19 +58,36 @@ pub fn router(api_key: String, storage: SharedStorage) -> Router {
 /// Returns an error if the address cannot be bound or the HTTP server stops unexpectedly.
 pub async fn serve(
     address: SocketAddr,
-    api_key: String,
+    api_key: Option<String>,
     storage: SharedStorage,
+) -> Result<(), ServerError> {
+    serve_with_ready(address, api_key, storage, || {}).await
+}
+
+/// Serves the application and invokes `ready` after successfully binding the listener.
+///
+/// # Errors
+/// Returns an error if the address cannot be bound or the HTTP server stops unexpectedly.
+pub async fn serve_with_ready(
+    address: SocketAddr,
+    api_key: Option<String>,
+    storage: SharedStorage,
+    ready: impl FnOnce(),
 ) -> Result<(), ServerError> {
     let listener = TcpListener::bind(address)
         .await
         .map_err(|source| ServerError::Bind { address, source })?;
-    axum::serve(
+    ready();
+    let worker = tokio::spawn(worker_loop(Arc::clone(&storage)));
+    let result = axum::serve(
         listener,
         router(api_key, storage).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
-    .map_err(ServerError::Serve)
+    .map_err(ServerError::Serve);
+    worker.abort();
+    result
 }
 
 async fn health() -> Json<Health> {
@@ -192,6 +214,131 @@ async fn get_document(
     .ok_or(ApiError::NotFound)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchRequest {
+    q: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+const fn default_search_limit() -> usize {
+    10
+}
+
+#[derive(Serialize)]
+struct SearchResponse {
+    results: Vec<storage::SearchHit>,
+}
+
+async fn search(
+    State(state): State<AppState>,
+    Json(request): Json<SearchRequest>,
+) -> Result<Json<SearchResponse>, ApiError> {
+    if request.q.trim().is_empty() {
+        return Err(ApiError::Validation("q must not be empty"));
+    }
+    if !(1..=100).contains(&request.limit) {
+        return Err(ApiError::Validation("limit must be between 1 and 100"));
+    }
+    let storage = Arc::clone(&state.storage);
+    let query = request.q;
+    let limit = request.limit;
+    let results = tokio::task::spawn_blocking(move || {
+        storage
+            .lock()
+            .map_err(|_| ApiError::StorageUnavailable)?
+            .search(query.trim(), limit)
+            .map_err(ApiError::Storage)
+    })
+    .await
+    .map_err(ApiError::DatabaseExecutor)??;
+    Ok(Json(SearchResponse { results }))
+}
+
+/// Processes at most one queued document, returning whether work was claimed.
+///
+/// # Errors
+/// Returns an error if the storage lock is poisoned or a database operation fails.
+pub async fn process_next_job(storage: SharedStorage) -> Result<bool, WorkerError> {
+    let job = tokio::task::spawn_blocking({
+        let storage = Arc::clone(&storage);
+        move || {
+            storage
+                .lock()
+                .map_err(|_| WorkerError::StorageUnavailable)?
+                .claim_job()
+                .map_err(WorkerError::Storage)
+        }
+    })
+    .await
+    .map_err(WorkerError::Executor)??;
+    let Some(job) = job else {
+        return Ok(false);
+    };
+
+    let chunks = match memory_engine::chunk_text(&job.content, None) {
+        Ok(chunks) => chunks,
+        Err(error) => {
+            let message = error.to_string();
+            persist_job_failure(Arc::clone(&storage), job.clone(), message).await?;
+            return Err(WorkerError::Chunking(error));
+        }
+    };
+    if chunks.is_empty() {
+        tokio::task::spawn_blocking(move || {
+            storage
+                .lock()
+                .map_err(|_| WorkerError::StorageUnavailable)?
+                .delete_empty_document(&job)
+                .map_err(WorkerError::Storage)
+        })
+        .await
+        .map_err(WorkerError::Executor)??;
+        return Ok(true);
+    }
+    tokio::task::spawn_blocking(move || {
+        storage
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?
+            .complete_job(&job, &chunks)
+            .map_err(WorkerError::Storage)
+    })
+    .await
+    .map_err(WorkerError::Executor)??;
+    Ok(true)
+}
+
+async fn persist_job_failure(
+    storage: SharedStorage,
+    job: storage::ClaimedJob,
+    message: String,
+) -> Result<(), WorkerError> {
+    tokio::task::spawn_blocking(move || {
+        storage
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?
+            .fail_job(&job, &message)
+            .map_err(WorkerError::Storage)
+    })
+    .await
+    .map_err(WorkerError::Executor)??;
+    Ok(())
+}
+
+async fn worker_loop(storage: SharedStorage) {
+    loop {
+        match process_next_job(Arc::clone(&storage)).await {
+            Ok(true) => {}
+            Ok(false) => sleep(Duration::from_millis(100)).await,
+            Err(error) => {
+                tracing::error!(%error, "document worker failed; retrying");
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 fn validate_request(request: &CreateDocumentRequest) -> Result<(), ApiError> {
     if request.content.trim().is_empty() {
         return Err(ApiError::Validation("content must not be empty"));
@@ -253,10 +400,12 @@ async fn authenticate(
         .get(http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    let valid = supplied.is_some_and(|key| {
-        let supplied_hash: [u8; 32] = Sha256::digest(key).into();
-        bool::from(supplied_hash.ct_eq(&state.api_key_hash))
-    });
+    let valid = supplied
+        .zip(state.api_key_hash.as_ref())
+        .is_some_and(|(key, expected)| {
+            let supplied_hash: [u8; 32] = Sha256::digest(key).into();
+            bool::from(supplied_hash.ct_eq(expected))
+        });
     let has_session_material = request.headers().contains_key(http::header::COOKIE);
     if valid || (supplied.is_none() && !has_session_material && peer.ip().is_loopback()) {
         Ok(next.run(request).await)
@@ -358,4 +507,17 @@ pub enum ServerError {
     },
     #[error("the HTTP server stopped unexpectedly: {0}")]
     Serve(#[source] std::io::Error),
+}
+
+/// Failure while claiming or completing queued document work.
+#[derive(Debug, Error)]
+pub enum WorkerError {
+    #[error("storage lock is unavailable after a previous operation failed")]
+    StorageUnavailable,
+    #[error("document worker storage operation failed: {0}")]
+    Storage(#[source] storage::StorageError),
+    #[error("document worker executor stopped before completing the operation: {0}")]
+    Executor(#[source] tokio::task::JoinError),
+    #[error("document chunking failed: {0}")]
+    Chunking(#[source] memory_engine::ChunkingError),
 }
