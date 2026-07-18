@@ -1314,6 +1314,7 @@ name = "supermemory"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "memory-engine",
  "server",
  "storage",
  "thiserror",

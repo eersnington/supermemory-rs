@@ -23,12 +23,36 @@ pub struct Config {
     /// Path to the `SQLite` database.
     #[arg(long, env = "SUPERMEMORY_DATABASE", default_value_os_t = default_database_path())]
     pub database: PathBuf,
+
+    /// Existing local BGE model directory.
+    #[arg(long, env = "SUPERMEMORY_MODEL", default_value_os_t = default_model_path())]
+    pub model: PathBuf,
+
+    /// Existing native ONNX Runtime dynamic library.
+    #[arg(long, env = "SUPERMEMORY_ORT_LIBRARY", default_value_os_t = default_ort_library_path())]
+    pub ort_library: PathBuf,
 }
 
 fn default_database_path() -> PathBuf {
     std::env::var_os("HOME").map_or_else(
         || PathBuf::from("supermemory.db"),
         |home| PathBuf::from(home).join(".supermemory-rs/supermemory.db"),
+    )
+}
+
+fn default_model_path() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(
+        || PathBuf::from("models/Xenova/bge-base-en-v1.5"),
+        |home| PathBuf::from(home).join(".supermemory/models/Xenova/bge-base-en-v1.5"),
+    )
+}
+
+fn default_ort_library_path() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(
+        || PathBuf::from("libonnxruntime.dylib"),
+        |home| {
+            PathBuf::from(home).join(".supermemory/runtime/ort-native/onnxruntime-node/bin/napi-v6/darwin/arm64/libonnxruntime.1.23.2.dylib")
+        },
     )
 }
 
@@ -84,24 +108,45 @@ async fn start(config: Config) -> Result<(), StartupError> {
     let organization_id = storage.local_organization_id().to_owned();
     let storage = std::sync::Arc::new(std::sync::Mutex::new(storage));
     print_success("local SQLite storage", "ready", database_started.elapsed());
+    let model_path = config.model.clone();
+    let ort_library = config.ort_library.clone();
+    let model_started = Instant::now();
+    print_step("local embeddings", &config.model.display().to_string());
+    let embeddings = tokio::task::spawn_blocking(move || {
+        memory_engine::EmbeddingModel::load(&model_path, &ort_library)
+    })
+    .await
+    .map_err(StartupError::ModelExecutor)??;
+    let embeddings = std::sync::Arc::new(embeddings);
+    print_success(
+        "local embeddings",
+        "BGE 768d ready",
+        model_started.elapsed(),
+    );
     print_step("http server", &format!("port {}", config.bind.port()));
     let address = config.bind;
     let database = config.database.clone();
     let displayed_api_key = api_key.clone();
-    server::serve_with_ready(address, Some(api_key), storage, move || {
-        print_success(
-            "http server",
-            &format!("listening on http://localhost:{}", address.port()),
-            boot.elapsed(),
-        );
-        print_ready(
-            address.port(),
-            &database,
-            &displayed_api_key,
-            &organization_id,
-            boot.elapsed(),
-        );
-    })
+    server::serve_with_embeddings_ready(
+        address,
+        Some(api_key),
+        storage,
+        Some(embeddings),
+        move || {
+            print_success(
+                "http server",
+                &format!("listening on http://localhost:{}", address.port()),
+                boot.elapsed(),
+            );
+            print_ready(
+                address.port(),
+                &database,
+                &displayed_api_key,
+                &organization_id,
+                boot.elapsed(),
+            );
+        },
+    )
     .await?;
     Ok(())
 }
@@ -209,8 +254,9 @@ fn print_ready(
     let rows = vec![
         ("url", format!("http://localhost:{port}")),
         ("database", format!("local SQLite ({})", database.display())),
-        ("search", "SQLite FTS5".to_owned()),
-        ("workflow", "durable local worker".to_owned()),
+        ("search", "exact BGE semantic + SQLite FTS5".to_owned()),
+        ("embeddings", "BGE base 768d · local q8".to_owned()),
+        ("workflow", "revision-guarded durable worker".to_owned()),
         ("api key", api_key.to_owned()),
         ("org id", organization_id.to_owned()),
         ("boot", format_duration(elapsed)),
@@ -287,6 +333,10 @@ pub enum StartupError {
     Storage(#[from] storage::StorageError),
     #[error("database executor stopped during startup: {0}")]
     DatabaseExecutor(#[source] tokio::task::JoinError),
+    #[error("embedding model executor stopped during startup: {0}")]
+    ModelExecutor(#[source] tokio::task::JoinError),
+    #[error(transparent)]
+    Embedding(#[from] memory_engine::EmbeddingError),
     #[error(transparent)]
     Server(#[from] server::ServerError),
 }

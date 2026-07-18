@@ -1,5 +1,6 @@
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -8,8 +9,12 @@ use axum::{
     http::{Request, StatusCode},
     response::Response,
 };
+use memory_engine::EmbeddingModel;
 use serde_json::{Value, json};
-use server::{SharedStorage, process_next_job, router};
+use server::{
+    SharedStorage, process_next_job, process_next_job_with_embeddings, router,
+    router_with_embeddings,
+};
 use storage::Storage;
 use tower::ServiceExt;
 
@@ -292,4 +297,61 @@ async fn submitted_document_is_processed_and_searchable() {
     assert_eq!(response.status(), StatusCode::OK);
     let searched = body(response).await;
     assert_eq!(searched["results"][0]["documentId"], id);
+}
+
+#[tokio::test]
+async fn submitted_document_is_embedded_and_semantically_searchable() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let home = PathBuf::from(home).join(".supermemory");
+    let model_path = home.join("models/Xenova/bge-base-en-v1.5");
+    let runtime_path = home.join(
+        "runtime/ort-native/onnxruntime-node/bin/napi-v6/darwin/arm64/libonnxruntime.1.23.2.dylib",
+    );
+    if !model_path.exists() || !runtime_path.exists() {
+        return;
+    }
+    let embeddings = Arc::new(
+        EmbeddingModel::load(&model_path, &runtime_path).expect("existing model should load"),
+    );
+    let storage: SharedStorage = Arc::new(Mutex::new(Storage::in_memory().expect("storage")));
+    let app = router_with_embeddings(
+        Some("secret".to_owned()),
+        Arc::clone(&storage),
+        Arc::clone(&embeddings),
+    );
+    for content in [
+        "The sky is blue on a clear day.",
+        "A database transaction preserves atomicity.",
+    ] {
+        let create = remote(
+            Request::post("/v3/documents")
+                .header("authorization", "Bearer secret")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"content": content}).to_string()))
+                .expect("request"),
+        );
+        app.clone().oneshot(create).await.expect("create response");
+        assert!(
+            process_next_job_with_embeddings(Arc::clone(&storage), Some(Arc::clone(&embeddings)))
+                .await
+                .expect("semantic worker")
+        );
+    }
+
+    let search = remote(
+        Request::post("/v4/search")
+            .header("authorization", "Bearer secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"q":"What color is the sky?","threshold":0}"#,
+            ))
+            .expect("request"),
+    );
+    let searched = body(app.oneshot(search).await.expect("search response")).await;
+    assert_eq!(
+        searched["results"][0]["chunk"],
+        "The sky is blue on a clear day."
+    );
 }

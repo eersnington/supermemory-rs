@@ -1,6 +1,6 @@
 //! `SQLite` persistence, migrations, and atomic document identity decisions.
 
-use std::{path::Path, thread, time::Duration};
+use std::{collections::HashMap, path::Path, thread, time::Duration};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
@@ -13,6 +13,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         2,
         include_str!("../../../migrations/0002_searchable_chunks.sql"),
+    ),
+    (
+        3,
+        include_str!("../../../migrations/0003_document_vectors.sql"),
     ),
 ];
 const BASE58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -46,12 +50,21 @@ pub struct ClaimedJob {
     pub id: String,
     pub document_id: String,
     pub content: String,
+    pub revision: i64,
+}
+
+/// A chunk and its normalized embedding ready for atomic publication.
+#[derive(Debug, Clone, Copy)]
+pub struct EmbeddedChunk<'a> {
+    pub content: &'a str,
+    pub vector: &'a [f32],
 }
 
 /// A full-text search result.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
+    pub id: String,
     pub document_id: String,
     pub chunk: String,
     pub score: f64,
@@ -177,9 +190,9 @@ impl Storage {
             .map_err(StorageError::Write)?;
         let job = tx
             .query_row(
-                "SELECT jobs.id, documents.id, documents.content FROM jobs JOIN documents ON documents.id=jobs.document_id WHERE jobs.status='queued' AND jobs.available_at <= CURRENT_TIMESTAMP ORDER BY jobs.created_at, jobs.rowid LIMIT 1",
+                "SELECT jobs.id, documents.id, documents.content, jobs.revision FROM jobs JOIN documents ON documents.id=jobs.document_id WHERE jobs.status='queued' AND jobs.revision=documents.revision AND jobs.available_at <= CURRENT_TIMESTAMP ORDER BY jobs.created_at, jobs.rowid LIMIT 1",
                 [],
-                |row| Ok(ClaimedJob { id: row.get(0)?, document_id: row.get(1)?, content: row.get(2)? }),
+                |row| Ok(ClaimedJob { id: row.get(0)?, document_id: row.get(1)?, content: row.get(2)?, revision: row.get(3)? }),
             )
             .optional()
             .map_err(StorageError::Read)?;
@@ -188,13 +201,13 @@ impl Storage {
             return Ok(None);
         };
         tx.execute(
-            "UPDATE jobs SET status='extracting', attempts=attempts+1, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND status='queued'",
-            [&job.id],
+            "UPDATE jobs SET status='extracting', attempts=attempts+1, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status='queued'",
+            params![job.id, job.revision],
         )
         .map_err(StorageError::Write)?;
         tx.execute(
-            "UPDATE documents SET status='extracting', updated_at=CURRENT_TIMESTAMP WHERE id=?1",
-            [&job.document_id],
+            "UPDATE documents SET status='extracting', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+            params![job.document_id, job.revision],
         )
         .map_err(StorageError::Write)?;
         tx.commit().map_err(StorageError::Write)?;
@@ -210,29 +223,149 @@ impl Storage {
         job: &ClaimedJob,
         chunks: &[String],
     ) -> Result<(), StorageError> {
+        let embedded: Vec<_> = chunks
+            .iter()
+            .map(|content| EmbeddedChunk {
+                content,
+                vector: &[],
+            })
+            .collect();
+        self.publish_job(job, &embedded, None)
+    }
+
+    /// Atomically publishes chunks and normalized vectors for a claimed revision.
+    ///
+    /// # Errors
+    /// Returns an error when vector validation fails or the revision became stale.
+    pub fn complete_embedded_job(
+        &mut self,
+        job: &ClaimedJob,
+        chunks: &[EmbeddedChunk<'_>],
+        model_id: &str,
+        dimensions: usize,
+    ) -> Result<(), StorageError> {
+        if dimensions == 0 {
+            return Err(StorageError::InvalidVectorDimensions { dimensions });
+        }
+        for chunk in chunks {
+            validate_vector(chunk.vector, dimensions)?;
+        }
+        self.publish_job(job, chunks, Some((model_id, dimensions)))
+    }
+
+    fn publish_job(
+        &mut self,
+        job: &ClaimedJob,
+        chunks: &[EmbeddedChunk<'_>],
+        embedding: Option<(&str, usize)>,
+    ) -> Result<(), StorageError> {
         let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        let current_revision: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM documents WHERE id=?1",
+                [&job.document_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StorageError::Read)?;
+        if current_revision != Some(job.revision) {
+            return Err(StorageError::StaleRevision {
+                document_id: job.document_id.clone(),
+                claimed: job.revision,
+                current: current_revision,
+            });
+        }
+        let mut existing = HashMap::new();
+        {
+            let mut statement = tx
+                .prepare(
+                    "SELECT ordinal, content, stable_id FROM document_chunks WHERE document_id=?1",
+                )
+                .map_err(StorageError::Read)?;
+            let rows = statement
+                .query_map([&job.document_id], |row| {
+                    Ok((
+                        row.get::<_, usize>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(StorageError::Read)?;
+            for row in rows {
+                let (ordinal, content, stable_id) = row.map_err(StorageError::Read)?;
+                existing.insert((ordinal, content), stable_id);
+            }
+        }
         tx.execute(
             "DELETE FROM document_chunks WHERE document_id=?1",
             [&job.document_id],
         )
         .map_err(StorageError::Write)?;
-        for (ordinal, content) in chunks.iter().enumerate() {
+        for (ordinal, chunk) in chunks.iter().enumerate() {
+            let stable_id = existing
+                .remove(&(ordinal, chunk.content.to_owned()))
+                .map_or_else(generate_id, Ok)?;
             tx.execute(
-                "INSERT INTO document_chunks (document_id, ordinal, content) VALUES (?1, ?2, ?3)",
-                params![job.document_id, ordinal, content],
+                "INSERT INTO document_chunks (document_id, ordinal, content, stable_id) VALUES (?1, ?2, ?3, ?4)",
+                params![job.document_id, ordinal, chunk.content, stable_id],
             )
             .map_err(StorageError::Write)?;
+            if let Some((model_id, dimensions)) = embedding {
+                let chunk_id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO chunk_embeddings (chunk_id, model_id, dimensions, vector) VALUES (?1, ?2, ?3, ?4)",
+                    params![chunk_id, model_id, dimensions, vector_bytes(chunk.vector)],
+                )
+                .map_err(StorageError::Write)?;
+            }
         }
         tx.execute(
-            "UPDATE jobs SET status='done', last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND status='extracting'",
-            [&job.id],
+            "UPDATE jobs SET status='done', last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status IN ('extracting','chunking','embedding','indexing')",
+            params![job.id, job.revision],
         )
         .map_err(StorageError::Write)?;
         tx.execute(
-            "UPDATE documents SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id=?1",
-            [&job.document_id],
+            "UPDATE documents SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+            params![job.document_id, job.revision],
         )
         .map_err(StorageError::Write)?;
+        tx.commit().map_err(StorageError::Write)
+    }
+
+    /// Advances a claimed job and its current document revision to a processing stage.
+    ///
+    /// # Errors
+    /// Returns an error for an unsupported stage, stale revision, or failed transaction.
+    pub fn mark_job_stage(&mut self, job: &ClaimedJob, stage: &str) -> Result<(), StorageError> {
+        if !matches!(stage, "chunking" | "embedding" | "indexing") {
+            return Err(StorageError::InvalidJobStage(stage.to_owned()));
+        }
+        let expected = match stage {
+            "chunking" => "extracting",
+            "embedding" => "chunking",
+            "indexing" => "embedding",
+            _ => return Err(StorageError::InvalidJobStage(stage.to_owned())),
+        };
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        let jobs = tx
+            .execute(
+                "UPDATE jobs SET status=?3, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status=?4",
+                params![job.id, job.revision, stage, expected],
+            )
+            .map_err(StorageError::Write)?;
+        let documents = tx
+            .execute(
+                "UPDATE documents SET status=?3, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+                params![job.document_id, job.revision, stage],
+            )
+            .map_err(StorageError::Write)?;
+        if jobs != 1 || documents != 1 {
+            return Err(StorageError::StaleRevision {
+                document_id: job.document_id.clone(),
+                claimed: job.revision,
+                current: None,
+            });
+        }
         tx.commit().map_err(StorageError::Write)
     }
 
@@ -243,13 +376,13 @@ impl Storage {
     pub fn fail_job(&mut self, job: &ClaimedJob, error: &str) -> Result<(), StorageError> {
         let tx = self.connection.transaction().map_err(StorageError::Write)?;
         tx.execute(
-            "UPDATE jobs SET status='failed', last_error=?2, updated_at=CURRENT_TIMESTAMP WHERE id=?1",
-            params![job.id, error],
+            "UPDATE jobs SET status='failed', last_error=?3, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+            params![job.id, job.revision, error],
         )
         .map_err(StorageError::Write)?;
         tx.execute(
-            "UPDATE documents SET status='failed', updated_at=CURRENT_TIMESTAMP WHERE id=?1",
-            [&job.document_id],
+            "UPDATE documents SET status='failed', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+            params![job.document_id, job.revision],
         )
         .map_err(StorageError::Write)?;
         tx.commit().map_err(StorageError::Write)
@@ -262,8 +395,8 @@ impl Storage {
     pub fn delete_empty_document(&mut self, job: &ClaimedJob) -> Result<(), StorageError> {
         let tx = self.connection.transaction().map_err(StorageError::Write)?;
         tx.execute(
-            "DELETE FROM documents WHERE id=?1 AND status='extracting'",
-            [&job.document_id],
+            "DELETE FROM documents WHERE id=?1 AND revision=?2 AND status IN ('extracting','chunking')",
+            params![job.document_id, job.revision],
         )
         .map_err(StorageError::Write)?;
         tx.commit().map_err(StorageError::Write)
@@ -276,19 +409,80 @@ impl Storage {
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StorageError> {
         let query = format!("\"{}\"", query.replace('"', "\"\""));
         let mut statement = self.connection.prepare(
-            "SELECT documents.id, document_chunks.content, -bm25(document_chunks_fts) FROM document_chunks_fts JOIN document_chunks ON document_chunks.id=document_chunks_fts.rowid JOIN documents ON documents.id=document_chunks.document_id WHERE document_chunks_fts MATCH ?1 AND documents.org_id=?2 AND documents.status='done' ORDER BY bm25(document_chunks_fts), document_chunks.ordinal LIMIT ?3",
+            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, -bm25(document_chunks_fts) FROM document_chunks_fts JOIN document_chunks ON document_chunks.id=document_chunks_fts.rowid JOIN documents ON documents.id=document_chunks.document_id WHERE document_chunks_fts MATCH ?1 AND documents.org_id=?2 AND documents.status='done' ORDER BY bm25(document_chunks_fts), document_chunks.ordinal LIMIT ?3",
         ).map_err(StorageError::Read)?;
         statement
             .query_map(params![query, self.local_org_id, limit], |row| {
                 Ok(SearchHit {
-                    document_id: row.get(0)?,
-                    chunk: row.get(1)?,
-                    score: row.get(2)?,
+                    id: row.get(0)?,
+                    document_id: row.get(1)?,
+                    chunk: row.get(2)?,
+                    score: row.get(3)?,
                 })
             })
             .map_err(StorageError::Read)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::Read)
+    }
+
+    /// Searches current chunks by exact cosine similarity over normalized vectors.
+    ///
+    /// # Errors
+    /// Returns an error for malformed query/stored vectors or a failed database read.
+    pub fn search_semantic(
+        &self,
+        query: &[f32],
+        model_id: &str,
+        limit: usize,
+        threshold: f32,
+    ) -> Result<Vec<SearchHit>, StorageError> {
+        validate_vector(query, query.len())?;
+        let dimensions = query.len();
+        let mut statement = self.connection.prepare(
+            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, chunk_embeddings.vector, document_chunks.ordinal FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?1 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?3 AND documents.status='done'",
+        ).map_err(StorageError::Read)?;
+        let rows = statement
+            .query_map(params![model_id, dimensions, self.local_org_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, usize>(4)?,
+                ))
+            })
+            .map_err(StorageError::Read)?;
+        let mut hits = Vec::new();
+        for row in rows {
+            let (id, document_id, chunk, bytes, ordinal) = row.map_err(StorageError::Read)?;
+            let vector = decode_vector(&bytes, dimensions)?;
+            let score: f32 = query
+                .iter()
+                .zip(vector)
+                .map(|(left, right)| left * right)
+                .sum();
+            if score >= threshold {
+                hits.push((
+                    SearchHit {
+                        id,
+                        document_id,
+                        chunk,
+                        score: f64::from(score),
+                    },
+                    ordinal,
+                ));
+            }
+        }
+        hits.sort_by(|(left, left_ordinal), (right, right_ordinal)| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.document_id.cmp(&right.document_id))
+                .then_with(|| left_ordinal.cmp(right_ordinal))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        hits.truncate(limit);
+        Ok(hits.into_iter().map(|(hit, _)| hit).collect())
     }
 
     /// Returns the current migration version.
@@ -402,7 +596,7 @@ fn update_full(
     status: &str,
 ) -> Result<(), StorageError> {
     tx.execute(
-        "UPDATE documents SET content=?2, content_hash=?3, custom_id=?4, status=?5, container_tags=?6, entity_context=?7, metadata=?8, task_type=?9, filepath=?10, filter_by_metadata=?11, dreaming=?12, updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+        "UPDATE documents SET content=?2, content_hash=?3, custom_id=?4, status=?5, container_tags=?6, entity_context=?7, metadata=?8, task_type=?9, filepath=?10, filter_by_metadata=?11, dreaming=?12, revision=revision+1, updated_at=CURRENT_TIMESTAMP WHERE id=?1",
         params![id, input.content, hash, input.custom_id, status, json(&input.container_tags)?, input.entity_context, json(metadata)?, input.task_type, input.filepath, json(&input.filter_by_metadata)?, input.dreaming],
     ).map_err(StorageError::Write)?;
     Ok(())
@@ -419,9 +613,16 @@ fn enqueue_unless_active(
     if active {
         return Ok(false);
     }
+    let revision: i64 = tx
+        .query_row(
+            "SELECT revision FROM documents WHERE id=?1",
+            [document_id],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::Read)?;
     tx.execute(
-        "INSERT INTO jobs (id, document_id, kind, status) VALUES (?1, ?2, 'document', 'queued')",
-        params![generate_id()?, document_id],
+        "INSERT INTO jobs (id, document_id, kind, status, revision) VALUES (?1, ?2, 'document', 'queued', ?3)",
+        params![generate_id()?, document_id, revision],
     )
     .map_err(StorageError::Write)?;
     Ok(true)
@@ -525,6 +726,48 @@ fn json(value: &(impl Serialize + ?Sized)) -> Result<String, StorageError> {
     serde_json::to_string(value).map_err(StorageError::Serialize)
 }
 
+fn validate_vector(vector: &[f32], dimensions: usize) -> Result<(), StorageError> {
+    if vector.len() != dimensions {
+        return Err(StorageError::InvalidVectorLength {
+            expected: dimensions,
+            actual: vector.len(),
+        });
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(StorageError::NonFiniteVector);
+    }
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if (norm - 1.0).abs() > 1e-4 {
+        return Err(StorageError::InvalidVectorNorm { norm });
+    }
+    Ok(())
+}
+
+fn vector_bytes(vector: &[f32]) -> Vec<u8> {
+    vector
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn decode_vector(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>, StorageError> {
+    let expected = dimensions
+        .checked_mul(size_of::<f32>())
+        .ok_or(StorageError::InvalidVectorDimensions { dimensions })?;
+    if bytes.len() != expected {
+        return Err(StorageError::MalformedStoredVector {
+            expected,
+            actual: bytes.len(),
+        });
+    }
+    let vector = bytes
+        .chunks_exact(size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect::<Vec<_>>();
+    validate_vector(&vector, dimensions)?;
+    Ok(vector)
+}
+
 fn merge_metadata(
     existing: &Map<String, Value>,
     incoming: &Map<String, Value>,
@@ -607,6 +850,7 @@ fn initialize(connection: &mut Connection) -> Result<String, StorageError> {
             |row| row.get(0),
         )
         .map_err(StorageError::Migrate)?;
+    validate_existing_version(&tx, current)?;
     for &(version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version > current) {
         tx.execute_batch(sql).map_err(StorageError::Migrate)?;
         tx.execute(
@@ -615,48 +859,7 @@ fn initialize(connection: &mut Connection) -> Result<String, StorageError> {
         )
         .map_err(StorageError::Migrate)?;
     }
-    validate_columns(&tx, "organizations", &["id", "slug", "created_at"])?;
-    validate_columns(
-        &tx,
-        "documents",
-        &[
-            "id",
-            "org_id",
-            "content",
-            "content_hash",
-            "custom_id",
-            "status",
-            "container_tags",
-            "entity_context",
-            "metadata",
-            "task_type",
-            "filepath",
-            "filter_by_metadata",
-            "dreaming",
-            "created_at",
-            "updated_at",
-        ],
-    )?;
-    validate_columns(
-        &tx,
-        "document_chunks",
-        &["id", "document_id", "ordinal", "content"],
-    )?;
-    validate_columns(
-        &tx,
-        "jobs",
-        &[
-            "id",
-            "document_id",
-            "kind",
-            "status",
-            "attempts",
-            "available_at",
-            "last_error",
-            "created_at",
-            "updated_at",
-        ],
-    )?;
+    validate_current_schema(&tx)?;
     let org_id = tx
         .query_row(
             "SELECT id FROM organizations WHERE slug=?1",
@@ -688,6 +891,110 @@ fn initialize(connection: &mut Connection) -> Result<String, StorageError> {
     .map_err(StorageError::Migrate)?;
     tx.commit().map_err(StorageError::Migrate)?;
     Ok(org_id)
+}
+
+fn validate_current_schema(connection: &Connection) -> Result<(), StorageError> {
+    validate_columns(connection, "organizations", &["id", "slug", "created_at"])?;
+    validate_columns(
+        connection,
+        "documents",
+        &[
+            "id",
+            "org_id",
+            "content",
+            "content_hash",
+            "custom_id",
+            "status",
+            "container_tags",
+            "entity_context",
+            "metadata",
+            "task_type",
+            "filepath",
+            "filter_by_metadata",
+            "dreaming",
+            "created_at",
+            "updated_at",
+            "revision",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "document_chunks",
+        &["id", "document_id", "ordinal", "content", "stable_id"],
+    )?;
+    validate_columns(
+        connection,
+        "jobs",
+        &[
+            "id",
+            "document_id",
+            "kind",
+            "status",
+            "attempts",
+            "available_at",
+            "last_error",
+            "created_at",
+            "updated_at",
+            "revision",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "chunk_embeddings",
+        &["chunk_id", "model_id", "dimensions", "vector", "created_at"],
+    )
+}
+
+fn validate_existing_version(connection: &Connection, version: i64) -> Result<(), StorageError> {
+    if version >= 1 {
+        validate_columns(connection, "organizations", &["id", "slug", "created_at"])?;
+    }
+    if (1..3).contains(&version) {
+        validate_columns(
+            connection,
+            "documents",
+            &[
+                "id",
+                "org_id",
+                "content",
+                "content_hash",
+                "custom_id",
+                "status",
+                "container_tags",
+                "entity_context",
+                "metadata",
+                "task_type",
+                "filepath",
+                "filter_by_metadata",
+                "dreaming",
+                "created_at",
+                "updated_at",
+            ],
+        )?;
+        validate_columns(
+            connection,
+            "jobs",
+            &[
+                "id",
+                "document_id",
+                "kind",
+                "status",
+                "attempts",
+                "available_at",
+                "last_error",
+                "created_at",
+                "updated_at",
+            ],
+        )?;
+    }
+    if version == 2 {
+        validate_columns(
+            connection,
+            "document_chunks",
+            &["id", "document_id", "ordinal", "content"],
+        )?;
+    }
+    Ok(())
 }
 
 fn configure_wal(connection: &Connection) -> Result<(), StorageError> {
@@ -756,6 +1063,26 @@ pub enum StorageError {
     Serialize(#[source] serde_json::Error),
     #[error("the operating system random source failed; no identifier was generated: {0}")]
     Random(getrandom::Error),
+    #[error("embedding dimensions must be greater than zero, found {dimensions}")]
+    InvalidVectorDimensions { dimensions: usize },
+    #[error("embedding has {actual} components, expected {expected}")]
+    InvalidVectorLength { expected: usize, actual: usize },
+    #[error("embedding contains a non-finite component; no vector data was written")]
+    NonFiniteVector,
+    #[error("embedding has invalid L2 norm {norm}; expected a normalized vector")]
+    InvalidVectorNorm { norm: f32 },
+    #[error("stored embedding contains {actual} bytes, expected {expected}; rebuild this vector")]
+    MalformedStoredVector { expected: usize, actual: usize },
+    #[error(
+        "document {document_id} revision {claimed} is stale; current revision is {current:?}; no searchable data was changed"
+    )]
+    StaleRevision {
+        document_id: String,
+        claimed: i64,
+        current: Option<i64>,
+    },
+    #[error("unsupported document processing stage {0}")]
+    InvalidJobStage(String),
     #[error(
         "existing table {table} has malformed columns; expected [{expected}], found [{actual}]; repair or recreate this unreleased schema-v1 database"
     )]

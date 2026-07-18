@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+memory-engine = { path = "../memory-engine" }
 server = { path = "../server" }
 storage = { path = "../storage" }
 thiserror.workspace = true

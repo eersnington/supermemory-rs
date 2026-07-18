@@ -16,7 +16,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use storage::{Storage, UpsertDocument};
+use storage::{EmbeddedChunk, Storage, UpsertDocument};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -31,19 +31,35 @@ struct AppState {
     api_key: Option<String>,
     port: u16,
     storage: SharedStorage,
+    embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
 }
 
 /// Builds the complete HTTP application.
 pub fn router(api_key: Option<String>, storage: SharedStorage) -> Router {
-    router_with_port(api_key, storage, 6767)
+    router_with_port(api_key, storage, None, 6767)
 }
 
-fn router_with_port(api_key: Option<String>, storage: SharedStorage, port: u16) -> Router {
+/// Builds the HTTP application with local semantic search enabled.
+pub fn router_with_embeddings(
+    api_key: Option<String>,
+    storage: SharedStorage,
+    embeddings: Arc<memory_engine::EmbeddingModel>,
+) -> Router {
+    router_with_port(api_key, storage, Some(embeddings), 6767)
+}
+
+fn router_with_port(
+    api_key: Option<String>,
+    storage: SharedStorage,
+    embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
+    port: u16,
+) -> Router {
     let state = AppState {
         api_key_hash: api_key.as_ref().map(|key| Sha256::digest(key).into()),
         api_key,
         port,
         storage,
+        embeddings,
     };
     let api = Router::new()
         .route("/documents", post(create_document))
@@ -165,14 +181,31 @@ pub async fn serve_with_ready(
     storage: SharedStorage,
     ready: impl FnOnce(),
 ) -> Result<(), ServerError> {
+    serve_with_embeddings_ready(address, api_key, storage, None, ready).await
+}
+
+/// Serves with a loaded local embedding model and reports readiness after binding.
+///
+/// # Errors
+/// Returns an error if the address cannot be bound or the HTTP server stops unexpectedly.
+pub async fn serve_with_embeddings_ready(
+    address: SocketAddr,
+    api_key: Option<String>,
+    storage: SharedStorage,
+    embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
+    ready: impl FnOnce(),
+) -> Result<(), ServerError> {
     let listener = TcpListener::bind(address)
         .await
         .map_err(|source| ServerError::Bind { address, source })?;
     ready();
-    let worker = tokio::spawn(worker_loop(Arc::clone(&storage)));
+    let worker = tokio::spawn(worker_loop(
+        Arc::clone(&storage),
+        embeddings.as_ref().map(Arc::clone),
+    ));
     let result = axum::serve(
         listener,
-        router_with_port(api_key, storage, address.port())
+        router_with_port(api_key, storage, embeddings, address.port())
             .into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
@@ -312,10 +345,16 @@ struct SearchRequest {
     q: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
+    #[serde(default = "default_search_threshold")]
+    threshold: f32,
 }
 
 const fn default_search_limit() -> usize {
     10
+}
+
+const fn default_search_threshold() -> f32 {
+    0.6
 }
 
 #[derive(Serialize)]
@@ -333,14 +372,44 @@ async fn search(
     if !(1..=100).contains(&request.limit) {
         return Err(ApiError::Validation("limit must be between 1 and 100"));
     }
+    if !request.threshold.is_finite() || !(0.0..=1.0).contains(&request.threshold) {
+        return Err(ApiError::Validation(
+            "threshold must be a finite number between 0 and 1",
+        ));
+    }
+    let query = request.q.trim().to_owned();
+    let query_vector = if let Some(embeddings) = state.embeddings.as_ref() {
+        let embeddings = Arc::clone(embeddings);
+        let value = query.clone();
+        Some(
+            tokio::task::spawn_blocking(move || embeddings.embed(&[value]))
+                .await
+                .map_err(ApiError::DatabaseExecutor)?
+                .map_err(ApiError::Embedding)?
+                .into_iter()
+                .next()
+                .ok_or(ApiError::EmptyEmbedding)?,
+        )
+    } else {
+        None
+    };
     let storage = Arc::clone(&state.storage);
-    let query = request.q;
     let limit = request.limit;
+    let threshold = request.threshold;
     let results = tokio::task::spawn_blocking(move || {
-        storage
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
-            .search(query.trim(), limit)
+        let storage = storage.lock().map_err(|_| ApiError::StorageUnavailable)?;
+        query_vector
+            .map_or_else(
+                || storage.search(&query, limit),
+                |vector| {
+                    storage.search_semantic(
+                        vector.as_slice(),
+                        "Xenova/bge-base-en-v1.5:q8:mean:normalized",
+                        limit,
+                        threshold,
+                    )
+                },
+            )
             .map_err(ApiError::Storage)
     })
     .await
@@ -353,6 +422,17 @@ async fn search(
 /// # Errors
 /// Returns an error if the storage lock is poisoned or a database operation fails.
 pub async fn process_next_job(storage: SharedStorage) -> Result<bool, WorkerError> {
+    process_next_job_with_embeddings(storage, None).await
+}
+
+/// Processes one job through chunking, local embedding, and atomic indexing.
+///
+/// # Errors
+/// Returns an error if any durable stage or model operation fails.
+pub async fn process_next_job_with_embeddings(
+    storage: SharedStorage,
+    embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
+) -> Result<bool, WorkerError> {
     let job = tokio::task::spawn_blocking({
         let storage = Arc::clone(&storage);
         move || {
@@ -369,6 +449,7 @@ pub async fn process_next_job(storage: SharedStorage) -> Result<bool, WorkerErro
         return Ok(false);
     };
 
+    mark_job_stage(Arc::clone(&storage), job.clone(), "chunking").await?;
     let chunks = match memory_engine::chunk_text(&job.content, None) {
         Ok(chunks) => chunks,
         Err(error) => {
@@ -389,6 +470,45 @@ pub async fn process_next_job(storage: SharedStorage) -> Result<bool, WorkerErro
         .map_err(WorkerError::Executor)??;
         return Ok(true);
     }
+    if let Some(embeddings) = embeddings {
+        mark_job_stage(Arc::clone(&storage), job.clone(), "embedding").await?;
+        let values = chunks.clone();
+        let vectors = match tokio::task::spawn_blocking(move || embeddings.embed(&values))
+            .await
+            .map_err(WorkerError::Executor)?
+        {
+            Ok(vectors) => vectors,
+            Err(error) => {
+                let message = error.to_string();
+                persist_job_failure(Arc::clone(&storage), job.clone(), message).await?;
+                return Err(WorkerError::Embedding(error));
+            }
+        };
+        mark_job_stage(Arc::clone(&storage), job.clone(), "indexing").await?;
+        return tokio::task::spawn_blocking(move || {
+            let embedded: Vec<_> = chunks
+                .iter()
+                .zip(&vectors)
+                .map(|(content, vector)| EmbeddedChunk {
+                    content,
+                    vector: vector.as_slice(),
+                })
+                .collect();
+            storage
+                .lock()
+                .map_err(|_| WorkerError::StorageUnavailable)?
+                .complete_embedded_job(
+                    &job,
+                    &embedded,
+                    "Xenova/bge-base-en-v1.5:q8:mean:normalized",
+                    memory_engine::BGE_DIMENSIONS,
+                )
+                .map_err(WorkerError::Storage)
+        })
+        .await
+        .map_err(WorkerError::Executor)?
+        .map(|()| true);
+    }
     tokio::task::spawn_blocking(move || {
         storage
             .lock()
@@ -399,6 +519,23 @@ pub async fn process_next_job(storage: SharedStorage) -> Result<bool, WorkerErro
     .await
     .map_err(WorkerError::Executor)??;
     Ok(true)
+}
+
+async fn mark_job_stage(
+    storage: SharedStorage,
+    job: storage::ClaimedJob,
+    stage: &'static str,
+) -> Result<(), WorkerError> {
+    tokio::task::spawn_blocking(move || {
+        storage
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?
+            .mark_job_stage(&job, stage)
+            .map_err(WorkerError::Storage)
+    })
+    .await
+    .map_err(WorkerError::Executor)??;
+    Ok(())
 }
 
 async fn persist_job_failure(
@@ -418,9 +555,17 @@ async fn persist_job_failure(
     Ok(())
 }
 
-async fn worker_loop(storage: SharedStorage) {
+async fn worker_loop(
+    storage: SharedStorage,
+    embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
+) {
     loop {
-        match process_next_job(Arc::clone(&storage)).await {
+        match process_next_job_with_embeddings(
+            Arc::clone(&storage),
+            embeddings.as_ref().map(Arc::clone),
+        )
+        .await
+        {
             Ok(true) => {}
             Ok(false) => sleep(Duration::from_millis(100)).await,
             Err(error) => {
@@ -554,6 +699,10 @@ enum ApiError {
     Storage(#[source] storage::StorageError),
     #[error("database executor stopped before completing the operation: {0}")]
     DatabaseExecutor(#[source] tokio::task::JoinError),
+    #[error("query embedding failed: {0}")]
+    Embedding(#[source] memory_engine::EmbeddingError),
+    #[error("query embedding returned no vector")]
+    EmptyEmbedding,
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -574,7 +723,11 @@ impl IntoResponse for ApiError {
                 }),
             )
                 .into_response(),
-            Self::StorageUnavailable | Self::Storage(_) | Self::DatabaseExecutor(_) => (
+            Self::StorageUnavailable
+            | Self::Storage(_)
+            | Self::DatabaseExecutor(_)
+            | Self::Embedding(_)
+            | Self::EmptyEmbedding => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorBody {
                     error: "Internal server error",
@@ -612,4 +765,6 @@ pub enum WorkerError {
     Executor(#[source] tokio::task::JoinError),
     #[error("document chunking failed: {0}")]
     Chunking(#[source] memory_engine::ChunkingError),
+    #[error("document embedding failed: {0}")]
+    Embedding(#[source] memory_engine::EmbeddingError),
 }
