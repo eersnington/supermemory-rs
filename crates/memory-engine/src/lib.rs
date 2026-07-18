@@ -1,10 +1,12 @@
 //! Core document lifecycle types and invariants.
 
 mod chunking;
+mod embedding;
 
 pub use chunking::{
     ChunkingError, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, chunk_text, normalize_extracted_text,
 };
+pub use embedding::{BGE_DIMENSIONS, EmbeddingError, EmbeddingModel, EmbeddingVector};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
