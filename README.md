@@ -4,9 +4,11 @@ Early Rust implementation of a self-hosted Supermemory-compatible service. It do
 
 Development follows the [semantic porting guidelines](docs/semantic-porting.md): preserve behavior recovered from `supermemory-server` v0.0.5 while replacing its generic runtime infrastructure.
 
+Executed compatibility checks and remaining gaps are tracked in [verification status](docs/verification.md).
+
 ## Current status
 
-The executable currently serves public `GET /health`, document creation and lookup under `/v3/documents`, and exact local BGE semantic document search at `POST /v4/search`. Documents are scoped to a generated, persisted local organization. A revision-guarded durable worker chunks, embeds, and atomically indexes queued documents; interrupted jobs are recovered when the process restarts. Creation implements v0.0.5-compatible content sanitization, SHA-1 duplicate identity, organization/container-scoped custom IDs, and atomic upsert/job behavior. Ordered schema migrations are tracked in `schema_migrations`.
+The executable serves document creation and lookup, V3/V4 semantic search, memory extraction and reconciliation, graph context, profiles, direct forgetting, and request-scoped organizations. A revision-guarded worker chunks, embeds, and atomically indexes queued documents; interrupted jobs recover on restart. First startup imports compatible legacy organizations, API keys, documents, chunks, vectors, memories, relations, sources, spaces, and encrypted provider credentials without modifying `~/.supermemory`.
 
 Start it directly for loopback-only access:
 
@@ -16,7 +18,7 @@ supermemory-rs
 
 Set `SUPERMEMORY_API_KEY` only when non-loopback clients need bearer authentication.
 
-The default address is `127.0.0.1:6767`. Processing uses the recovered v0.0.5 chunk-size limits, extraction normalization, Markdown detection, heading sections, UTF-16 length accounting, recursive word splitting, overlap, and short-chunk merging. It reuses `~/.supermemory/models/Xenova/bge-base-en-v1.5` and the existing native ONNX Runtime without downloading model assets. Specialized Markdown table/code splitting, exact Compromise sentence boundaries, memory extraction, graph/profile behavior, and retrieval-quality parity are not implemented yet.
+The default address is `127.0.0.1:6767`. Processing uses the recovered chunk limits, UTF-16 accounting, overlap, and local BGE model. Exact Compromise sentence boundaries, specialized Markdown table/code splitting, extraction formats, several secondary routes, and retrieval-quality parity remain unfinished.
 
 Submit and search a document:
 

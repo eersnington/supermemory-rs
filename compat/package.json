@@ -1,0 +1,9 @@
+{
+  "name": "supermemory-rs-compatibility",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@supermemory/tools": "https://registry.npmjs.org/@supermemory/tools/-/tools-2.1.1.tgz",
+    "supermemory": "https://registry.npmjs.org/supermemory/-/supermemory-4.0.0.tgz"
+  }
+}

@@ -1,5 +1,7 @@
 /target/
 /migration/node_modules/
+/compat/node_modules/
+/compat/.venv/
 *.db
 *.db-shm
 *.db-wal
