@@ -2,6 +2,8 @@
 
 Early Rust implementation of a self-hosted Supermemory-compatible service. It does not yet claim full API, retrieval-quality, or performance parity.
 
+Development follows the [semantic porting guidelines](docs/semantic-porting.md): preserve behavior recovered from `supermemory-server` v0.0.5 while replacing its generic runtime infrastructure.
+
 ## Current status
 
 The executable currently serves public `GET /health` plus `POST /v3/documents` and `GET /v3/documents/:id`. Documents are scoped to a generated, persisted local organization. Creation implements v0.0.5-compatible content sanitization, SHA-1 duplicate identity, organization/container-scoped custom IDs, and atomic upsert/job behavior. Ordered schema migrations are tracked in `schema_migrations`.
