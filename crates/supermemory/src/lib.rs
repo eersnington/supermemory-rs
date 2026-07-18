@@ -161,11 +161,11 @@ const LOGO: [&str; 5] = [
     "██████    ██████  ██      ███████ ██   ██ ██      ██ ███████ ██      ██  ██████  ██   ██    ██   ",
 ];
 const RS_LOGO: [&str; 5] = [
-    "      ██████  ███████",
-    "     ██   ██  ██     ",
-    "████ ██████   ███████",
-    "     ██   ██       ██",
-    "     ██   ██  ███████",
+    "     ██████    ██████ ",
+    "     ██   ██  ██      ",
+    "████ ██████    █████  ",
+    "     ██   ██        ██",
+    "     ██   ██  ██████  ",
 ];
 
 fn print_banner() {
@@ -227,7 +227,7 @@ fn print_ready(
     let title = "→ supermemory ready";
     println!(
         "\x1b[38;5;81m│{RESET}  \x1b[38;5;45m→{RESET} {BOLD}\x1b[38;5;45msupermemory ready{RESET}{}  \x1b[38;5;81m│{RESET}",
-        " ".repeat(line_width.saturating_sub(title.len()))
+        " ".repeat(line_width.saturating_sub(title.chars().count()))
     );
     println!(
         "\x1b[38;5;81m│{RESET}{}\x1b[38;5;81m│{RESET}",
