@@ -16,6 +16,25 @@ Start it directly for loopback-only access:
 supermemory-rs
 ```
 
+Set one provider key to enable ingestion-time memory extraction:
+
+| Provider | Environment variable |
+| --- | --- |
+| OpenAI or OpenAI-compatible | `OPENAI_API_KEY` |
+| Anthropic | `ANTHROPIC_API_KEY` |
+| Gemini | `GEMINI_API_KEY` |
+| Groq | `GROQ_API_KEY` |
+
+For example, with Gemini:
+
+```sh
+export GEMINI_API_KEY="your-google-ai-key"
+supermemory-rs
+```
+
+Provider selection follows v0.0.5 precedence: OpenAI, Anthropic, Gemini, then Groq. OpenAI-compatible
+services can also set `OPENAI_BASE_URL` and `OPENAI_TEXT_MODEL`.
+
 Set `SUPERMEMORY_API_KEY` only when non-loopback clients need bearer authentication.
 
 The default address is `127.0.0.1:6767`. Processing uses the recovered chunk limits, UTF-16 accounting, overlap, and local BGE model. Exact Compromise sentence boundaries, specialized Markdown table/code splitting, extraction formats, several secondary routes, and retrieval-quality parity remain unfinished.
