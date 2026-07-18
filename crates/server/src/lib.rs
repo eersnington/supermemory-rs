@@ -7,7 +7,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{ConnectInfo, Extension, Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -27,12 +27,16 @@ pub type SharedStorage = Arc<Mutex<Storage>>;
 
 #[derive(Clone)]
 struct AppState {
-    api_key_hash: Option<[u8; 32]>,
+    api_keys: Arc<Vec<([u8; 32], String)>>,
     api_key: Option<String>,
     port: u16,
     storage: SharedStorage,
     embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
+    local_org_id: String,
 }
+
+#[derive(Clone)]
+struct OrganizationId(String);
 
 /// Builds the complete HTTP application.
 pub fn router(api_key: Option<String>, storage: SharedStorage) -> Router {
@@ -54,12 +58,29 @@ fn router_with_port(
     embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
     port: u16,
 ) -> Router {
+    let (local_org_id, mut api_keys) = storage.lock().map_or_else(
+        |_| (String::new(), Vec::new()),
+        |storage| {
+            let local = storage.local_organization_id().to_owned();
+            let imported = storage
+                .api_key_identities()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(hash, org)| (hash, org.unwrap_or_else(|| local.clone())))
+                .collect();
+            (local, imported)
+        },
+    );
+    if let Some(key) = api_key.as_ref() {
+        api_keys.push((Sha256::digest(key).into(), local_org_id.clone()));
+    }
     let state = AppState {
-        api_key_hash: api_key.as_ref().map(|key| Sha256::digest(key).into()),
+        api_keys: Arc::new(api_keys),
         api_key,
         port,
         storage,
         embeddings,
+        local_org_id,
     };
     let api = Router::new()
         .route("/documents", post(create_document))
@@ -296,6 +317,7 @@ fn default_dreaming() -> Dreaming {
 
 async fn create_document(
     State(state): State<AppState>,
+    Extension(organization): Extension<OrganizationId>,
     Json(request): Json<CreateDocumentRequest>,
 ) -> Result<Json<DocumentResult>, ApiError> {
     validate_request(&request)?;
@@ -330,7 +352,7 @@ async fn create_document(
         storage
             .lock()
             .map_err(|_| ApiError::StorageUnavailable)?
-            .upsert_document(document)
+            .upsert_document_for(&organization.0, document)
             .map_err(ApiError::Storage)
     })
     .await
@@ -343,6 +365,7 @@ async fn create_document(
 
 async fn get_document(
     State(state): State<AppState>,
+    Extension(organization): Extension<OrganizationId>,
     Path(id): Path<String>,
 ) -> Result<Json<storage::Document>, ApiError> {
     let storage = Arc::clone(&state.storage);
@@ -350,7 +373,7 @@ async fn get_document(
         storage
             .lock()
             .map_err(|_| ApiError::StorageUnavailable)?
-            .find_document(&id)
+            .find_document_for(&organization.0, &id)
             .map_err(ApiError::Storage)
     })
     .await
@@ -431,6 +454,7 @@ struct V3ChunkResult {
 
 async fn v3_search(
     State(state): State<AppState>,
+    Extension(organization): Extension<OrganizationId>,
     Json(request): Json<V3SearchRequest>,
 ) -> Result<Json<V3SearchResponse>, ApiError> {
     let started = std::time::Instant::now();
@@ -467,6 +491,7 @@ async fn v3_search(
         request.limit
     };
     let options = storage::SearchOptions {
+        organization_id: Some(organization.0.clone()),
         container_tags: tags,
         document_id: request.doc_id,
         filepath: request.filepath,
@@ -477,7 +502,7 @@ async fn v3_search(
         let storage = storage.lock().map_err(|_| ApiError::StorageUnavailable)?;
         query_vector
             .map_or_else(
-                || storage.search(&query, candidate_limit),
+                || storage.search_for(&organization.0, &query, candidate_limit),
                 |vector| {
                     storage.search_semantic(
                         vector.as_slice(),
@@ -700,6 +725,8 @@ struct ChunkSearchResult {
 struct EmptyContext {
     parents: Vec<Value>,
     children: Vec<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    related: Vec<Value>,
 }
 
 #[derive(Serialize)]
@@ -711,6 +738,8 @@ struct SearchDocument {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     document_type: Option<String>,
     metadata: Option<Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -721,6 +750,7 @@ struct SearchDocument {
 )]
 async fn search(
     State(state): State<AppState>,
+    Extension(organization): Extension<OrganizationId>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ApiError> {
     let started = std::time::Instant::now();
@@ -768,6 +798,7 @@ async fn search(
     let memory_mode = search_mode != SearchMode::Documents;
     let document_mode = search_mode != SearchMode::Memories;
     let options = storage::SearchOptions {
+        organization_id: Some(organization.0.clone()),
         container_tags: vec![
             request
                 .container_tag
@@ -783,7 +814,8 @@ async fn search(
         if let Some(vector) = query_vector {
             let memories = if memory_mode {
                 storage
-                    .search_memories(
+                    .search_memories_for(
+                        &organization.0,
                         vector.as_slice(),
                         "Xenova/bge-base-en-v1.5:q8:mean:normalized",
                         options
@@ -815,7 +847,7 @@ async fn search(
         } else {
             let chunks = if document_mode {
                 storage
-                    .search(&query, candidate_limit)
+                    .search_for(&organization.0, &query, candidate_limit)
                     .map_err(ApiError::Storage)?
             } else {
                 Vec::new()
@@ -851,6 +883,34 @@ async fn search(
 }
 
 fn memory_search_result(hit: storage::MemorySearchHit, boost: f64) -> MemorySearchResult {
+    let parents = hit
+        .parents
+        .into_iter()
+        .filter_map(|relation| serde_json::to_value(relation).ok())
+        .collect();
+    let children = hit
+        .children
+        .into_iter()
+        .filter_map(|relation| serde_json::to_value(relation).ok())
+        .collect();
+    let related = hit
+        .related
+        .into_iter()
+        .filter_map(|relation| serde_json::to_value(relation).ok())
+        .collect();
+    let documents = hit
+        .documents
+        .into_iter()
+        .map(|document| SearchDocument {
+            id: document.id,
+            title: document.title,
+            document_type: document.document_type,
+            metadata: Some(document.metadata),
+            summary: document.summary,
+            created_at: document.created_at,
+            updated_at: document.updated_at,
+        })
+        .collect();
     MemorySearchResult {
         id: hit.record.id,
         memory: hit.record.memory,
@@ -860,10 +920,11 @@ fn memory_search_result(hit: storage::MemorySearchHit, boost: f64) -> MemorySear
         version: hit.record.version,
         root_memory_id: hit.record.root_memory_id,
         context: EmptyContext {
-            parents: Vec::new(),
-            children: Vec::new(),
+            parents,
+            children,
+            related,
         },
-        documents: Vec::new(),
+        documents,
         chunks: Vec::new(),
     }
 }
@@ -884,6 +945,7 @@ fn chunk_search_result(hit: storage::SearchHit) -> ChunkSearchResult {
         title,
         document_type,
         metadata: Some(hit.metadata.clone()),
+        summary: None,
         created_at: hit.created_at,
         updated_at: hit.updated_at.clone(),
     };
@@ -898,6 +960,7 @@ fn chunk_search_result(hit: storage::SearchHit) -> ChunkSearchResult {
         context: EmptyContext {
             parents: Vec::new(),
             children: Vec::new(),
+            related: Vec::new(),
         },
         documents: vec![document],
         chunks: Vec::new(),
@@ -1093,6 +1156,7 @@ const PREFERENCES_DESCRIPTION: &str = "Explicit first-person preferences only â€
 
 async fn profile(
     State(state): State<AppState>,
+    Extension(organization): Extension<OrganizationId>,
     Json(request): Json<ProfileRequest>,
 ) -> Result<Json<ProfileResponse>, ApiError> {
     validate_container_tag(Some(&request.container_tag))?;
@@ -1109,6 +1173,7 @@ async fn profile(
     });
     let storage = Arc::clone(&state.storage);
     let container_tag = request.container_tag.clone();
+    let profile_org_id = organization.0.clone();
     let requested_buckets = request
         .buckets
         .unwrap_or_else(|| vec!["preferences".to_owned()]);
@@ -1118,17 +1183,17 @@ async fn profile(
     let (static_memories, dynamic_memories, buckets) = tokio::task::spawn_blocking(move || {
         let storage = storage.lock().map_err(|_| ApiError::StorageUnavailable)?;
         let static_memories = storage
-            .static_profile(&container_tag)
+            .static_profile_for(&profile_org_id, &container_tag)
             .map_err(ApiError::Storage)?;
         let dynamic_memories = storage
-            .dynamic_profile(&container_tag, &static_memories)
+            .dynamic_profile_for(&profile_org_id, &container_tag, &static_memories)
             .map_err(ApiError::Storage)?;
         let buckets = if want_buckets {
             requested_buckets
                 .iter()
                 .map(|bucket| {
                     storage
-                        .bucket_profile(&container_tag, bucket)
+                        .bucket_profile_for(&profile_org_id, &container_tag, bucket)
                         .map(|memories| (bucket.clone(), memories))
                         .map_err(ApiError::Storage)
                 })
@@ -1153,7 +1218,16 @@ async fn profile(
         );
     }
     let search_results = if let Some(query) = request.q.filter(|query| !query.trim().is_empty()) {
-        Some(profile_search(&state, query, &request.container_tag, request.threshold).await?)
+        Some(
+            profile_search(
+                &state,
+                &organization.0,
+                query,
+                &request.container_tag,
+                request.threshold,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -1185,6 +1259,7 @@ async fn profile(
 
 async fn profile_search(
     state: &AppState,
+    organization_id: &str,
     query: String,
     container_tag: &str,
     threshold: f32,
@@ -1199,11 +1274,13 @@ async fn profile_search(
     };
     let storage = Arc::clone(&state.storage);
     let container_tag = container_tag.to_owned();
+    let organization_id = organization_id.to_owned();
     let hits = tokio::task::spawn_blocking(move || {
         storage
             .lock()
             .map_err(|_| ApiError::StorageUnavailable)?
-            .search_memories(
+            .search_memories_for(
+                &organization_id,
                 vector.as_slice(),
                 "Xenova/bge-base-en-v1.5:q8:mean:normalized",
                 &container_tag,
@@ -1256,6 +1333,7 @@ struct ForgetMemoryResponse {
 
 async fn forget_memory(
     State(state): State<AppState>,
+    Extension(organization): Extension<OrganizationId>,
     Json(request): Json<ForgetMemoryRequest>,
 ) -> Result<Json<ForgetMemoryResponse>, ApiError> {
     if request.id.is_none() && request.content.is_none() {
@@ -1267,7 +1345,8 @@ async fn forget_memory(
         storage
             .lock()
             .map_err(|_| ApiError::StorageUnavailable)?
-            .forget_memory(
+            .forget_memory_for(
+                &organization.0,
                 request.id.as_deref(),
                 request.content.as_deref(),
                 &request.container_tag,
@@ -1456,6 +1535,7 @@ async fn reconcile_extracted_memories(
     vectors: Vec<memory_engine::EmbeddingVector>,
 ) -> Result<(), WorkerError> {
     let document_id = job.document_id.clone();
+    let organization_id = job.organization_id.clone();
     let proposals = candidates
         .into_iter()
         .zip(vectors)
@@ -1497,7 +1577,8 @@ async fn reconcile_extracted_memories(
         storage
             .lock()
             .map_err(|_| WorkerError::StorageUnavailable)?
-            .reconcile_memories(
+            .reconcile_memories_for(
+                &organization_id,
                 &document_id,
                 "sm_project_default",
                 &proposals,
@@ -1605,7 +1686,7 @@ fn validate_metadata(values: &Map<String, Value>) -> Result<(), ApiError> {
 async fn authenticate(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
     let supplied = request
@@ -1613,14 +1694,23 @@ async fn authenticate(
         .get(http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    let valid = supplied
-        .zip(state.api_key_hash.as_ref())
-        .is_some_and(|(key, expected)| {
-            let supplied_hash: [u8; 32] = Sha256::digest(key).into();
-            bool::from(supplied_hash.ct_eq(expected))
-        });
+    let organization = supplied.and_then(|key| {
+        let supplied_hash: [u8; 32] = Sha256::digest(key).into();
+        state
+            .api_keys
+            .iter()
+            .find(|(expected, _)| bool::from(supplied_hash.ct_eq(expected)))
+            .map(|(_, organization)| organization.clone())
+    });
     let has_session_material = request.headers().contains_key(http::header::COOKIE);
-    if valid || (supplied.is_none() && !has_session_material && peer.ip().is_loopback()) {
+    let organization = organization.or_else(|| {
+        (supplied.is_none() && !has_session_material && peer.ip().is_loopback())
+            .then(|| state.local_org_id.clone())
+    });
+    if let Some(organization) = organization {
+        request
+            .extensions_mut()
+            .insert(OrganizationId(organization));
         Ok(next.run(request).await)
     } else {
         Err(AuthError)

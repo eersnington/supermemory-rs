@@ -1,6 +1,7 @@
 //! Application configuration and startup.
 
 pub mod credentials;
+pub mod legacy;
 
 use std::{
     fs::OpenOptions,
@@ -11,6 +12,7 @@ use std::{
 };
 
 use clap::Parser;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 
@@ -118,9 +120,10 @@ async fn start(config: Config) -> Result<(), StartupError> {
         "local SQLite storage",
         &config.database.display().to_string(),
     );
-    let storage = tokio::task::spawn_blocking(move || storage::Storage::open(database))
+    let mut storage = tokio::task::spawn_blocking(move || storage::Storage::open(database))
         .await
         .map_err(StartupError::DatabaseExecutor)??;
+    migrate_legacy_snapshot(&mut storage, &legacy_data_dir)?;
     let organization_id = storage.local_organization_id().to_owned();
     let storage = std::sync::Arc::new(std::sync::Mutex::new(storage));
     print_success("local SQLite storage", "ready", database_started.elapsed());
@@ -172,6 +175,44 @@ async fn start(config: Config) -> Result<(), StartupError> {
         },
     )
     .await?;
+    Ok(())
+}
+
+fn migrate_legacy_snapshot(
+    storage: &mut storage::Storage,
+    legacy_data_dir: &Path,
+) -> Result<(), StartupError> {
+    let source = legacy_data_dir.join("data");
+    if !source.exists() {
+        return Ok(());
+    }
+    let source_bytes =
+        std::fs::read(&source).map_err(|source_error| StartupError::ReadLegacySnapshot {
+            path: source.clone(),
+            source: source_error,
+        })?;
+    let source_hash = format!("{:x}", Sha256::digest(&source_bytes));
+    drop(source_bytes);
+    if storage.has_legacy_import(&source_hash)? {
+        return Ok(());
+    }
+    let output = std::env::temp_dir().join(format!(
+        "supermemory-legacy-export-{}.jsonl",
+        storage::generate_id()?
+    ));
+    legacy::export_snapshot(
+        legacy_data_dir,
+        &legacy_data_dir.join("runtime/pglite"),
+        &output,
+    )?;
+    let import_result = storage.import_legacy_export(&output);
+    let cleanup_result = std::fs::remove_file(&output);
+    let report = import_result?;
+    cleanup_result.map_err(|source| StartupError::RemoveLegacyExport {
+        path: output,
+        source,
+    })?;
+    storage.record_legacy_import(&source_hash, &report)?;
     Ok(())
 }
 
@@ -365,6 +406,20 @@ pub enum StartupError {
     Credentials(#[from] credentials::CredentialError),
     #[error(transparent)]
     Provider(#[from] memory_engine::ProviderError),
+    #[error(transparent)]
+    LegacyExport(#[from] legacy::LegacyExportError),
+    #[error("failed to read legacy snapshot {path}; source data was not changed: {source}")]
+    ReadLegacySnapshot {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to remove temporary legacy export {path}: {source}")]
+    RemoveLegacyExport {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Server(#[from] server::ServerError),
 }

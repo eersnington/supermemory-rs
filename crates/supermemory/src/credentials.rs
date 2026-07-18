@@ -56,11 +56,26 @@ pub fn decrypt_file(
     path: &Path,
     data_dir: &Path,
 ) -> Result<BTreeMap<String, String>, CredentialError> {
+    let plaintext = decrypt_frame(path, data_dir, MAGIC, CONTEXT)?;
+    let plaintext = String::from_utf8(plaintext).map_err(CredentialError::Utf8)?;
+    parse_env(&plaintext)
+}
+
+/// Decrypts a compatible Supermemory AES-GCM frame for migration.
+///
+/// # Errors
+/// Returns an error if the frame is malformed or cannot be authenticated.
+pub fn decrypt_frame(
+    path: &Path,
+    data_dir: &Path,
+    magic: &[u8; 4],
+    context: &[u8],
+) -> Result<Vec<u8>, CredentialError> {
     let frame = std::fs::read(path).map_err(|source| CredentialError::Read {
         path: path.to_path_buf(),
         source,
     })?;
-    if frame.len() < 32 || frame.get(..4) != Some(MAGIC) {
+    if frame.len() < 32 || frame.get(..4) != Some(magic) {
         return Err(CredentialError::MalformedFrame {
             path: path.to_path_buf(),
         });
@@ -68,15 +83,14 @@ pub fn decrypt_file(
     let nonce = GenericArray::from_slice(&frame[4..16]);
     let tag = GenericArray::from_slice(&frame[16..32]);
     for machine_id in machine_ids(data_dir) {
-        let key = derive_key(&machine_id);
+        let key = derive_key(&machine_id, context);
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| CredentialError::InvalidKey)?;
         let mut plaintext = frame[32..].to_vec();
         if cipher
             .decrypt_in_place_detached(nonce, b"", &mut plaintext, tag)
             .is_ok()
         {
-            let plaintext = String::from_utf8(plaintext).map_err(CredentialError::Utf8)?;
-            return parse_env(&plaintext);
+            return Ok(plaintext);
         }
     }
     Err(CredentialError::Authentication {
@@ -97,7 +111,7 @@ pub fn encrypt_file(
         .into_iter()
         .next()
         .ok_or(CredentialError::NoMachineIdentity)?;
-    let key = derive_key(&machine_id);
+    let key = derive_key(&machine_id, CONTEXT);
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| CredentialError::InvalidKey)?;
     let mut nonce = [0_u8; 12];
     getrandom::fill(&mut nonce).map_err(CredentialError::Random)?;
@@ -137,14 +151,14 @@ pub fn encrypt_file(
     })
 }
 
-fn derive_key(machine_id: &str) -> [u8; 32] {
+fn derive_key(machine_id: &str, context: &[u8]) -> [u8; 32] {
     let machine_hash = Sha256::digest(machine_id.as_bytes());
     let mut mixed = [0_u8; 32];
     for (index, byte) in mixed.iter_mut().enumerate() {
         *byte = BUILD_SECRET[index] ^ machine_hash[index];
     }
     let mut key = [0_u8; 32];
-    pbkdf2_hmac::<Sha256>(&mixed, CONTEXT, 100_000, &mut key);
+    pbkdf2_hmac::<Sha256>(&mixed, context, 100_000, &mut key);
     key
 }
 

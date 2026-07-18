@@ -1,0 +1,8 @@
+{
+  "name": "supermemory-rs-legacy-exporter",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@electric-sql/pglite": "https://registry.npmjs.org/@electric-sql/pglite/-/pglite-0.3.16.tgz"
+  }
+}
