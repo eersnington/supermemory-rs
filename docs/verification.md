@@ -1,83 +1,97 @@
-# Verification status
+# Verify compatibility and performance
 
-This page records executed checks. It is not a claim of full v0.0.5 parity.
+This page records checks that have run against the release binary. The strongest result is a matched five-question LoCoMo comparison with `supermemory-server` v0.0.5. Passing these checks does not establish full parity.
 
-## SDK compatibility
+## Review verified coverage
 
-The release binary passed these local smoke tests on July 19, 2026:
+The release binary passes the tested client flows, legacy migration, local embedding fixture, and matched MemoryBench workload. Known application programming interface and retrieval gaps remain.
 
-- `supermemory` JavaScript SDK 4.0.0: add, status polling, V3 search, V4 document search, and profile.
-- `supermemory` Python SDK 3.51.0: the same request sequence.
-- `@supermemory/tools` 2.1.1: all seven AI SDK and OpenAI tool definitions constructed against the local base URL.
+| Area | Status | Evidence |
+| --- | --- | --- |
+| JavaScript client | Passed | `supermemory` 4.0.0 smoke flow |
+| Python client | Passed | `supermemory` 3.51.0 smoke flow |
+| Tool definitions | Passed | Seven `@supermemory/tools` 2.1.1 definitions |
+| Legacy migration | Passed | Real encrypted v0.0.5 snapshot |
+| Matched MemoryBench run | Passed | Same questions, episodes, models, and fresh data |
+| Full parity | Not established | Gaps listed below |
 
-The scripts are in `compat/`.
+## Compare matched MemoryBench results
 
-## Legacy migration
+The official MemoryBench runner tested both servers on July 19, 2026. Each run used fresh data, the same 127 LoCoMo episodes, and the same five question IDs. Both runs used the existing local `bge-base-en-v1.5` embedding model, Gemini memory extraction, and Gemini 2.5 Flash for answers and judging.
 
-The migration test decrypted a real v0.0.5 `SMD1` snapshot, loaded it through the matching `PGlite` WASM and filesystem bundle, exported stable JSONL, and imported it into a fresh SQLite database. The source snapshot was not modified. The test also covers `SME1` credential re-encryption.
+Memory sampling ran once per second from server readiness through evaluation. The v0.0.5 measurements include `supermemory-server` and its detached Rivet engine.
 
-Run this check with:
+| Measurement | Rust | v0.0.5 | Relative result |
+| --- | ---: | ---: | --- |
+| Answer accuracy | 80% (4/5) | 100% (5/5) | v0.0.5: +20 percentage points |
+| Retrieval Hit@10 | 80% | 80% | Equal |
+| Mean reciprocal rank (MRR) | 0.700 | 0.640 | Rust: 1.09x higher |
+| Normalized discounted cumulative gain (NDCG) | 0.726 | 0.632 | Rust: 1.15x higher |
+| Ingestion acceptance, mean | 47 ms | 1,900 ms | Rust: 40.4x faster |
+| Cold indexing, mean | 419,121 ms | 349,442 ms | Rust: 1.20x slower |
+| Search, mean | 32 ms | 111 ms | Rust: 3.47x faster |
+| Search, p95 | 47 ms | 158 ms | Rust: 3.36x faster |
+| Answer context, mean | 7,297 tokens | 11,122 tokens | v0.0.5: 1.52x as many |
+| Ready resident set size (RSS) | 218,640 KiB | 1,581,312 KiB | Rust: 7.23x lower |
+| Workload RSS, mean | 337,907 KiB | 1,353,826 KiB | Rust: 4.01x lower |
+| Workload RSS, peak | 412,352 KiB | 1,824,096 KiB | Rust: 4.42x lower |
+| Populated restart RSS | 188,384 KiB | 1,041,314 KiB | Rust: 5.53x lower |
+
+Rust used less memory and returned search results faster, but its cold indexing took 20% longer. v0.0.5 answered one additional question correctly, while both implementations achieved the same Hit@10.
+
+Do not use answer and judge latency to compare server performance because those phases include external Gemini requests. Five questions can expose compatibility and resource differences, but they cannot establish a stable quality ranking.
+
+### Reset the v0.0.5 Rivet engine
+
+v0.0.5 can leave its Rivet engine listening on `127.0.0.1:6420` after the server exits. A new server may reuse that stale process and leave accepted documents queued. Stop the orphaned Rivet process before running v0.0.5 with a fresh data directory.
+
+This failure occurred during verification. After the stale engine stopped, a one-document probe moved from `queued` to `indexing` to `done` in 6s, and the matched benchmark completed.
+
+## Check client compatibility
+
+The release binary passed these local client checks on July 19, 2026:
+
+- `supermemory` JavaScript software development kit (SDK) 4.0.0: add, status polling, V3 search, V4 document search, and profile
+- `supermemory` Python SDK 3.51.0: the same request sequence
+- `@supermemory/tools` 2.1.1: all seven artificial intelligence (AI) SDK and OpenAI tool definitions constructed against the local URL
+
+Run the scripts from `compat/`. Read the [compatibility check instructions](../compat/README.md) for their scope and dependencies.
+
+## Check legacy migration
+
+The migration test decrypts a real v0.0.5 `SMD1` snapshot and opens it with the matching PGlite WebAssembly runtime and filesystem bundle. It exports deterministic JSON Lines, imports them into a fresh SQLite database, and verifies `SME1` credential re-encryption. The test does not modify the source snapshot.
+
+Run the migration check with:
 
 ```sh
 SUPERMEMORY_TEST_LEGACY=1 cargo test -p supermemory --test legacy --locked
 ```
 
-## Local performance smoke test
+Read the [legacy migration instructions](../migration/README.md) for the exporter dependency and startup path.
 
-The release build processed 50 short documents and 100 requests per endpoint on the development machine. This was a smoke test, not a controlled benchmark.
+## Run the application programming interface smoke test
 
-```text
-accepted ingestion: 1889.99 documents/s
-processing pipeline: 59.60 documents/s
-search p95: 2.99 ms
-profile p95: 0.21 ms
-steady RSS after workload: 185152 KiB
-```
+`compat/api-smoke.mjs` is a manual development check for application programming interface (API) throughput and latency. It is not a controlled comparison and does not run in continuous integration.
 
-The raw performance harness is `bench/smoke.mjs`. The controlled cross-server workload below
-supersedes the earlier unmatched v0.0.5 RSS observation.
+One release run processed 50 short documents and sent 100 requests to each measured endpoint:
 
-## MemoryBench
+| Measurement | Result |
+| --- | ---: |
+| Ingestion acceptance | 1,889.99 documents/s |
+| Processing throughput | 59.60 documents/s |
+| Search p95 | 2.99 ms |
+| Profile p95 | 0.21 ms |
+| Steady RSS after the workload | 185,152 KiB |
 
-The official MemoryBench runner completed a controlled five-question LoCoMo comparison on July
-19, 2026. Both servers used fresh isolated databases, the same 127 episodes, the same five
-question IDs, the same local BGE assets, Gemini memory extraction, and Gemini 2.5 Flash for
-answering and judging. Each process was sampled once per second from readiness through the full
-run. v0.0.5 memory includes both `supermemory-server` and its detached Rivet engine.
+Use the matched MemoryBench results for cross-server conclusions.
 
-| Measurement | Rust | v0.0.5 | Relative result |
-| --- | ---: | ---: | --- |
-| Accuracy | 80% (4/5) | 100% (5/5) | v0.0.5 1.25x higher |
-| Hit@10 | 80% | 80% | Equal |
-| MRR | 0.700 | 0.640 | Rust 1.09x higher |
-| NDCG | 0.726 | 0.632 | Rust 1.15x higher |
-| Accepted-ingestion mean | 47 ms | 1,900 ms | Rust 40.4x faster |
-| Cold-indexing mean | 419,121 ms | 349,442 ms | Rust 1.20x slower |
-| Search mean | 32 ms | 111 ms | Rust 3.47x faster |
-| Search p95 | 47 ms | 158 ms | Rust 3.36x faster |
-| Answer context mean | 7,297 tokens | 11,122 tokens | Rust used 1.52x fewer tokens |
-| Ready RSS | 218,640 KiB | 1,581,312 KiB | Rust used 7.23x less memory |
-| Workload mean RSS | 337,907 KiB | 1,353,826 KiB | Rust used 4.01x less memory |
-| Workload peak RSS | 412,352 KiB | 1,824,096 KiB | Rust used 4.42x less memory |
-| Populated restart RSS | 188,384 KiB | 1,041,314 KiB | Rust used 5.53x less memory |
+## Track remaining parity gaps
 
-On this matched run, Rust search was 3.5 times faster, but Rust cold indexing was 20% slower.
-Rust used 4.4 times less memory at workload peak and 5.5 times less after reopening the populated
-database. Answer and judge latency are not server performance measurements because they include
-external Gemini calls. Five questions are enough for a compatibility and resource comparison,
-not a statistically stable quality ranking.
+The following behavior still differs from or lacks full verification against v0.0.5:
 
-Repeated v0.0.5 attempts initially remained queued because the server left an orphaned global
-Rivet engine listening on `127.0.0.1:6420` after shutdown. Fresh server processes reused that
-stale engine and accepted documents without dispatching their workflows. Stopping the orphaned
-engine restored processing; a one-document probe then transitioned from queued to indexing to
-done in six seconds before the completed benchmark run.
-
-## Remaining parity gaps
-
-- Temporal query parsing and provider-backed query rewriting are incomplete.
-- V3 adjacent-chunk context and Workers AI reranking are incomplete.
-- Batch `forget-matching` and direct memory update/create routes are incomplete.
-- Dynamic profile diversification and summary caching are simpler than v0.0.5.
-- URL, PDF, image, audio, and multipart file extraction are not implemented.
-- The full SDK route inventory has not passed.
+- Temporal query parsing and provider-backed query rewriting
+- V3 adjacent-chunk context and Workers AI reranking
+- Batch `forget-matching` and direct memory creation and update routes
+- Dynamic profile diversification and summary caching
+- URL, PDF, image, audio, and multipart file extraction
+- Full JavaScript and Python SDK route inventories

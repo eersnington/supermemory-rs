@@ -1,3 +1,5 @@
+// Measures API throughput and latency against a running compatible server.
+// This manual smoke test does not run during startup, continuous integration, or MemoryBench.
 const baseURL = process.env.SUPERMEMORY_BASE_URL;
 const apiKey = process.env.SUPERMEMORY_API_KEY;
 const documentCount = Number(process.env.BENCH_DOCUMENTS ?? 50);
