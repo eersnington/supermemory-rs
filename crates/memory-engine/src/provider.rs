@@ -40,43 +40,71 @@ pub struct ProviderConfig {
     pub api_key: String,
     pub model: String,
     pub base_url: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+/// User-configurable model names for supported providers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModels {
+    pub openai: String,
+    pub openai_reasoning_effort: String,
+    pub anthropic: String,
+    pub gemini: String,
+    pub groq: String,
+}
+
+impl Default for ProviderModels {
+    fn default() -> Self {
+        Self {
+            openai: "gpt-5.6-luna".to_owned(),
+            openai_reasoning_effort: "medium".to_owned(),
+            anthropic: "claude-haiku-4-5".to_owned(),
+            gemini: "gemini-3.5-flash".to_owned(),
+            groq: "openai/gpt-oss-120b".to_owned(),
+        }
+    }
 }
 
 impl ProviderConfig {
-    /// Selects the first provider configured with the v0.0.5 precedence and defaults.
+    /// Selects the first provider configured with v0.0.5 precedence.
     #[must_use]
-    pub fn from_values(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+    pub fn from_values(
+        get: impl Fn(&str) -> Option<String>,
+        models: &ProviderModels,
+    ) -> Option<Self> {
         if let Some(api_key) = nonempty(get("OPENAI_API_KEY")) {
             return Some(Self {
                 kind: ProviderKind::OpenAi,
                 api_key,
-                model: nonempty(get("OPENAI_TEXT_MODEL"))
-                    .or_else(|| nonempty(get("OPENAI_MODEL")))
-                    .unwrap_or_else(|| "gpt-5.1".to_owned()),
+                model: models.openai.clone(),
                 base_url: nonempty(get("OPENAI_BASE_URL")),
+                reasoning_effort: Some(models.openai_reasoning_effort.clone()),
             });
         }
         if let Some(api_key) = nonempty(get("ANTHROPIC_API_KEY")) {
             return Some(Self {
                 kind: ProviderKind::Anthropic,
                 api_key,
-                model: "claude-haiku-4-5".to_owned(),
+                model: models.anthropic.clone(),
                 base_url: None,
+                reasoning_effort: None,
             });
         }
         if let Some(api_key) = nonempty(get("GEMINI_API_KEY")) {
             return Some(Self {
                 kind: ProviderKind::Gemini,
                 api_key,
-                model: "gemini-3.1-flash-lite-preview".to_owned(),
+                model: models.gemini.clone(),
                 base_url: None,
+                reasoning_effort: None,
             });
         }
         nonempty(get("GROQ_API_KEY")).map(|api_key| Self {
             kind: ProviderKind::Groq,
             api_key,
-            model: "openai/gpt-oss-120b".to_owned(),
+            model: models.groq.clone(),
             base_url: None,
+            reasoning_effort: None,
         })
     }
 }
@@ -228,15 +256,19 @@ impl MemoryProvider {
                 ProviderKind::Groq => "https://api.groq.com/openai/v1",
                 _ => "https://api.openai.com/v1",
             });
+        let mut body = json!({
+            "model": self.config.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"}
+        });
+        if let Some(reasoning_effort) = self.config.reasoning_effort.as_deref() {
+            body["reasoning_effort"] = Value::String(reasoning_effort.to_owned());
+        }
         let response = self
             .client
             .post(format!("{}/chat/completions", base.trim_end_matches('/')))
             .bearer_auth(&self.config.api_key)
-            .json(&json!({
-                "model": self.config.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(ProviderError::Request)?;

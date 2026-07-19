@@ -2,6 +2,7 @@
 
 pub mod credentials;
 pub mod legacy;
+pub mod model_config;
 
 use std::{
     fs::OpenOptions,
@@ -103,12 +104,16 @@ async fn start(config: Config) -> Result<(), StartupError> {
         || PathBuf::from(".supermemory"),
         |home| PathBuf::from(home).join(".supermemory"),
     );
-    let provider_values = credentials::load_or_import(data_dir, &legacy_data_dir)?;
-    let provider_config = memory_engine::ProviderConfig::from_values(|key| {
-        std::env::var(key)
-            .ok()
-            .or_else(|| provider_values.get(key).cloned())
-    });
+    let mut provider_values = credentials::load_or_import(data_dir, &legacy_data_dir)?;
+    let provider_models =
+        memory_engine::ProviderModels::from(model_config::load_or_create(data_dir)?);
+    if provider_config(&provider_values, &provider_models).is_none()
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
+        prompt_for_provider(data_dir, &mut provider_values)?;
+    }
+    let provider_config = provider_config(&provider_values, &provider_models);
     let provider = provider_config
         .map(memory_engine::MemoryProvider::new)
         .transpose()?
@@ -176,6 +181,72 @@ async fn start(config: Config) -> Result<(), StartupError> {
     )
     .await?;
     Ok(())
+}
+
+fn provider_config(
+    stored: &std::collections::BTreeMap<String, String>,
+    models: &memory_engine::ProviderModels,
+) -> Option<memory_engine::ProviderConfig> {
+    memory_engine::ProviderConfig::from_values(
+        |key| std::env::var(key).ok().or_else(|| stored.get(key).cloned()),
+        models,
+    )
+}
+
+fn prompt_for_provider(
+    data_dir: &Path,
+    values: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(), StartupError> {
+    println!("  supermemory-rs needs an LLM API key for memory extraction.");
+    println!("  Pick a provider (you can add more later by setting environment variables):");
+    println!("    1) OpenAI      (OPENAI_API_KEY)");
+    println!("    2) Anthropic   (ANTHROPIC_API_KEY)");
+    println!("    3) Gemini      (GEMINI_API_KEY)");
+    println!("    4) Skip for now");
+
+    loop {
+        print!("  Choice [1-4]: ");
+        io::stdout().flush().map_err(StartupError::ProviderPrompt)?;
+        let mut input = String::new();
+        let bytes = io::stdin()
+            .read_line(&mut input)
+            .map_err(StartupError::ProviderPrompt)?;
+        if bytes == 0 {
+            return Err(StartupError::ProviderPromptClosed);
+        }
+        let Some((variable, label)) = provider_selection(&input) else {
+            println!("  Enter 1, 2, 3, or 4.");
+            continue;
+        };
+        let Some(variable) = variable else {
+            println!("  Skipped provider setup. Documents will not produce extracted memories.");
+            return Ok(());
+        };
+        let key = rpassword::prompt_password(format!("  Paste your {label} API key: "))
+            .map_err(StartupError::ProviderPrompt)?;
+        if key.trim().is_empty() {
+            println!("  The API key cannot be empty. Choose a provider and try again.");
+            continue;
+        }
+        values.insert(variable.to_owned(), key.trim().to_owned());
+        let path = data_dir.join("env.enc");
+        credentials::encrypt_file(&path, data_dir, values)?;
+        println!(
+            "  ✓ Saved {variable} → {} (encrypted · mode 600)",
+            path.display()
+        );
+        return Ok(());
+    }
+}
+
+fn provider_selection(input: &str) -> Option<(Option<&'static str>, &'static str)> {
+    match input.trim() {
+        "1" => Some((Some("OPENAI_API_KEY"), "OpenAI")),
+        "2" => Some((Some("ANTHROPIC_API_KEY"), "Anthropic")),
+        "3" => Some((Some("GEMINI_API_KEY"), "Gemini")),
+        "4" => Some((None, "")),
+        _ => None,
+    }
 }
 
 fn migrate_legacy_snapshot(
@@ -407,6 +478,12 @@ pub enum StartupError {
     #[error(transparent)]
     Provider(#[from] memory_engine::ProviderError),
     #[error(transparent)]
+    ModelConfig(#[from] model_config::ModelConfigError),
+    #[error("failed to read provider setup input; no credentials were written: {0}")]
+    ProviderPrompt(#[source] std::io::Error),
+    #[error("provider setup input closed before a choice was made; no credentials were written")]
+    ProviderPromptClosed,
+    #[error(transparent)]
     LegacyExport(#[from] legacy::LegacyExportError),
     #[error("failed to read legacy snapshot {path}; source data was not changed: {source}")]
     ReadLegacySnapshot {
@@ -422,4 +499,27 @@ pub enum StartupError {
     },
     #[error(transparent)]
     Server(#[from] server::ServerError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provider_selection;
+
+    #[test]
+    fn provider_selection_maps_supported_interactive_choices() {
+        assert_eq!(
+            provider_selection("1\n"),
+            Some((Some("OPENAI_API_KEY"), "OpenAI"))
+        );
+        assert_eq!(
+            provider_selection("2"),
+            Some((Some("ANTHROPIC_API_KEY"), "Anthropic"))
+        );
+        assert_eq!(
+            provider_selection("3"),
+            Some((Some("GEMINI_API_KEY"), "Gemini"))
+        );
+        assert_eq!(provider_selection("4"), Some((None, "")));
+        assert_eq!(provider_selection("invalid"), None);
+    }
 }

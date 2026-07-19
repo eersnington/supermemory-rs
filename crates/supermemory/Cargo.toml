@@ -15,6 +15,8 @@ clap.workspace = true
 getrandom.workspace = true
 memory-engine = { path = "../memory-engine" }
 pbkdf2.workspace = true
+rpassword.workspace = true
+serde.workspace = true
 server = { path = "../server" }
 sha2.workspace = true
 storage = { path = "../storage" }
@@ -22,6 +24,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

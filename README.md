@@ -16,7 +16,11 @@ Start it directly for loopback-only access:
 supermemory-rs
 ```
 
-Set one provider key to enable ingestion-time memory extraction:
+On an interactive first run, `supermemory-rs` prompts for OpenAI, Anthropic, or Gemini and stores
+the selected key in encrypted `~/.supermemory-rs/env.enc` storage with owner-only permissions.
+Select **Skip for now** to run without extracted memories.
+
+For unattended startup, set one provider key to enable ingestion-time memory extraction:
 
 | Provider | Environment variable |
 | --- | --- |
@@ -33,7 +37,27 @@ supermemory-rs
 ```
 
 Provider selection follows v0.0.5 precedence: OpenAI, Anthropic, Gemini, then Groq. OpenAI-compatible
-services can also set `OPENAI_BASE_URL` and `OPENAI_TEXT_MODEL`.
+services can also set `OPENAI_BASE_URL`.
+
+Provider models are configured in `~/.supermemory-rs/config.toml`, which is created with defaults
+on first startup:
+
+```toml
+[providers.openai]
+model = "gpt-5.6-luna"
+reasoning_effort = "medium"
+
+[providers.anthropic]
+model = "claude-haiku-4-5"
+
+[providers.gemini]
+model = "gemini-3.5-flash"
+
+[providers.groq]
+model = "openai/gpt-oss-120b"
+```
+
+Model names are read only from this TOML file, not from environment variables.
 
 Set `SUPERMEMORY_API_KEY` only when non-loopback clients need bearer authentication.
 

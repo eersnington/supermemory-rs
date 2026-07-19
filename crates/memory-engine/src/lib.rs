@@ -10,7 +10,7 @@ pub use chunking::{
 pub use embedding::{BGE_DIMENSIONS, EmbeddingError, EmbeddingModel, EmbeddingVector};
 pub use provider::{
     MemoryCandidate, MemoryProvider, ParentRelation, ProviderConfig, ProviderError, ProviderKind,
-    RelationKind, TemporalContext,
+    ProviderModels, RelationKind, TemporalContext,
 };
 
 use serde::{Deserialize, Serialize};
