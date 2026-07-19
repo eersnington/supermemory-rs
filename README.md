@@ -32,7 +32,16 @@ See the [semantic porting guidelines](docs/semantic-porting.md) for the compatib
 
 The model and runtime paths can be changed with `--model` and `--ort-library`, or with `SUPERMEMORY_MODEL` and `SUPERMEMORY_ORT_LIBRARY`.
 
-## Run it
+## Install and run
+
+```sh
+cargo install --path crates/supermemory --locked
+supermemory-rs
+```
+
+This installs the executable at `~/.cargo/bin/supermemory-rs`. Run the install command again after updating the source.
+
+To run directly from the checkout during development:
 
 ```sh
 cargo run -p supermemory

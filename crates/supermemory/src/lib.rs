@@ -16,6 +16,7 @@ use clap::Parser;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
+use unicode_width::UnicodeWidthStr;
 
 /// Non-secret command-line configuration.
 #[derive(Debug, Parser)]
@@ -397,10 +398,14 @@ fn print_ready(
         ("org id", organization_id.to_owned()),
         ("boot", format_duration(elapsed)),
     ];
-    let label_width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    let label_width = rows
+        .iter()
+        .map(|(label, _)| display_width(label))
+        .max()
+        .unwrap_or(0);
     let line_width = rows
         .iter()
-        .map(|(_, value)| label_width + value.len() + 2)
+        .map(|(_, value)| label_width + display_width(value) + 2)
         .chain([19])
         .max()
         .unwrap_or(19);
@@ -416,7 +421,7 @@ fn print_ready(
         " ".repeat(line_width + 4)
     );
     for (label, value) in rows {
-        let visible = label_width + value.len() + 2;
+        let visible = label_width + display_width(&value) + 2;
         println!(
             "\x1b[38;5;81m│{RESET}  {DIM}{label:>label_width$}{RESET}  {BOLD}{value}{RESET}{}  \x1b[38;5;81m│{RESET}",
             " ".repeat(line_width.saturating_sub(visible))
@@ -427,6 +432,10 @@ fn print_ready(
         "  {DIM}the api key above is auto-applied for unauthenticated localhost requests.{RESET}\n"
     );
     let _ = io::stdout().flush();
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
 }
 
 fn format_duration(duration: std::time::Duration) -> String {
@@ -503,7 +512,12 @@ pub enum StartupError {
 
 #[cfg(test)]
 mod tests {
-    use super::provider_selection;
+    use super::{display_width, provider_selection};
+
+    #[test]
+    fn display_width_counts_middle_dot_as_one_column() {
+        assert_eq!(display_width("BGE base 768d · local q8"), 24);
+    }
 
     #[test]
     fn provider_selection_maps_supported_interactive_choices() {
