@@ -10,14 +10,16 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 axum = "0.8"
 aes-gcm = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 http = "1"
-rusqlite = { version = "0.37", features = ["bundled"] }
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+postgres-types = "0.2"
+bytes = "1"
 reqwest = { version = "0.11.27", default-features = false, features = ["json", "rustls-tls"] }
 rpassword = "7"
 getrandom = "0.3"
@@ -35,6 +37,8 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+turso_pg = { path = "../turso/postgres/frontend" }
+turso_pg_server = { path = "../turso/postgres/server" }
 unicode-width = "0.2"
 
 [workspace.lints.rust]

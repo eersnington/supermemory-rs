@@ -4,19 +4,14 @@ use supermemory::Config;
 
 #[test]
 fn config_parses_explicit_startup_values() {
-    let config = Config::try_parse_from([
-        "supermemory",
-        "--bind",
-        "0.0.0.0:8080",
-        "--database",
-        "data.db",
-    ])
-    .expect("valid configuration");
+    let config =
+        Config::try_parse_from(["supermemory", "--bind", "0.0.0.0:8080", "--data", "data"])
+            .expect("valid configuration");
     assert_eq!(
         config.bind,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080)
     );
-    assert_eq!(config.database.to_string_lossy(), "data.db");
+    assert_eq!(config.data.to_string_lossy(), "data");
 }
 
 #[test]
@@ -31,9 +26,9 @@ fn config_uses_compatibility_default_port() {
 }
 
 #[test]
-fn config_uses_stable_per_user_database_by_default() {
+fn config_uses_local_turso_defaults() {
     let config = Config::try_parse_from(["supermemory-rs"]).expect("config");
-    assert!(config.database.ends_with(".supermemory-rs/supermemory.db"));
+    assert!(config.data.ends_with(".supermemory-rs"));
 }
 
 #[test]
