@@ -1388,11 +1388,12 @@ fn valid_future_datetime<C: GenericClient>(
     v: Option<&str>,
 ) -> Result<Option<String>, StorageError> {
     let Some(v) = v else { return Ok(None) };
-    let valid: bool = db
-        .query_one("SELECT $1::timestamptz>now()", &[&v])
+    let valid: String = db
+        .query_one("SELECT ($1::timestamptz>now())::text", &[&v])
         .map_err(StorageError::Read)?
-        .get(0);
-    Ok(valid.then(|| v.to_owned()))
+        .try_get(0)
+        .map_err(StorageError::Read)?;
+    Ok((valid == "true").then(|| v.to_owned()))
 }
 
 fn vector_text(vector: &[f32]) -> String {
