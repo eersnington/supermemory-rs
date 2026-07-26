@@ -1,6 +1,7 @@
 //! Application configuration and startup.
 
 pub mod credentials;
+pub mod legacy;
 pub mod model_config;
 
 use std::{
@@ -12,6 +13,7 @@ use std::{
 };
 
 use clap::Parser;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 use unicode_width::UnicodeWidthStr;
@@ -24,9 +26,9 @@ pub struct Config {
     #[arg(long, env = "SUPERMEMORY_BIND", default_value = "127.0.0.1:6767")]
     pub bind: SocketAddr,
 
-    /// Directory used for local configuration and credentials.
-    #[arg(long, env = "SUPERMEMORY_DATA", default_value_os_t = default_data_path())]
-    pub data: PathBuf,
+    /// Path to the `SQLite` database.
+    #[arg(long, env = "SUPERMEMORY_DATABASE", default_value_os_t = default_database_path())]
+    pub database: PathBuf,
 
     /// Existing local BGE model directory.
     #[arg(long, env = "SUPERMEMORY_MODEL", default_value_os_t = default_model_path())]
@@ -37,10 +39,10 @@ pub struct Config {
     pub ort_library: PathBuf,
 }
 
-fn default_data_path() -> PathBuf {
+fn default_database_path() -> PathBuf {
     std::env::var_os("HOME").map_or_else(
-        || PathBuf::from(".supermemory-rs"),
-        |home| PathBuf::from(home).join(".supermemory-rs"),
+        || PathBuf::from("supermemory.db"),
+        |home| PathBuf::from(home).join(".supermemory-rs/supermemory.db"),
     )
 }
 
@@ -88,11 +90,13 @@ async fn start(config: Config) -> Result<(), StartupError> {
     init_tracing()?;
     let boot = Instant::now();
     print_banner();
-    std::fs::create_dir_all(&config.data).map_err(|source| StartupError::CreateDataDirectory {
-        path: config.data.clone(),
-        source,
-    })?;
-    let data_dir = config.data.as_path();
+    if let Some(parent) = config.database.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| StartupError::CreateDataDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let data_dir = config.database.parent().unwrap_or_else(|| Path::new("."));
     let api_key = std::env::var("SUPERMEMORY_API_KEY")
         .ok()
         .filter(|key| !key.is_empty())
@@ -116,20 +120,19 @@ async fn start(config: Config) -> Result<(), StartupError> {
         .transpose()?
         .map(std::sync::Arc::new);
 
-    let database_path = data_dir.join("supermemory-turso.db");
+    let database = config.database.clone();
     let database_started = Instant::now();
     print_step(
-        "embedded Turso storage",
-        &database_path.display().to_string(),
+        "local SQLite storage",
+        &config.database.display().to_string(),
     );
-    let storage = start_embedded_turso(database_path.clone()).await?;
+    let mut storage = tokio::task::spawn_blocking(move || storage::Storage::open(database))
+        .await
+        .map_err(StartupError::DatabaseExecutor)??;
+    migrate_legacy_snapshot(&mut storage, &legacy_data_dir)?;
     let organization_id = storage.local_organization_id().to_owned();
     let storage = std::sync::Arc::new(std::sync::Mutex::new(storage));
-    print_success(
-        "embedded Turso storage",
-        "ready",
-        database_started.elapsed(),
-    );
+    print_success("local SQLite storage", "ready", database_started.elapsed());
     let model_path = config.model.clone();
     let ort_library = config.ort_library.clone();
     let model_started = Instant::now();
@@ -154,7 +157,7 @@ async fn start(config: Config) -> Result<(), StartupError> {
     }
     print_step("http server", &format!("port {}", config.bind.port()));
     let address = config.bind;
-    let displayed_database = database_path;
+    let database = config.database.clone();
     let displayed_api_key = api_key.clone();
     server::serve_with_services_ready(
         address,
@@ -170,7 +173,7 @@ async fn start(config: Config) -> Result<(), StartupError> {
             );
             print_ready(
                 address.port(),
-                &displayed_database,
+                &database,
                 &displayed_api_key,
                 &organization_id,
                 boot.elapsed(),
@@ -179,67 +182,6 @@ async fn start(config: Config) -> Result<(), StartupError> {
     )
     .await?;
     Ok(())
-}
-
-async fn start_embedded_turso(database: PathBuf) -> Result<storage::Storage, StartupError> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|error| StartupError::EmbeddedTurso(error.to_string()))?;
-    let address = listener
-        .local_addr()
-        .map_err(|error| StartupError::EmbeddedTurso(error.to_string()))?;
-    drop(listener);
-
-    let database_text = database.to_string_lossy().into_owned();
-    let options = turso_pg::DatabaseOpts::new()
-        .with_views(true)
-        .with_custom_types(true)
-        .with_encryption(true)
-        .with_index_method(true)
-        .with_autovacuum(true)
-        .with_attach(true)
-        .with_generated_columns(true);
-    let (_, database) = turso_pg::open_database(
-        &database_text,
-        None,
-        turso_pg::OpenFlags::default(),
-        options,
-    )
-    .map_err(|error| StartupError::EmbeddedTurso(error.to_string()))?;
-    let connection = turso_pg::Connection::new(
-        database
-            .connect()
-            .map_err(|error| StartupError::EmbeddedTurso(error.to_string()))?,
-    );
-    let server = turso_pg_server::TursoPgServer::new(
-        address.to_string(),
-        database_text,
-        connection,
-        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-    );
-    std::thread::Builder::new()
-        .name("supermemory-tursopg".to_owned())
-        .spawn(move || {
-            if let Err(error) = server.run() {
-                tracing::error!(%error, "embedded Turso server stopped");
-            }
-        })
-        .map_err(|error| StartupError::EmbeddedTurso(error.to_string()))?;
-
-    let database_url = format!("postgresql://{address}/postgres");
-    tokio::task::spawn_blocking(move || {
-        let mut last_error = None;
-        for _ in 0..100 {
-            match storage::Storage::open(&database_url) {
-                Ok(storage) => return Ok(storage),
-                Err(error) => last_error = Some(error),
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        Err(last_error.expect("embedded Turso connection was attempted"))
-    })
-    .await
-    .map_err(StartupError::DatabaseExecutor)?
-    .map_err(StartupError::Storage)
 }
 
 fn provider_config(
@@ -306,6 +248,44 @@ fn provider_selection(input: &str) -> Option<(Option<&'static str>, &'static str
         "4" => Some((None, "")),
         _ => None,
     }
+}
+
+fn migrate_legacy_snapshot(
+    storage: &mut storage::Storage,
+    legacy_data_dir: &Path,
+) -> Result<(), StartupError> {
+    let source = legacy_data_dir.join("data");
+    if !source.exists() {
+        return Ok(());
+    }
+    let source_bytes =
+        std::fs::read(&source).map_err(|source_error| StartupError::ReadLegacySnapshot {
+            path: source.clone(),
+            source: source_error,
+        })?;
+    let source_hash = format!("{:x}", Sha256::digest(&source_bytes));
+    drop(source_bytes);
+    if storage.has_legacy_import(&source_hash)? {
+        return Ok(());
+    }
+    let output = std::env::temp_dir().join(format!(
+        "supermemory-legacy-export-{}.jsonl",
+        storage::generate_id()?
+    ));
+    legacy::export_snapshot(
+        legacy_data_dir,
+        &legacy_data_dir.join("runtime/pglite"),
+        &output,
+    )?;
+    let import_result = storage.import_legacy_export(&output);
+    let cleanup_result = std::fs::remove_file(&output);
+    let report = import_result?;
+    cleanup_result.map_err(|source| StartupError::RemoveLegacyExport {
+        path: output,
+        source,
+    })?;
+    storage.record_legacy_import(&source_hash, &report)?;
+    Ok(())
 }
 
 fn load_or_create_api_key(data_dir: &Path) -> Result<String, StartupError> {
@@ -410,14 +390,8 @@ fn print_ready(
     }
     let rows = vec![
         ("url", format!("http://localhost:{port}")),
-        (
-            "database",
-            format!("embedded Turso ({})", database.display()),
-        ),
-        (
-            "search",
-            "Turso HNSW candidates + exact BGE reranking".to_owned(),
-        ),
+        ("database", format!("local SQLite ({})", database.display())),
+        ("search", "exact BGE semantic + SQLite FTS5".to_owned()),
         ("embeddings", "BGE base 768d · local q8".to_owned()),
         ("workflow", "revision-guarded durable worker".to_owned()),
         ("api key", api_key.to_owned()),
@@ -504,8 +478,6 @@ pub enum StartupError {
     Storage(#[from] storage::StorageError),
     #[error("database executor stopped during startup: {0}")]
     DatabaseExecutor(#[source] tokio::task::JoinError),
-    #[error("failed to start embedded Turso: {0}")]
-    EmbeddedTurso(String),
     #[error("embedding model executor stopped during startup: {0}")]
     ModelExecutor(#[source] tokio::task::JoinError),
     #[error(transparent)]
@@ -520,6 +492,20 @@ pub enum StartupError {
     ProviderPrompt(#[source] std::io::Error),
     #[error("provider setup input closed before a choice was made; no credentials were written")]
     ProviderPromptClosed,
+    #[error(transparent)]
+    LegacyExport(#[from] legacy::LegacyExportError),
+    #[error("failed to read legacy snapshot {path}; source data was not changed: {source}")]
+    ReadLegacySnapshot {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to remove temporary legacy export {path}: {source}")]
+    RemoveLegacyExport {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Server(#[from] server::ServerError),
 }

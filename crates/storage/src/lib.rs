@@ -1,25 +1,36 @@
-//! Synchronous `PostgreSQL` persistence and atomic document identity decisions.
-
-#![expect(
-    clippy::missing_errors_doc,
-    clippy::needless_pass_by_value,
-    reason = "the storage facade exposes one shared database error contract"
-)]
+//! `SQLite` persistence, migrations, and atomic document identity decisions.
 
 use std::{
-    cell::{RefCell, RefMut},
-    collections::{HashMap, HashSet},
+    collections::HashMap,
+    io::{BufRead, BufReader},
     path::Path,
+    thread,
+    time::Duration,
 };
 
-use bytes::BytesMut;
-use postgres::{Client, GenericClient, NoTls, Row};
-use postgres_types::{FromSql, IsNull, ToSql, Type, to_sql_checked};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use thiserror::Error;
 
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../../../migrations/0001_initial.sql")),
+    (
+        2,
+        include_str!("../../../migrations/0002_searchable_chunks.sql"),
+    ),
+    (
+        3,
+        include_str!("../../../migrations/0003_document_vectors.sql"),
+    ),
+    (4, include_str!("../../../migrations/0004_memories.sql")),
+    (
+        5,
+        include_str!("../../../migrations/0005_legacy_compatibility.sql"),
+    ),
+];
 const BASE58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const LOCAL_SLUG: &str = "local";
 
@@ -208,6 +219,22 @@ pub struct MemorySourceDocument {
     pub updated_at: String,
 }
 
+/// Counts from an idempotent legacy JSONL import.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyImportReport {
+    pub organizations: usize,
+    pub spaces: usize,
+    pub documents: usize,
+    pub chunks: usize,
+    pub memories: usize,
+    pub relations: usize,
+    pub sources: usize,
+    pub api_keys: usize,
+}
+
+/// Imported API-key hash paired with its organization, when known.
+pub type ApiKeyIdentity = ([u8; 32], Option<String>);
+
 /// Stored representation returned by the HTTP API.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -232,51 +259,58 @@ struct StoredDocument {
     content_hash: String,
 }
 
-/// An initialized synchronous `PostgreSQL` connection.
+/// An initialized application database connection.
 pub struct Storage {
-    connection: RefCell<Option<Client>>,
+    connection: Connection,
     local_org_id: String,
 }
 
 impl Storage {
-    /// Connects to `PostgreSQL` using the supplied connection string and initializes a fresh schema.
+    /// Opens a database and applies all embedded migrations.
+    ///
+    /// # Errors
+    /// Returns an error when the database cannot be opened, migrated, or seeded.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let dsn = path
-            .as_ref()
-            .to_str()
-            .ok_or(StorageError::InvalidConnectionString)?;
-        let mut connection = Client::connect(dsn, NoTls).map_err(StorageError::Open)?;
+        let mut connection = Connection::open(path).map_err(StorageError::Open)?;
         let local_org_id = initialize(&mut connection)?;
         Ok(Self {
-            connection: RefCell::new(Some(connection)),
+            connection,
             local_org_id,
         })
     }
 
-    /// Connects using `DATABASE_URL`. Intended for isolated test databases.
+    /// Opens an isolated in-memory database and applies all migrations.
+    ///
+    /// # Errors
+    /// Returns an error when the database cannot be migrated or seeded.
     pub fn in_memory() -> Result<Self, StorageError> {
-        let dsn = std::env::var("DATABASE_URL").map_err(|_| StorageError::MissingDatabaseUrl)?;
-        Self::open(dsn)
-    }
-
-    fn client(&self) -> RefMut<'_, Client> {
-        RefMut::map(self.connection.borrow_mut(), |connection| {
-            connection
-                .as_mut()
-                .expect("PostgreSQL client is available until Storage is dropped")
+        let mut connection = Connection::open_in_memory().map_err(StorageError::Open)?;
+        let local_org_id = initialize(&mut connection)?;
+        Ok(Self {
+            connection,
+            local_org_id,
         })
     }
 
+    /// Returns the organization used for local unauthenticated requests.
     #[must_use]
     pub fn local_organization_id(&self) -> &str {
         &self.local_org_id
     }
 
+    /// Sanitizes, identifies, updates, and if needed queues a document atomically.
+    ///
+    /// # Errors
+    /// Returns an error when randomness, serialization, or the transaction fails.
     pub fn upsert_document(&mut self, input: UpsertDocument) -> Result<UpsertResult, StorageError> {
-        let org = self.local_org_id.clone();
-        self.upsert_document_for(&org, input)
+        let org_id = self.local_org_id.clone();
+        self.upsert_document_for(&org_id, input)
     }
 
+    /// Applies document identity and upsert rules in an explicit organization.
+    ///
+    /// # Errors
+    /// Returns an error when identity resolution or persistence fails.
     pub fn upsert_document_for(
         &mut self,
         org_id: &str,
@@ -284,84 +318,89 @@ impl Storage {
     ) -> Result<UpsertResult, StorageError> {
         input.content = sanitize_content(&input.content);
         let hash = content_hash(&input.content);
-        let mut client = self.client();
-        let mut tx = client.transaction().map_err(StorageError::Write)?;
-        let existing = if let Some(custom) = input.custom_id.as_deref() {
-            find_custom(&mut tx, org_id, custom, &input.container_tags)?
+        let org_id = org_id.to_owned();
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+
+        let existing = if let Some(custom_id) = input.custom_id.as_deref() {
+            find_custom(&tx, &org_id, custom_id, &input.container_tags)?
         } else {
-            find_duplicate(
-                &mut tx,
-                org_id,
-                &hash,
-                &input.metadata,
-                &input.container_tags,
-            )?
+            find_duplicate(&tx, &org_id, &hash, &input.metadata, &input.container_tags)?
         };
+
         let result = if let Some(existing) = existing {
-            apply_existing(&mut tx, &existing, &input, &hash)?
+            apply_existing(&tx, &existing, &input, &hash)?
         } else {
-            insert_new(&mut tx, org_id, &input, &hash)?
+            insert_new(&tx, &org_id, &input, &hash)?
         };
         tx.commit().map_err(StorageError::Write)?;
         Ok(result)
     }
 
+    /// Finds by internal ID first, then custom ID, within the local organization.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails or stored JSON is malformed.
     pub fn find_document(&self, identifier: &str) -> Result<Option<Document>, StorageError> {
         self.find_document_for(&self.local_org_id, identifier)
     }
 
+    /// Finds a document by internal then custom ID in an explicit organization.
+    ///
+    /// # Errors
+    /// Returns an error when stored data cannot be read.
     pub fn find_document_for(
         &self,
         org_id: &str,
         identifier: &str,
     ) -> Result<Option<Document>, StorageError> {
-        let mut db = self.client();
-        if let Some(row) = db
-            .query_opt(
-                &format!("{SELECT_DOCUMENT} WHERE org_id=$1 AND id=$2 ORDER BY created_at LIMIT 1"),
-                &[&org_id, &identifier],
-            )
-            .map_err(StorageError::Read)?
-        {
-            return Ok(Some(read_document(&row)?.document));
+        if let Some(found) = query_one(&self.connection, "id = ?2", org_id, identifier)? {
+            return Ok(Some(found.document));
         }
-        db.query_opt(
-            &format!(
-                "{SELECT_DOCUMENT} WHERE org_id=$1 AND custom_id=$2 ORDER BY created_at LIMIT 1"
-            ),
-            &[&org_id, &identifier],
+        Ok(
+            query_one(&self.connection, "custom_id = ?2", org_id, identifier)?
+                .map(|found| found.document),
         )
-        .map_err(StorageError::Read)?
-        .map(|r| read_document(&r).map(|d| d.document))
-        .transpose()
     }
 
+    /// Atomically claims the oldest available document job.
+    ///
+    /// # Errors
+    /// Returns an error if the claim transaction cannot be read, written, or committed.
     pub fn claim_job(&mut self) -> Result<Option<ClaimedJob>, StorageError> {
-        let mut db = self.client();
-        let mut tx = db.transaction().map_err(StorageError::Write)?;
-        let row = tx.query_opt("SELECT j.id,d.id,d.content,j.revision,d.org_id FROM jobs j JOIN documents d ON d.id=j.document_id WHERE j.status='queued' AND j.revision=d.revision AND j.available_at<=now() ORDER BY j.created_at FOR UPDATE OF j SKIP LOCKED LIMIT 1", &[]).map_err(StorageError::Read)?;
-        let Some(row) = row else {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StorageError::Write)?;
+        let job = tx
+            .query_row(
+                "SELECT jobs.id, documents.id, documents.content, jobs.revision, documents.org_id FROM jobs JOIN documents ON documents.id=jobs.document_id WHERE jobs.status='queued' AND jobs.revision=documents.revision AND jobs.available_at <= CURRENT_TIMESTAMP ORDER BY jobs.created_at, jobs.rowid LIMIT 1",
+                [],
+                |row| Ok(ClaimedJob { id: row.get(0)?, document_id: row.get(1)?, content: row.get(2)?, revision: row.get(3)?, organization_id: row.get(4)? }),
+            )
+            .optional()
+            .map_err(StorageError::Read)?;
+        let Some(job) = job else {
             tx.commit().map_err(StorageError::Write)?;
             return Ok(None);
         };
-        let job = ClaimedJob {
-            id: row.get(0),
-            document_id: row.get(1),
-            content: row.get(2),
-            revision: row.get(3),
-            organization_id: row.get(4),
-        };
-        let revision_parameter = job.revision.to_string();
-        tx.execute("UPDATE jobs SET status='extracting',attempts=attempts+1,updated_at=now() WHERE id=$1 AND revision=$2::bigint", &[&job.id,&revision_parameter]).map_err(StorageError::Write)?;
         tx.execute(
-            "UPDATE documents SET status='extracting',updated_at=now() WHERE id=$1 AND revision=$2::bigint",
-            &[&job.document_id, &revision_parameter],
+            "UPDATE jobs SET status='extracting', attempts=attempts+1, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status='queued'",
+            params![job.id, job.revision],
+        )
+        .map_err(StorageError::Write)?;
+        tx.execute(
+            "UPDATE documents SET status='extracting', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+            params![job.document_id, job.revision],
         )
         .map_err(StorageError::Write)?;
         tx.commit().map_err(StorageError::Write)?;
         Ok(Some(job))
     }
 
+    /// Replaces a document's searchable chunks and completes its claimed job atomically.
+    ///
+    /// # Errors
+    /// Returns an error if searchable content or lifecycle state cannot be persisted.
     pub fn complete_job(
         &mut self,
         job: &ClaimedJob,
@@ -377,6 +416,10 @@ impl Storage {
         self.publish_job(job, &embedded, None)
     }
 
+    /// Atomically publishes chunks and normalized vectors for a claimed revision.
+    ///
+    /// # Errors
+    /// Returns an error when vector validation fails or the revision became stale.
     pub fn complete_embedded_job(
         &mut self,
         job: &ClaimedJob,
@@ -384,104 +427,122 @@ impl Storage {
         model_id: &str,
         dimensions: usize,
     ) -> Result<(), StorageError> {
-        if dimensions != 768 {
+        if dimensions == 0 {
             return Err(StorageError::InvalidVectorDimensions { dimensions });
         }
         for chunk in chunks {
             validate_vector(chunk.vector, dimensions)?;
         }
-        self.publish_job(job, chunks, Some(model_id))
+        self.publish_job(job, chunks, Some((model_id, dimensions)))
     }
 
     fn publish_job(
         &mut self,
         job: &ClaimedJob,
         chunks: &[EmbeddedChunk<'_>],
-        model_id: Option<&str>,
+        embedding: Option<(&str, usize)>,
     ) -> Result<(), StorageError> {
-        let mut db = self.client();
-        let mut tx = db.transaction().map_err(StorageError::Write)?;
-        let current = tx
-            .query_opt(
-                "SELECT revision FROM documents WHERE id=$1 FOR UPDATE",
-                &[&job.document_id],
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        let current_revision: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM documents WHERE id=?1",
+                [&job.document_id],
+                |row| row.get(0),
             )
-            .map_err(StorageError::Read)?
-            .map(|r| r.get(0));
-        if current != Some(job.revision) {
+            .optional()
+            .map_err(StorageError::Read)?;
+        if current_revision != Some(job.revision) {
             return Err(StorageError::StaleRevision {
                 document_id: job.document_id.clone(),
                 claimed: job.revision,
-                current,
+                current: current_revision,
             });
         }
-        let rows = tx
-            .query(
-                "SELECT ordinal,content,stable_id FROM document_chunks WHERE document_id=$1",
-                &[&job.document_id],
-            )
-            .map_err(StorageError::Read)?;
-        let mut existing: HashMap<(i64, String), String> = rows
-            .into_iter()
-            .map(|r| ((r.get(0), r.get(1)), r.get(2)))
-            .collect();
+        let mut existing = HashMap::new();
+        {
+            let mut statement = tx
+                .prepare(
+                    "SELECT ordinal, content, stable_id FROM document_chunks WHERE document_id=?1",
+                )
+                .map_err(StorageError::Read)?;
+            let rows = statement
+                .query_map([&job.document_id], |row| {
+                    Ok((
+                        row.get::<_, usize>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(StorageError::Read)?;
+            for row in rows {
+                let (ordinal, content, stable_id) = row.map_err(StorageError::Read)?;
+                existing.insert((ordinal, content), stable_id);
+            }
+        }
         tx.execute(
-            "DELETE FROM document_chunks WHERE document_id=$1",
-            &[&job.document_id],
+            "DELETE FROM document_chunks WHERE document_id=?1",
+            [&job.document_id],
         )
         .map_err(StorageError::Write)?;
         for (ordinal, chunk) in chunks.iter().enumerate() {
-            let ordinal = i64::try_from(ordinal).map_err(|_| StorageError::PositionOverflow)?;
-            let stable = existing
+            let stable_id = existing
                 .remove(&(ordinal, chunk.content.to_owned()))
                 .map_or_else(generate_id, Ok)?;
-            let ordinal_parameter = ordinal.to_string();
-            let chunk_id: i64 = tx
-                .query_one(
-                    "UPDATE id_allocator SET next_id=next_id+1 WHERE name='document_chunks' RETURNING next_id",
-                    &[],
-                )
-                .map_err(StorageError::Write)?
-                .get(0);
-            let chunk_id_parameter = chunk_id.to_string();
-            tx.execute("INSERT INTO document_chunks(id,document_id,ordinal,content,stable_id) VALUES($1::bigint,$2,$3::bigint,$4,$5)", &[&chunk_id_parameter,&job.document_id,&ordinal_parameter,&chunk.content,&stable]).map_err(StorageError::Write)?;
-            if let Some(model) = model_id {
-                let chunk_id_parameter = chunk_id.to_string();
-                let vector_parameter = vector_text(chunk.vector);
+            tx.execute(
+                "INSERT INTO document_chunks (document_id, ordinal, content, stable_id) VALUES (?1, ?2, ?3, ?4)",
+                params![job.document_id, ordinal, chunk.content, stable_id],
+            )
+            .map_err(StorageError::Write)?;
+            if let Some((model_id, dimensions)) = embedding {
+                let chunk_id = tx.last_insert_rowid();
                 tx.execute(
-                    "INSERT INTO chunk_embeddings(chunk_id,model_id,vector) VALUES($1::bigint,$2,$3::vector)",
-                    &[&chunk_id_parameter, &model, &vector_parameter],
+                    "INSERT INTO chunk_embeddings (chunk_id, model_id, dimensions, vector) VALUES (?1, ?2, ?3, ?4)",
+                    params![chunk_id, model_id, dimensions, vector_bytes(chunk.vector)],
                 )
                 .map_err(StorageError::Write)?;
             }
         }
-        let revision_parameter = job.revision.to_string();
-        tx.execute("UPDATE jobs SET status='done',last_error=NULL,updated_at=now() WHERE id=$1 AND revision=$2::bigint", &[&job.id,&revision_parameter]).map_err(StorageError::Write)?;
         tx.execute(
-            "UPDATE documents SET status='done',updated_at=now() WHERE id=$1 AND revision=$2::bigint",
-            &[&job.document_id, &revision_parameter],
+            "UPDATE jobs SET status='done', last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status IN ('extracting','chunking','embedding','indexing')",
+            params![job.id, job.revision],
+        )
+        .map_err(StorageError::Write)?;
+        tx.execute(
+            "UPDATE documents SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+            params![job.document_id, job.revision],
         )
         .map_err(StorageError::Write)?;
         tx.commit().map_err(StorageError::Write)
     }
 
+    /// Advances a claimed job and its current document revision to a processing stage.
+    ///
+    /// # Errors
+    /// Returns an error for an unsupported stage, stale revision, or failed transaction.
     pub fn mark_job_stage(&mut self, job: &ClaimedJob, stage: &str) -> Result<(), StorageError> {
+        if !matches!(stage, "chunking" | "embedding" | "indexing") {
+            return Err(StorageError::InvalidJobStage(stage.to_owned()));
+        }
         let expected = match stage {
             "chunking" => "extracting",
             "embedding" => "chunking",
             "indexing" => "embedding",
             _ => return Err(StorageError::InvalidJobStage(stage.to_owned())),
         };
-        let mut db = self.client();
-        let mut tx = db.transaction().map_err(StorageError::Write)?;
-        let a=tx.execute("UPDATE jobs SET status=$3,updated_at=now() WHERE id=$1 AND revision=$2 AND status=$4", &[&job.id,&job.revision,&stage,&expected]).map_err(StorageError::Write)?;
-        let b = tx
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        let jobs = tx
             .execute(
-                "UPDATE documents SET status=$3,updated_at=now() WHERE id=$1 AND revision=$2",
-                &[&job.document_id, &job.revision, &stage],
+                "UPDATE jobs SET status=?3, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status=?4",
+                params![job.id, job.revision, stage, expected],
             )
             .map_err(StorageError::Write)?;
-        if a != 1 || b != 1 {
+        let documents = tx
+            .execute(
+                "UPDATE documents SET status=?3, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+                params![job.document_id, job.revision, stage],
+            )
+            .map_err(StorageError::Write)?;
+        if jobs != 1 || documents != 1 {
             return Err(StorageError::StaleRevision {
                 document_id: job.document_id.clone(),
                 claimed: job.revision,
@@ -490,37 +551,87 @@ impl Storage {
         }
         tx.commit().map_err(StorageError::Write)
     }
+
+    /// Marks a claimed job and its document failed while preserving prior indexed content.
+    ///
+    /// # Errors
+    /// Returns an error if the failure state cannot be persisted atomically.
     pub fn fail_job(&mut self, job: &ClaimedJob, error: &str) -> Result<(), StorageError> {
-        let mut db = self.client();
-        let mut tx = db.transaction().map_err(StorageError::Write)?;
-        tx.execute("UPDATE jobs SET status='failed',last_error=$3,updated_at=now() WHERE id=$1 AND revision=$2",&[&job.id,&job.revision,&error]).map_err(StorageError::Write)?;
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
         tx.execute(
-            "UPDATE documents SET status='failed',updated_at=now() WHERE id=$1 AND revision=$2",
-            &[&job.document_id, &job.revision],
+            "UPDATE jobs SET status='failed', last_error=?3, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+            params![job.id, job.revision, error],
+        )
+        .map_err(StorageError::Write)?;
+        tx.execute(
+            "UPDATE documents SET status='failed', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+            params![job.document_id, job.revision],
         )
         .map_err(StorageError::Write)?;
         tx.commit().map_err(StorageError::Write)
     }
+
+    /// Deletes a claimed document whose extracted content produced no chunks.
+    ///
+    /// # Errors
+    /// Returns an error if the document cleanup transaction cannot be committed.
     pub fn delete_empty_document(&mut self, job: &ClaimedJob) -> Result<(), StorageError> {
-        self.client().execute("DELETE FROM documents WHERE id=$1 AND revision=$2 AND status IN ('extracting','chunking')",&[&job.document_id,&job.revision]).map(|_|()).map_err(StorageError::Write)
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        tx.execute(
+            "DELETE FROM documents WHERE id=?1 AND revision=?2 AND status IN ('extracting','chunking')",
+            params![job.document_id, job.revision],
+        )
+        .map_err(StorageError::Write)?;
+        tx.commit().map_err(StorageError::Write)
     }
 
+    /// Searches completed local documents using `SQLite` FTS5 relevance.
+    ///
+    /// # Errors
+    /// Returns an error if the search query cannot be executed or decoded.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StorageError> {
         self.search_for(&self.local_org_id, query, limit)
     }
+
+    /// Lexically searches one explicit organization.
+    ///
+    /// # Errors
+    /// Returns an error if the FTS query cannot be executed.
     pub fn search_for(
         &self,
         org_id: &str,
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>, StorageError> {
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let pattern = format!("%{}%", query.to_lowercase());
-        let limit_parameter = limit.to_string();
-        let rows=self.client().query("SELECT c.stable_id,d.id,c.content,1.0::float8,c.ordinal,d.custom_id,d.metadata,d.filepath,d.created_at::text,d.updated_at::text,d.content FROM document_chunks c JOIN documents d ON d.id=c.document_id WHERE lower(c.content) LIKE $1 AND d.org_id=$2 AND d.status='done' ORDER BY c.ordinal LIMIT $3::bigint",&[&pattern,&org_id,&limit_parameter]).map_err(StorageError::Read)?;
-        rows.iter().map(read_search_hit).collect()
+        let query = format!("\"{}\"", query.replace('"', "\"\""));
+        let mut statement = self.connection.prepare(
+            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, -bm25(document_chunks_fts), document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.content FROM document_chunks_fts JOIN document_chunks ON document_chunks.id=document_chunks_fts.rowid JOIN documents ON documents.id=document_chunks.document_id WHERE document_chunks_fts MATCH ?1 AND documents.org_id=?2 AND documents.status='done' ORDER BY bm25(document_chunks_fts), document_chunks.ordinal LIMIT ?3",
+        ).map_err(StorageError::Read)?;
+        statement
+            .query_map(params![query, org_id, limit], |row| {
+                Ok(SearchHit {
+                    id: row.get(0)?,
+                    document_id: row.get(1)?,
+                    chunk: row.get(2)?,
+                    score: row.get(3)?,
+                    position: row.get(4)?,
+                    custom_id: row.get(5)?,
+                    metadata: parse_json(&row.get::<_, String>(6)?, 6)?,
+                    filepath: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    document_content: row.get(10)?,
+                })
+            })
+            .map_err(StorageError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Read)
     }
 
+    /// Searches current chunks by exact cosine similarity over normalized vectors.
+    ///
+    /// # Errors
+    /// Returns an error for malformed query/stored vectors or a failed database read.
     pub fn search_semantic(
         &self,
         query: &[f32],
@@ -529,54 +640,104 @@ impl Storage {
         threshold: f32,
         options: &SearchOptions,
     ) -> Result<Vec<SearchHit>, StorageError> {
-        validate_vector(query, 768)?;
-        let org = options
+        validate_vector(query, query.len())?;
+        let dimensions = query.len();
+        let organization_id = options
             .organization_id
             .as_deref()
             .unwrap_or(&self.local_org_id);
-        let result_limit = limit;
-        let candidate_limit = i64::try_from(limit.saturating_mul(10)).unwrap_or(i64::MAX);
-        let query_parameter = PgVector(query.to_vec());
-        let sql = format!(
-            "SELECT c.stable_id,d.id,c.content,e.vector,c.ordinal,d.custom_id,d.metadata,d.filepath,d.created_at::text,d.updated_at::text,d.content,d.container_tags FROM chunk_embeddings e JOIN document_chunks c ON c.id=e.chunk_id JOIN documents d ON d.id=c.document_id WHERE e.model_id=$2 AND d.org_id=$3 AND d.status='done' ORDER BY e.vector<=>$1::vector LIMIT {candidate_limit}"
-        );
-        let rows = self
-            .client()
-            .query(&sql, &[&query_parameter, &model_id, &org])
+        let mut statement = self.connection.prepare(
+            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, chunk_embeddings.vector, document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.container_tags, documents.content FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?1 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?3 AND documents.status='done'",
+        ).map_err(StorageError::Read)?;
+        let rows = statement
+            .query_map(params![model_id, dimensions, organization_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, usize>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            })
             .map_err(StorageError::Read)?;
         let mut hits = Vec::new();
         for row in rows {
-            let metadata = object(row.get(6))?;
-            let tags: Vec<String> = serde_json::from_str(&row.get::<_, String>(11))
+            let (
+                id,
+                document_id,
+                chunk,
+                bytes,
+                ordinal,
+                custom_id,
+                metadata,
+                filepath,
+                created_at,
+                updated_at,
+                container_tags,
+                document_content,
+            ) = row.map_err(StorageError::Read)?;
+            let metadata: Map<String, Value> =
+                serde_json::from_str(&metadata).map_err(StorageError::DeserializeSearchData)?;
+            let container_tags: Vec<String> = serde_json::from_str(&container_tags)
                 .map_err(StorageError::DeserializeSearchData)?;
             if !matches_search_options(
-                row.get::<_, String>(1).as_str(),
-                row.get::<_, Option<String>>(5).as_deref(),
-                &tags,
-                row.get::<_, Option<String>>(7).as_deref(),
+                &document_id,
+                custom_id.as_deref(),
+                &container_tags,
+                filepath.as_deref(),
                 &metadata,
                 options,
             ) {
                 continue;
             }
-            let stored: PgVector = row.get(3);
-            let score = exact_similarity(query, &stored.0)?;
+            let vector = decode_vector(&bytes, dimensions)?;
+            let score: f32 = query
+                .iter()
+                .zip(vector)
+                .map(|(left, right)| left * right)
+                .sum();
             if score >= threshold {
-                hits.push(read_search_hit_with_score(&row, f64::from(score))?);
+                hits.push((
+                    SearchHit {
+                        id,
+                        document_id,
+                        chunk,
+                        score: f64::from(score),
+                        position: ordinal,
+                        custom_id,
+                        metadata,
+                        filepath,
+                        created_at,
+                        updated_at,
+                        document_content,
+                    },
+                    ordinal,
+                ));
             }
         }
-        hits.sort_by(|left, right| {
+        hits.sort_by(|(left, left_ordinal), (right, right_ordinal)| {
             right
                 .score
                 .total_cmp(&left.score)
                 .then_with(|| left.document_id.cmp(&right.document_id))
-                .then_with(|| left.position.cmp(&right.position))
+                .then_with(|| left_ordinal.cmp(right_ordinal))
                 .then_with(|| left.id.cmp(&right.id))
         });
-        hits.truncate(result_limit);
-        Ok(hits)
+        hits.truncate(limit);
+        Ok(hits.into_iter().map(|(hit, _)| hit).collect())
     }
 
+    /// Reconciles extracted memories, lineage, sources, and vectors in one transaction.
+    ///
+    /// # Errors
+    /// Returns an error if proposals are malformed or persistence cannot commit atomically.
     pub fn reconcile_memories(
         &mut self,
         document_id: &str,
@@ -585,9 +746,9 @@ impl Storage {
         model_id: &str,
         dimensions: usize,
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        let org = self.local_org_id.clone();
+        let org_id = self.local_org_id.clone();
         self.reconcile_memories_for(
-            &org,
+            &org_id,
             document_id,
             container_tag,
             proposals,
@@ -595,6 +756,11 @@ impl Storage {
             dimensions,
         )
     }
+
+    /// Reconciles extracted memories in an explicit organization.
+    ///
+    /// # Errors
+    /// Returns an error if proposals or persistence are invalid.
     pub fn reconcile_memories_for(
         &mut self,
         org_id: &str,
@@ -604,229 +770,344 @@ impl Storage {
         model_id: &str,
         dimensions: usize,
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        if dimensions != 768 {
-            return Err(StorageError::InvalidVectorDimensions { dimensions });
-        }
-        for p in proposals {
-            validate_vector(&p.vector, dimensions)?;
-            if p.temporary_id.is_empty() || p.content.trim().is_empty() {
+        for proposal in proposals {
+            validate_vector(&proposal.vector, dimensions)?;
+            if proposal.temporary_id.is_empty() || proposal.content.trim().is_empty() {
                 return Err(StorageError::InvalidMemoryProposal);
             }
         }
-        let mut db = self.client();
-        let mut tx = db.transaction().map_err(StorageError::Write)?;
-        if tx
-            .query_opt(
-                "SELECT 1 FROM documents WHERE id=$1 AND org_id=$2",
-                &[&document_id, &org_id],
+        let org_id = org_id.to_owned();
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        let document_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM documents WHERE id=?1 AND org_id=?2)",
+                params![document_id, org_id],
+                |row| row.get(0),
             )
-            .map_err(StorageError::Read)?
-            .is_none()
-        {
+            .map_err(StorageError::Read)?;
+        if !document_exists {
             return Err(StorageError::UnknownMemorySource(document_id.to_owned()));
         }
-        let mut temp = HashMap::new();
-        let mut ids = Vec::new();
-        for p in proposals {
-            if let Some(existing) = find_exact_memory(&mut tx, org_id, container_tag, &p.content)? {
-                tx.execute("INSERT INTO memory_sources(memory_id,document_id) VALUES($1,$2) ON CONFLICT DO NOTHING",&[&existing.id,&document_id]).map_err(StorageError::Write)?;
-                temp.insert(p.temporary_id.clone(), existing.id.clone());
-                ids.push(existing.id);
+        let mut temporary_ids = HashMap::new();
+        let mut record_ids = Vec::new();
+        for proposal in proposals {
+            if let Some(existing) =
+                find_exact_memory(&tx, &org_id, container_tag, &proposal.content)?
+            {
+                tx.execute(
+                    "INSERT OR IGNORE INTO memory_sources (memory_id, document_id) VALUES (?1, ?2)",
+                    params![existing.id, document_id],
+                )
+                .map_err(StorageError::Write)?;
+                temporary_ids.insert(proposal.temporary_id.clone(), existing.id.clone());
+                record_ids.push(existing.id);
                 continue;
             }
-            let parents =
-                resolve_memory_parents(&mut tx, org_id, container_tag, &p.parents, &temp)?;
+            let parents = resolve_memory_parents(
+                &tx,
+                &org_id,
+                container_tag,
+                &proposal.parents,
+                &temporary_ids,
+            )?;
             let primary = parents.first();
             let id = format!("mem_{}", generate_id()?);
-            let root = primary.map(|x| x.root_memory_id.clone().unwrap_or_else(|| x.id.clone()));
-            let parent = primary.map(|x| x.id.clone());
-            let version = primary.map_or(1, |x| x.version + 1);
-            let inferred = p.is_inferred || parents.iter().any(|x| x.relation == "derives");
-            let forget = valid_future_datetime(&mut tx, p.forget_after.as_deref())?;
-            let metadata = Value::Object(p.metadata.clone());
-            tx.execute("INSERT INTO memories(id,org_id,container_tag,content,metadata,is_inferred,is_static,root_memory_id,parent_memory_id,version,forget_after,forget_reason) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::timestamptz,$12)",&[&id,&org_id,&container_tag,&p.content,&metadata,&inferred,&p.is_static,&root,&parent,&version,&forget,&p.forget_reason]).map_err(StorageError::Write)?;
+            let root_memory_id = primary.map(|parent| {
+                parent
+                    .root_memory_id
+                    .clone()
+                    .unwrap_or_else(|| parent.id.clone())
+            });
+            let parent_memory_id = primary.map(|parent| parent.id.clone());
+            let version = primary.map_or(1, |parent| parent.version + 1);
+            let is_inferred =
+                proposal.is_inferred || parents.iter().any(|parent| parent.relation == "derives");
+            let forget_after = valid_future_datetime(&tx, proposal.forget_after.as_deref())?;
             tx.execute(
-                "INSERT INTO memory_sources(memory_id,document_id) VALUES($1,$2)",
-                &[&id, &document_id],
+                "INSERT INTO memories (id, org_id, container_tag, content, metadata, is_inferred, is_static, root_memory_id, parent_memory_id, version, forget_after, forget_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![id, org_id, container_tag, proposal.content, json(&proposal.metadata)?, is_inferred, proposal.is_static, root_memory_id, parent_memory_id, version, forget_after, proposal.forget_reason],
+            ).map_err(StorageError::Write)?;
+            tx.execute(
+                "INSERT INTO memory_sources (memory_id, document_id) VALUES (?1, ?2)",
+                params![id, document_id],
             )
             .map_err(StorageError::Write)?;
-            for x in &parents {
-                tx.execute("INSERT INTO memory_relations(parent_id,child_id,relation) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",&[&x.id,&id,&x.relation]).map_err(StorageError::Write)?;
-                if x.relation == "updates" {
-                    tx.execute("UPDATE memories SET is_latest=false,is_static=false,updated_at=now() WHERE id=$1",&[&x.id]).map_err(StorageError::Write)?;
+            for parent in &parents {
+                tx.execute(
+                    "INSERT OR IGNORE INTO memory_relations (parent_id, child_id, relation) VALUES (?1, ?2, ?3)",
+                    params![parent.id, id, parent.relation],
+                )
+                .map_err(StorageError::Write)?;
+                if parent.relation == "updates" {
                     tx.execute(
-                        "UPDATE memory_embeddings SET active=false WHERE memory_id=$1",
-                        &[&x.id],
+                        "UPDATE memories SET is_latest=0, is_static=0, updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+                        [&parent.id],
+                    )
+                    .map_err(StorageError::Write)?;
+                    tx.execute(
+                        "UPDATE memory_embeddings SET active=0 WHERE memory_id=?1",
+                        [&parent.id],
                     )
                     .map_err(StorageError::Write)?;
                 }
             }
             tx.execute(
-                "INSERT INTO memory_embeddings(memory_id,model_id,vector) VALUES($1,$2,$3)",
-                &[&id, &model_id, &vector_text(&p.vector)],
+                "INSERT INTO memory_embeddings (memory_id, model_id, dimensions, vector) VALUES (?1, ?2, ?3, ?4)",
+                params![id, model_id, dimensions, vector_bytes(&proposal.vector)],
             )
             .map_err(StorageError::Write)?;
-            temp.insert(p.temporary_id.clone(), id.clone());
-            ids.push(id);
+            temporary_ids.insert(proposal.temporary_id.clone(), id.clone());
+            record_ids.push(id);
         }
-        let records = ids
+        let records = record_ids
             .iter()
-            .map(|id| read_memory_by_id(&mut tx, id))
-            .collect::<Result<_, _>>()?;
+            .map(|id| read_memory_by_id(&tx, id))
+            .collect::<Result<Vec<_>, _>>()?;
         tx.commit().map_err(StorageError::Write)?;
         Ok(records)
     }
 
-    pub fn static_profile(&self, tag: &str) -> Result<Vec<MemoryRecord>, StorageError> {
-        self.static_profile_for(&self.local_org_id, tag)
+    /// Returns active static profile memories in recovered profile order.
+    ///
+    /// # Errors
+    /// Returns an error when stored memory data cannot be read.
+    pub fn static_profile(&self, container_tag: &str) -> Result<Vec<MemoryRecord>, StorageError> {
+        self.static_profile_for(&self.local_org_id, container_tag)
     }
+
+    /// Returns static profile memories in an explicit organization.
+    ///
+    /// # Errors
+    /// Returns an error when stored memory data cannot be read.
     pub fn static_profile_for(
         &self,
-        org: &str,
-        tag: &str,
+        org_id: &str,
+        container_tag: &str,
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        self.profile(org, tag, true, &HashSet::new())
+        let mut statement = self.connection.prepare(
+            "SELECT id, content, metadata, is_inferred, is_static, is_latest, is_forgotten, root_memory_id, parent_memory_id, version, forget_after, forget_reason, created_at, updated_at FROM memories WHERE org_id=?1 AND container_tag=?2 AND is_static=1 AND is_latest=1 AND is_forgotten=0 AND (forget_after IS NULL OR datetime(forget_after) > CURRENT_TIMESTAMP) ORDER BY (SELECT COUNT(*) FROM memory_sources WHERE memory_id=memories.id) DESC, updated_at DESC LIMIT 300",
+        ).map_err(StorageError::Read)?;
+        let rows = statement
+            .query_map(params![org_id, container_tag], read_memory)
+            .map_err(StorageError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Read)?;
+        Ok(deduplicate_memories(
+            rows,
+            100,
+            &std::collections::HashSet::new(),
+        ))
     }
+
+    /// Returns active dynamic profile memories ordered by recency.
+    ///
+    /// # Errors
+    /// Returns an error when stored memory data cannot be read.
     pub fn dynamic_profile(
         &self,
-        tag: &str,
-        statics: &[MemoryRecord],
+        container_tag: &str,
+        static_memories: &[MemoryRecord],
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        self.dynamic_profile_for(&self.local_org_id, tag, statics)
+        self.dynamic_profile_for(&self.local_org_id, container_tag, static_memories)
     }
+
+    /// Returns dynamic profile memories in an explicit organization.
+    ///
+    /// # Errors
+    /// Returns an error when stored memory data cannot be read.
     pub fn dynamic_profile_for(
         &self,
-        org: &str,
-        tag: &str,
-        statics: &[MemoryRecord],
+        org_id: &str,
+        container_tag: &str,
+        static_memories: &[MemoryRecord],
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        let excluded = statics
+        let mut statement = self.connection.prepare(
+            "SELECT id, content, metadata, is_inferred, is_static, is_latest, is_forgotten, root_memory_id, parent_memory_id, version, forget_after, forget_reason, created_at, updated_at FROM memories WHERE org_id=?1 AND container_tag=?2 AND is_static=0 AND is_latest=1 AND is_forgotten=0 AND (forget_after IS NULL OR datetime(forget_after) > CURRENT_TIMESTAMP) ORDER BY updated_at DESC LIMIT 300",
+        ).map_err(StorageError::Read)?;
+        let rows = statement
+            .query_map(params![org_id, container_tag], read_memory)
+            .map_err(StorageError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Read)?;
+        let excluded = static_memories
             .iter()
-            .map(|m| normalized_memory(&m.memory))
+            .map(|memory| normalized_memory(&memory.memory))
             .collect();
-        self.profile(org, tag, false, &excluded)
+        Ok(deduplicate_memories(rows, 100, &excluded))
     }
-    fn profile(
-        &self,
-        org: &str,
-        tag: &str,
-        is_static: bool,
-        excluded: &HashSet<String>,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
-        let rows=self.client().query("SELECT id,content,metadata,is_inferred,is_static,is_latest,is_forgotten,root_memory_id,parent_memory_id,version,forget_after::text,forget_reason,created_at::text,updated_at::text FROM memories WHERE org_id=$1 AND container_tag=$2 AND is_static=$3 AND is_latest AND NOT is_forgotten AND (forget_after IS NULL OR forget_after>now()) ORDER BY updated_at DESC LIMIT 300",&[&org,&tag,&is_static]).map_err(StorageError::Read)?;
-        let records = rows.iter().map(read_memory).collect::<Result<_, _>>()?;
-        Ok(deduplicate_memories(records, 100, excluded))
-    }
+
+    /// Returns memories assigned to a profile bucket.
+    ///
+    /// # Errors
+    /// Returns an error when stored memory data cannot be read.
     pub fn bucket_profile(
         &self,
-        tag: &str,
+        container_tag: &str,
         bucket: &str,
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        self.bucket_profile_for(&self.local_org_id, tag, bucket)
+        self.bucket_profile_for(&self.local_org_id, container_tag, bucket)
     }
+
+    /// Returns bucket memories in an explicit organization.
+    ///
+    /// # Errors
+    /// Returns an error when stored memory data cannot be read.
     pub fn bucket_profile_for(
         &self,
-        org: &str,
-        tag: &str,
+        org_id: &str,
+        container_tag: &str,
         bucket: &str,
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        let s = self.static_profile_for(org, tag)?;
-        let d = self.dynamic_profile_for(org, tag, &s)?;
-        Ok(s.into_iter()
-            .chain(d)
-            .filter(|m| {
-                m.metadata
+        let static_memories = self.static_profile_for(org_id, container_tag)?;
+        let dynamic = self.dynamic_profile_for(org_id, container_tag, &static_memories)?;
+        Ok(static_memories
+            .into_iter()
+            .chain(dynamic)
+            .filter(|memory| {
+                memory
+                    .metadata
                     .get("buckets")
                     .and_then(Value::as_array)
-                    .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(bucket)))
+                    .is_some_and(|buckets| {
+                        buckets.iter().any(|value| value.as_str() == Some(bucket))
+                    })
             })
             .take(100)
             .collect())
     }
 
+    /// Soft-forgets one active memory while preserving graph and source history.
+    ///
+    /// # Errors
+    /// Returns an error if the memory is absent or the transition cannot commit.
     pub fn forget_memory(
         &mut self,
         id: Option<&str>,
         content: Option<&str>,
-        tag: &str,
+        container_tag: &str,
         reason: Option<&str>,
     ) -> Result<String, StorageError> {
-        let org = self.local_org_id.clone();
-        self.forget_memory_for(&org, id, content, tag, reason)
+        let org_id = self.local_org_id.clone();
+        self.forget_memory_for(&org_id, id, content, container_tag, reason)
     }
+
+    /// Soft-forgets one active memory in an explicit organization.
+    ///
+    /// # Errors
+    /// Returns an error if the memory is absent or persistence fails.
     pub fn forget_memory_for(
         &mut self,
-        org: &str,
+        org_id: &str,
         id: Option<&str>,
         content: Option<&str>,
-        tag: &str,
+        container_tag: &str,
         reason: Option<&str>,
     ) -> Result<String, StorageError> {
-        let mut db = self.client();
-        let mut tx = db.transaction().map_err(StorageError::Write)?;
-        let row=if let Some(id)=id{tx.query_opt("SELECT id FROM memories WHERE id=$1 AND org_id=$2 AND container_tag=$3 AND NOT is_forgotten",&[&id,&org,&tag])}else if let Some(content)=content{tx.query_opt("SELECT id FROM memories WHERE content=$1 AND org_id=$2 AND container_tag=$3 AND NOT is_forgotten ORDER BY created_at LIMIT 1",&[&content,&org,&tag])}else{Ok(None)}.map_err(StorageError::Read)?;
-        let id: String = row.ok_or(StorageError::MemoryNotFound)?.get(0);
-        tx.execute("UPDATE memories SET is_forgotten=true,is_latest=false,is_static=false,forget_after=now(),forget_reason=$2,updated_at=now() WHERE id=$1",&[&id,&reason.unwrap_or("user_requested")]).map_err(StorageError::Write)?;
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        let memory_id: Option<String> = if let Some(id) = id {
+            tx.query_row(
+                "SELECT id FROM memories WHERE id=?1 AND org_id=?2 AND container_tag=?3 AND is_forgotten=0 AND (forget_after IS NULL OR datetime(forget_after) > CURRENT_TIMESTAMP)",
+                params![id, org_id, container_tag],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StorageError::Read)?
+        } else if let Some(content) = content {
+            tx.query_row(
+                "SELECT id FROM memories WHERE content=?1 AND org_id=?2 AND container_tag=?3 AND is_forgotten=0 AND (forget_after IS NULL OR datetime(forget_after) > CURRENT_TIMESTAMP) ORDER BY rowid LIMIT 1",
+                params![content, org_id, container_tag],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StorageError::Read)?
+        } else {
+            None
+        };
+        let memory_id = memory_id.ok_or(StorageError::MemoryNotFound)?;
         tx.execute(
-            "UPDATE memory_embeddings SET active=false WHERE memory_id=$1",
-            &[&id],
+            "UPDATE memories SET is_forgotten=1, is_latest=0, is_static=0, forget_after=CURRENT_TIMESTAMP, forget_reason=?2, updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+            params![memory_id, reason.unwrap_or("user_requested")],
+        )
+        .map_err(StorageError::Write)?;
+        tx.execute(
+            "UPDATE memory_embeddings SET active=0 WHERE memory_id=?1",
+            [&memory_id],
         )
         .map_err(StorageError::Write)?;
         tx.commit().map_err(StorageError::Write)?;
-        Ok(id)
+        Ok(memory_id)
     }
 
+    /// Searches canonical memories with exact cosine scoring.
+    ///
+    /// # Errors
+    /// Returns an error for malformed vectors or stored metadata.
     pub fn search_memories(
         &self,
-        q: &[f32],
-        model: &str,
-        tag: &str,
+        query: &[f32],
+        model_id: &str,
+        container_tag: &str,
         limit: usize,
         threshold: f32,
-        forgotten: bool,
+        include_forgotten: bool,
     ) -> Result<Vec<MemorySearchHit>, StorageError> {
         self.search_memories_for(
             &self.local_org_id,
-            q,
-            model,
-            tag,
+            query,
+            model_id,
+            container_tag,
             limit,
             threshold,
-            forgotten,
+            include_forgotten,
         )
     }
-    #[expect(clippy::too_many_arguments, reason = "public search contract")]
+
+    /// Searches memories in an explicit organization.
+    ///
+    /// # Errors
+    /// Returns an error for malformed stored vectors or metadata.
+    #[expect(clippy::too_many_arguments, reason = "search contract parameters")]
     pub fn search_memories_for(
         &self,
-        org: &str,
-        q: &[f32],
-        model: &str,
-        tag: &str,
+        org_id: &str,
+        query: &[f32],
+        model_id: &str,
+        container_tag: &str,
         limit: usize,
         threshold: f32,
-        forgotten: bool,
+        include_forgotten: bool,
     ) -> Result<Vec<MemorySearchHit>, StorageError> {
-        validate_vector(q, 768)?;
-        let candidate_limit = i64::try_from(limit.saturating_mul(10)).unwrap_or(i64::MAX);
-        let query_parameter = PgVector(q.to_vec());
-        let forgotten_parameter = forgotten.to_string();
-        let sql = format!(
-            "SELECT m.id,m.content,m.metadata,m.is_inferred,m.is_static,m.is_latest,m.is_forgotten,m.root_memory_id,m.parent_memory_id,m.version,m.forget_after::text,m.forget_reason,m.created_at::text,m.updated_at::text,e.vector FROM memory_embeddings e JOIN memories m ON m.id=e.memory_id WHERE m.org_id=$2 AND m.container_tag=$3 AND e.model_id=$4 AND (e.active OR $5::boolean) AND (NOT m.is_forgotten OR $5::boolean) ORDER BY e.vector<=>$1::vector LIMIT {candidate_limit}"
-        );
-        let rows = self
-            .client()
-            .query(
-                &sql,
-                &[&query_parameter, &org, &tag, &model, &forgotten_parameter],
+        validate_vector(query, query.len())?;
+        let mut statement = self.connection.prepare(
+            "SELECT memories.id, memories.content, memories.metadata, memories.is_inferred, memories.is_static, memories.is_latest, memories.is_forgotten, memories.root_memory_id, memories.parent_memory_id, memories.version, memories.forget_after, memories.forget_reason, memories.created_at, memories.updated_at, memory_embeddings.vector FROM memory_embeddings JOIN memories ON memories.id=memory_embeddings.memory_id WHERE memories.org_id=?1 AND memories.container_tag=?2 AND memory_embeddings.model_id=?3 AND memory_embeddings.dimensions=?4 AND (memory_embeddings.active=1 OR ?5=1) AND (memories.is_forgotten=0 OR ?5=1) AND (memories.forget_after IS NULL OR datetime(memories.forget_after) > CURRENT_TIMESTAMP OR ?5=1)",
+        ).map_err(StorageError::Read)?;
+        let rows = statement
+            .query_map(
+                params![
+                    org_id,
+                    container_tag,
+                    model_id,
+                    query.len(),
+                    include_forgotten
+                ],
+                |row| {
+                    let record = read_memory(row)?;
+                    Ok((record, row.get::<_, Vec<u8>>(14)?))
+                },
             )
             .map_err(StorageError::Read)?;
         let mut hits = Vec::new();
         for row in rows {
-            let vector: PgVector = row.get(14);
-            let similarity = exact_similarity(q, &vector.0)?;
+            let (record, bytes) = row.map_err(StorageError::Read)?;
+            let vector = decode_vector(&bytes, query.len())?;
+            let similarity: f32 = query
+                .iter()
+                .zip(vector)
+                .map(|(left, right)| left * right)
+                .sum();
             if similarity >= threshold {
                 hits.push(MemorySearchHit {
-                    record: read_memory(&row)?,
+                    record,
                     similarity: f64::from(similarity),
                     parents: Vec::new(),
                     children: Vec::new(),
@@ -842,233 +1123,718 @@ impl Storage {
                 .then_with(|| left.record.id.cmp(&right.record.id))
         });
         hits.truncate(limit);
-        let mut db = self.client();
         for hit in &mut hits {
-            let id = &hit.record.id;
-            hit.parents = memory_relations(&mut *db, id, true, None)?;
-            hit.children = memory_relations(&mut *db, id, false, None)?;
-            hit.documents = memory_source_documents(&mut *db, id)?;
+            hit.parents = memory_relations(&self.connection, &hit.record.id, true, None)?;
+            hit.children = memory_relations(&self.connection, &hit.record.id, false, None)?;
+            let mut related = memory_relations(
+                &self.connection,
+                &hit.record.id,
+                true,
+                Some(&["extends", "derives"]),
+            )?;
+            related.extend(memory_relations(
+                &self.connection,
+                &hit.record.id,
+                false,
+                Some(&["extends", "derives"]),
+            )?);
+            hit.related = related;
+            hit.documents = memory_source_documents(&self.connection, &hit.record.id)?;
         }
         Ok(hits)
     }
 
+    /// Returns the current migration version.
+    ///
+    /// # Errors
+    /// Returns an error when the migration ledger cannot be read.
+    pub fn migration_version(&self) -> Result<i64, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::Read)
+    }
+
+    /// Imports a stable JSONL export from the read-only legacy sidecar.
+    ///
+    /// Existing IDs are retained and duplicate rows make the operation idempotent.
+    ///
+    /// # Errors
+    /// Returns an error and rolls back the complete import if parsing or validation fails.
+    pub fn import_legacy_export(
+        &mut self,
+        path: &Path,
+    ) -> Result<LegacyImportReport, StorageError> {
+        let file = std::fs::File::open(path).map_err(|source| StorageError::ReadLegacyExport {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut tables: HashMap<String, Vec<Map<String, Value>>> = HashMap::new();
+        let mut complete = false;
+        for (index, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.map_err(|source| StorageError::ReadLegacyExport {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            let value: Value = serde_json::from_str(&line).map_err(|source| {
+                StorageError::MalformedLegacyExport {
+                    line: index + 1,
+                    source,
+                }
+            })?;
+            match value.get("type").and_then(Value::as_str) {
+                Some("row") => {
+                    let table = required_string(&value, "table")?.to_owned();
+                    let row = value
+                        .get("row")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .ok_or(StorageError::InvalidLegacyRow { line: index + 1 })?;
+                    tables.entry(table).or_default().push(row);
+                }
+                Some("complete") => complete = true,
+                Some("manifest" | "table") => {}
+                _ => return Err(StorageError::InvalidLegacyRow { line: index + 1 }),
+            }
+        }
+        if !complete {
+            return Err(StorageError::IncompleteLegacyExport);
+        }
+        self.import_legacy_tables(&tables)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "foreign-key import order is kept visible in one transaction"
+    )]
+    fn import_legacy_tables(
+        &mut self,
+        tables: &HashMap<String, Vec<Map<String, Value>>>,
+    ) -> Result<LegacyImportReport, StorageError> {
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        let mut report = LegacyImportReport::default();
+        for row in table_rows(tables, "organization") {
+            let id = field(row, "id")?;
+            let slug = field(row, "slug")?;
+            tx.execute(
+                "UPDATE organizations SET slug=slug || '-rs-' || substr(id, 1, 6) WHERE slug=?1 AND id<>?2 AND id=?3 AND NOT EXISTS(SELECT 1 FROM documents WHERE org_id=organizations.id)",
+                params![slug, id, self.local_org_id],
+            ).map_err(StorageError::Write)?;
+            report.organizations += tx.execute(
+                "INSERT OR IGNORE INTO organizations (id, slug, created_at, name, metadata) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, slug, field(row, "created_at")?, optional_field(row, "name"), json_field(row, "metadata", &json!({}))?],
+            ).map_err(StorageError::Write)?;
+        }
+        let mut spaces = HashMap::new();
+        for row in table_rows(tables, "space") {
+            let id = field(row, "id")?.to_owned();
+            let container_tag = field(row, "container_tag")?.to_owned();
+            spaces.insert(id.clone(), container_tag.clone());
+            report.spaces += tx.execute(
+                "INSERT OR IGNORE INTO spaces (id, org_id, container_tag, entity_context, name, description, metadata, profile_buckets, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![id, field(row, "org_id")?, container_tag, optional_field(row, "entity_context"), optional_field(row, "name"), optional_field(row, "description"), json_field(row, "metadata", &json!({}))?, json_field(row, "profile_buckets", &json!([]))?, field(row, "created_at")?, field(row, "updated_at")?],
+            ).map_err(StorageError::Write)?;
+        }
+        for row in table_rows(tables, "document") {
+            let mut metadata = object_field(row, "metadata")?;
+            copy_optional_metadata(row, &mut metadata, "title");
+            copy_optional_metadata(row, &mut metadata, "summary");
+            copy_optional_metadata(row, &mut metadata, "type");
+            let status = compatible_document_status(optional_field(row, "status"));
+            let task_type = match optional_field(row, "task_type") {
+                Some("superrag") => "superrag",
+                _ => "memory",
+            };
+            report.documents += tx.execute(
+                "INSERT OR IGNORE INTO documents (id, org_id, content, content_hash, custom_id, status, container_tags, entity_context, metadata, task_type, filepath, filter_by_metadata, dreaming, created_at, updated_at, title, summary, document_type, source, url, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, '{}', 'dynamic', ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                params![field(row, "id")?, field(row, "org_id")?, optional_field(row, "content").unwrap_or_default(), field(row, "content_hash")?, optional_field(row, "custom_id"), status, json_field(row, "container_tags", &json!(["sm_project_default"]))?, json(&metadata)?, task_type, optional_field(row, "filepath"), field(row, "created_at")?, field(row, "updated_at")?, optional_field(row, "title"), optional_field(row, "summary"), optional_field(row, "type"), optional_field(row, "source"), optional_field(row, "url"), optional_field(row, "user_id")],
+            ).map_err(StorageError::Write)?;
+        }
+        for row in table_rows(tables, "chunk") {
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO document_chunks (document_id, ordinal, content, stable_id) VALUES (?1, ?2, ?3, ?4)",
+                params![field(row, "document_id")?, integer_field(row, "position")?, field(row, "content")?, field(row, "id")?],
+            ).map_err(StorageError::Write)?;
+            report.chunks += changed;
+            if changed == 1 {
+                if let Some(vector) = vector_field(row, "embedding")? {
+                    let chunk_id = tx.last_insert_rowid();
+                    tx.execute(
+                        "INSERT INTO chunk_embeddings (chunk_id, model_id, dimensions, vector) VALUES (?1, ?2, ?3, ?4)",
+                        params![chunk_id, optional_field(row, "embedding_model").unwrap_or("legacy"), vector.len(), vector_bytes(&vector)],
+                    ).map_err(StorageError::Write)?;
+                }
+            }
+        }
+        let mut pending_parents = Vec::new();
+        for row in table_rows(tables, "memory_entry") {
+            let id = field(row, "id")?.to_owned();
+            let container_tag = optional_field(row, "space_id")
+                .and_then(|space| spaces.get(space))
+                .cloned()
+                .unwrap_or_else(|| "sm_project_default".to_owned());
+            let mut metadata = object_field(row, "metadata")?;
+            metadata.insert(
+                "buckets".to_owned(),
+                value_field(row, "buckets")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            );
+            report.memories += tx.execute(
+                "INSERT OR IGNORE INTO memories (id, org_id, container_tag, content, metadata, is_inferred, is_static, is_latest, is_forgotten, root_memory_id, parent_memory_id, version, forget_after, forget_reason, created_at, updated_at, source_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![id, field(row, "org_id")?, container_tag, field(row, "memory")?, json(&metadata)?, bool_field(row, "is_inference"), bool_field(row, "is_static"), bool_field(row, "is_latest"), bool_field(row, "is_forgotten"), optional_field(row, "root_memory_id"), integer_field(row, "version")?.max(1), optional_field(row, "forget_after"), optional_field(row, "forget_reason"), field(row, "created_at")?, field(row, "updated_at")?, integer_field(row, "source_count")?.max(0)],
+            ).map_err(StorageError::Write)?;
+            if let Some(parent) = optional_field(row, "parent_memory_id") {
+                pending_parents.push((id.clone(), parent.to_owned()));
+            }
+            if let Some(vector) = vector_field(row, "memory_embedding")? {
+                tx.execute(
+                    "INSERT OR IGNORE INTO memory_embeddings (memory_id, model_id, dimensions, vector, active) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![id, optional_field(row, "memory_embedding_model").unwrap_or("legacy"), vector.len(), vector_bytes(&vector), bool_field(row, "is_latest") && !bool_field(row, "is_forgotten")],
+                ).map_err(StorageError::Write)?;
+            }
+        }
+        for (id, parent) in pending_parents {
+            tx.execute(
+                "UPDATE memories SET parent_memory_id=?2 WHERE id=?1 AND EXISTS(SELECT 1 FROM memories WHERE id=?2)",
+                params![id, parent],
+            ).map_err(StorageError::Write)?;
+        }
+        for row in table_rows(tables, "memory_relations") {
+            let relation = compatible_relation(field(row, "relation")?);
+            report.relations += tx.execute(
+                "INSERT OR IGNORE INTO memory_relations (parent_id, child_id, relation) SELECT ?1, ?2, ?3 WHERE EXISTS(SELECT 1 FROM memories WHERE id=?1) AND EXISTS(SELECT 1 FROM memories WHERE id=?2)",
+                params![field(row, "from_id")?, field(row, "to_id")?, relation],
+            ).map_err(StorageError::Write)?;
+        }
+        for row in table_rows(tables, "memory_document_source") {
+            report.sources += tx.execute(
+                "INSERT OR IGNORE INTO memory_sources (memory_id, document_id, created_at) SELECT ?1, ?2, ?3 WHERE EXISTS(SELECT 1 FROM memories WHERE id=?1) AND EXISTS(SELECT 1 FROM documents WHERE id=?2)",
+                params![field(row, "memory_entry_id")?, field(row, "document_id")?, field(row, "added_at")?],
+            ).map_err(StorageError::Write)?;
+        }
+        let member_organizations = table_rows(tables, "member")
+            .iter()
+            .filter_map(|row| {
+                optional_field(row, "user_id")
+                    .zip(optional_field(row, "organization_id"))
+                    .map(|(user, org)| (user.to_owned(), org.to_owned()))
+            })
+            .collect::<HashMap<_, _>>();
+        let imported_organizations = table_rows(tables, "organization")
+            .iter()
+            .filter_map(|row| optional_field(row, "id"))
+            .collect::<std::collections::HashSet<_>>();
+        for row in table_rows(tables, "apikey") {
+            let Some(key) = optional_field(row, "key") else {
+                continue;
+            };
+            let organization_id = optional_field(row, "reference_id")
+                .and_then(|reference| member_organizations.get(reference))
+                .filter(|organization| imported_organizations.contains(organization.as_str()));
+            report.api_keys += tx.execute(
+                "INSERT OR IGNORE INTO api_keys (id, org_id, key_hash, name, enabled, expires_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![field(row, "id")?, organization_id, Sha256::digest(key.as_bytes()).as_slice(), optional_field(row, "name"), bool_field(row, "enabled"), optional_field(row, "expires_at"), field(row, "created_at")?, optional_field(row, "updated_at")],
+            ).map_err(StorageError::Write)?;
+        }
+        tx.commit().map_err(StorageError::Write)?;
+        Ok(report)
+    }
+
+    /// Returns active imported API-key hashes for authentication.
+    ///
+    /// # Errors
+    /// Returns an error if the key store cannot be read.
     pub fn api_key_hashes(&self) -> Result<Vec<[u8; 32]>, StorageError> {
         Ok(self
             .api_key_identities()?
             .into_iter()
-            .map(|x| x.0)
+            .map(|(hash, _)| hash)
             .collect())
     }
+
+    /// Returns active imported API-key hashes with organization identity.
+    ///
+    /// # Errors
+    /// Returns an error if a key hash is malformed or cannot be read.
     pub fn api_key_identities(&self) -> Result<Vec<ApiKeyIdentity>, StorageError> {
-        let rows=self.client().query("SELECT key_hash,org_id FROM api_keys WHERE enabled AND (expires_at IS NULL OR expires_at>now())",&[]).map_err(StorageError::Read)?;
-        rows.into_iter()
-            .map(|r| {
-                let b: Vec<u8> = r.get(0);
-                let hash = b
-                    .try_into()
-                    .map_err(|b: Vec<u8>| StorageError::MalformedApiKeyHash(b.len()))?;
-                Ok((hash, r.get(1)))
+        let mut statement = self.connection.prepare(
+            "SELECT key_hash, org_id FROM api_keys WHERE enabled=1 AND (expires_at IS NULL OR datetime(expires_at) > CURRENT_TIMESTAMP)",
+        ).map_err(StorageError::Read)?;
+        statement
+            .query_map([], |row| {
+                let bytes: Vec<u8> = row.get(0)?;
+                let hash = bytes.try_into().map_err(|bytes: Vec<u8>| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        format!("API key hash has {} bytes, expected 32", bytes.len()).into(),
+                    )
+                })?;
+                Ok((hash, row.get(1)?))
             })
-            .collect()
+            .map_err(StorageError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Read)
+    }
+
+    /// Returns whether a legacy snapshot fingerprint was fully imported.
+    ///
+    /// # Errors
+    /// Returns an error if the migration ledger cannot be read.
+    pub fn has_legacy_import(&self, source_hash: &str) -> Result<bool, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM legacy_imports WHERE source_hash=?1)",
+                [source_hash],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::Read)
+    }
+
+    /// Records a completed, validated legacy import fingerprint.
+    ///
+    /// # Errors
+    /// Returns an error if the completion marker cannot be persisted.
+    pub fn record_legacy_import(
+        &mut self,
+        source_hash: &str,
+        report: &LegacyImportReport,
+    ) -> Result<(), StorageError> {
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO legacy_imports (source_hash, report) VALUES (?1, ?2)",
+                params![source_hash, format!("{report:?}")],
+            )
+            .map(|_| ())
+            .map_err(StorageError::Write)
     }
 }
 
-impl Drop for Storage {
-    fn drop(&mut self) {
-        if let Some(client) = self.connection.get_mut().take() {
-            let _ = std::thread::spawn(move || drop(client)).join();
-        }
-    }
-}
-
-/// Stored API-key hash and optional organization.
-pub type ApiKeyIdentity = ([u8; 32], Option<String>);
-
-const SELECT_DOCUMENT: &str = "SELECT id,content,content_hash,custom_id,status,container_tags,entity_context,metadata,task_type,filepath,filter_by_metadata,dreaming,created_at::text,updated_at::text FROM documents";
-
-fn json_value<T: Serialize + ?Sized>(v: &T) -> Result<String, StorageError> {
-    serde_json::to_string(v).map_err(StorageError::Serialize)
-}
-fn read_document(r: &Row) -> Result<StoredDocument, StorageError> {
-    Ok(StoredDocument {
-        document: Document {
-            id: r.get(0),
-            content: r.get(1),
-            custom_id: r.get(3),
-            status: r.get(4),
-            container_tags: serde_json::from_str(&r.get::<_, String>(5))
-                .map_err(StorageError::DeserializeSearchData)?,
-            entity_context: r.get(6),
-            metadata: object(r.get(7))?,
-            task_type: r.get(8),
-            filepath: r.get(9),
-            filter_by_metadata: object(r.get(10))?,
-            dreaming: r.get(11),
-            created_at: r.get(12),
-            updated_at: r.get(13),
-        },
-        content_hash: r.get(2),
-    })
-}
-fn object(value: String) -> Result<Map<String, Value>, StorageError> {
-    serde_json::from_str(&value).map_err(StorageError::DeserializeSearchData)
-}
-fn read_search_hit(r: &Row) -> Result<SearchHit, StorageError> {
-    read_search_hit_with_score(r, r.get(3))
-}
-
-fn read_search_hit_with_score(r: &Row, score: f64) -> Result<SearchHit, StorageError> {
-    Ok(SearchHit {
-        id: r.get(0),
-        document_id: r.get(1),
-        chunk: r.get(2),
-        score,
-        position: usize::try_from(r.get::<_, i64>(4))
-            .map_err(|_| StorageError::PositionOverflow)?,
-        custom_id: r.get(5),
-        metadata: object(r.get(6))?,
-        filepath: r.get(7),
-        created_at: r.get(8),
-        updated_at: r.get(9),
-        document_content: r.get(10),
-    })
-}
-
-fn find_custom<C: GenericClient>(
-    db: &mut C,
-    org: &str,
-    custom: &str,
-    tags: &[String],
-) -> Result<Option<StoredDocument>, StorageError> {
-    let tags = json_value(tags)?;
-    db.query_opt(&format!("{SELECT_DOCUMENT} WHERE org_id=$1 AND custom_id=$2 AND container_tags=$3 ORDER BY created_at LIMIT 1"),&[&org,&custom,&tags]).map_err(StorageError::Read)?.map(|r|read_document(&r)).transpose()
-}
-fn find_duplicate<C: GenericClient>(
-    db: &mut C,
-    org: &str,
-    hash: &str,
-    metadata: &Map<String, Value>,
-    tags: &[String],
-) -> Result<Option<StoredDocument>, StorageError> {
-    let rows=db.query(&format!("{SELECT_DOCUMENT} WHERE org_id=$1 AND content_hash=$2 AND status='done' ORDER BY created_at"),&[&org,&hash]).map_err(StorageError::Read)?;
-    let wanted = normalized_tags(tags);
-    for r in rows {
-        let d = read_document(&r)?;
-        if normalized_tags(&d.document.container_tags) == wanted
-            && metadata_equivalent(&d.document.metadata, metadata)
-        {
-            return Ok(Some(d));
-        }
-    }
-    Ok(None)
-}
-fn apply_existing<C: GenericClient>(
-    db: &mut C,
-    e: &StoredDocument,
+fn apply_existing(
+    tx: &rusqlite::Transaction<'_>,
+    existing: &StoredDocument,
     input: &UpsertDocument,
     hash: &str,
 ) -> Result<UpsertResult, StorageError> {
-    let id = e.document.id.clone();
-    let status = e.document.status.as_str();
-    if matches!(
+    let id = existing.document.id.clone();
+    let status = existing.document.status.as_str();
+    let active = matches!(
         status,
         "unknown" | "queued" | "extracting" | "chunking" | "embedding" | "indexing"
-    ) {
+    );
+    if active {
         return Ok(UpsertResult {
             id,
             status: status.to_owned(),
             enqueued: false,
         });
     }
+
     if status == "failed" {
         update_full(
-            db,
+            tx,
             &id,
             input,
             hash,
-            &merge_metadata(&e.document.metadata, &input.metadata),
+            &merge_metadata(&existing.document.metadata, &input.metadata),
             "queued",
         )?;
-        let enqueued = enqueue(db, &id)?;
+        let enqueued = enqueue_unless_active(tx, &id)?;
         return Ok(UpsertResult {
             id,
-            status: "queued".into(),
+            status: "queued".to_owned(),
             enqueued,
         });
     }
-    if e.content_hash == hash {
-        if metadata_equivalent(&e.document.metadata, &input.metadata) {
+
+    if existing.content_hash == hash {
+        if metadata_equivalent(&existing.document.metadata, &input.metadata) {
             return Ok(UpsertResult {
                 id,
-                status: "done".into(),
+                status: "done".to_owned(),
                 enqueued: false,
             });
         }
-        let metadata = json_value(&merge_metadata(&e.document.metadata, &input.metadata))?;
-        db.execute(
-            "UPDATE documents SET metadata=$2,updated_at=now() WHERE id=$1",
-            &[&id, &metadata],
+        let metadata = merge_metadata(&existing.document.metadata, &input.metadata);
+        tx.execute(
+            "UPDATE documents SET metadata = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id, json(&metadata)?],
         )
         .map_err(StorageError::Write)?;
         return Ok(UpsertResult {
             id,
-            status: "done".into(),
+            status: "done".to_owned(),
             enqueued: false,
         });
     }
-    update_full(
-        db,
-        &id,
-        input,
-        hash,
-        &merge_metadata(&e.document.metadata, &input.metadata),
-        "queued",
-    )?;
-    let enqueued = enqueue(db, &id)?;
+
+    let metadata = merge_metadata(&existing.document.metadata, &input.metadata);
+    update_full(tx, &id, input, hash, &metadata, "queued")?;
+    let enqueued = enqueue_unless_active(tx, &id)?;
     Ok(UpsertResult {
         id,
-        status: "queued".into(),
+        status: "queued".to_owned(),
         enqueued,
     })
 }
-fn insert_new<C: GenericClient>(
-    db: &mut C,
-    org: &str,
+
+fn insert_new(
+    tx: &rusqlite::Transaction<'_>,
+    org_id: &str,
     input: &UpsertDocument,
     hash: &str,
 ) -> Result<UpsertResult, StorageError> {
     let id = generate_id()?;
-    db.execute("INSERT INTO documents(id,org_id,content,content_hash,custom_id,status,container_tags,entity_context,metadata,task_type,filepath,filter_by_metadata,dreaming) VALUES($1,$2,$3,$4,$5,'queued',$6,$7,$8,$9,$10,$11,$12)",&[&id,&org,&input.content,&hash,&input.custom_id,&json_value(&input.container_tags)?,&input.entity_context,&json_value(&input.metadata)?,&input.task_type,&input.filepath,&json_value(&input.filter_by_metadata)?,&input.dreaming]).map_err(StorageError::Write)?;
-    enqueue(db, &id)?;
+    tx.execute(
+        "INSERT INTO documents (id, org_id, content, content_hash, custom_id, status, container_tags, entity_context, metadata, task_type, filepath, filter_by_metadata, dreaming) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![id, org_id, input.content, hash, input.custom_id, json(&input.container_tags)?, input.entity_context, json(&input.metadata)?, input.task_type, input.filepath, json(&input.filter_by_metadata)?, input.dreaming],
+    ).map_err(StorageError::Write)?;
+    enqueue_unless_active(tx, &id)?;
     Ok(UpsertResult {
         id,
-        status: "queued".into(),
+        status: "queued".to_owned(),
         enqueued: true,
     })
 }
-fn update_full<C: GenericClient>(
-    db: &mut C,
+
+fn update_full(
+    tx: &rusqlite::Transaction<'_>,
     id: &str,
-    i: &UpsertDocument,
+    input: &UpsertDocument,
     hash: &str,
-    m: &Map<String, Value>,
+    metadata: &Map<String, Value>,
     status: &str,
 ) -> Result<(), StorageError> {
-    db.execute("UPDATE documents SET content=$2,content_hash=$3,custom_id=$4,status=$5,container_tags=$6,entity_context=$7,metadata=$8,task_type=$9,filepath=$10,filter_by_metadata=$11,dreaming=$12,revision=revision+1,updated_at=now() WHERE id=$1",&[&id,&i.content,&hash,&i.custom_id,&status,&json_value(&i.container_tags)?,&i.entity_context,&json_value(m)?,&i.task_type,&i.filepath,&json_value(&i.filter_by_metadata)?,&i.dreaming]).map(|_|()).map_err(StorageError::Write)
+    tx.execute(
+        "UPDATE documents SET content=?2, content_hash=?3, custom_id=?4, status=?5, container_tags=?6, entity_context=?7, metadata=?8, task_type=?9, filepath=?10, filter_by_metadata=?11, dreaming=?12, revision=revision+1, updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+        params![id, input.content, hash, input.custom_id, status, json(&input.container_tags)?, input.entity_context, json(metadata)?, input.task_type, input.filepath, json(&input.filter_by_metadata)?, input.dreaming],
+    ).map_err(StorageError::Write)?;
+    Ok(())
 }
-fn enqueue<C: GenericClient>(db: &mut C, id: &str) -> Result<bool, StorageError> {
-    if db.query_opt("SELECT 1 FROM jobs WHERE document_id=$1 AND status IN ('queued','extracting','chunking','embedding','indexing')",&[&id]).map_err(StorageError::Read)?.is_some(){return Ok(false)}
-    let revision: i64 = db
-        .query_one("SELECT revision FROM documents WHERE id=$1", &[&id])
-        .map_err(StorageError::Read)?
-        .get(0);
-    let revision_parameter = revision.to_string();
-    db.execute(
-        "INSERT INTO jobs(id,document_id,revision) VALUES($1,$2,$3::bigint)",
-        &[&generate_id()?, &id, &revision_parameter],
+
+fn enqueue_unless_active(
+    tx: &rusqlite::Transaction<'_>,
+    document_id: &str,
+) -> Result<bool, StorageError> {
+    let active: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE document_id=?1 AND status IN ('queued','extracting','chunking','embedding','indexing'))",
+        [document_id], |row| row.get(0),
+    ).map_err(StorageError::Read)?;
+    if active {
+        return Ok(false);
+    }
+    let revision: i64 = tx
+        .query_row(
+            "SELECT revision FROM documents WHERE id=?1",
+            [document_id],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::Read)?;
+    tx.execute(
+        "INSERT INTO jobs (id, document_id, kind, status, revision) VALUES (?1, ?2, 'document', 'queued', ?3)",
+        params![generate_id()?, document_id, revision],
     )
     .map_err(StorageError::Write)?;
     Ok(true)
+}
+
+fn find_custom(
+    connection: &Connection,
+    org_id: &str,
+    custom_id: &str,
+    tags: &[String],
+) -> Result<Option<StoredDocument>, StorageError> {
+    let tags = json(tags)?;
+    let mut statement = connection.prepare(&format!("{SELECT_DOCUMENT} WHERE org_id=?1 AND custom_id=?2 AND container_tags=?3 ORDER BY rowid LIMIT 1")).map_err(StorageError::Read)?;
+    read_optional(statement.query_row(params![org_id, custom_id, tags], read_document))
+}
+
+fn find_duplicate(
+    connection: &Connection,
+    org_id: &str,
+    hash: &str,
+    metadata: &Map<String, Value>,
+    tags: &[String],
+) -> Result<Option<StoredDocument>, StorageError> {
+    let wanted_tags = normalized_tags(tags);
+    let mut statement = connection
+        .prepare(&format!(
+            "{SELECT_DOCUMENT} WHERE org_id=?1 AND content_hash=?2 AND status='done' ORDER BY rowid"
+        ))
+        .map_err(StorageError::Read)?;
+    let rows = statement
+        .query_map(params![org_id, hash], read_document)
+        .map_err(StorageError::Read)?;
+    for row in rows {
+        let candidate = row.map_err(StorageError::Read)?;
+        if normalized_tags(&candidate.document.container_tags) == wanted_tags
+            && metadata_equivalent(&candidate.document.metadata, metadata)
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+const SELECT_DOCUMENT: &str = "SELECT id, content, content_hash, custom_id, status, container_tags, entity_context, metadata, task_type, filepath, filter_by_metadata, dreaming, created_at, updated_at FROM documents";
+
+fn query_one(
+    connection: &Connection,
+    predicate: &str,
+    org_id: &str,
+    identifier: &str,
+) -> Result<Option<StoredDocument>, StorageError> {
+    let mut statement = connection
+        .prepare(&format!(
+            "{SELECT_DOCUMENT} WHERE org_id=?1 AND {predicate} ORDER BY rowid LIMIT 1"
+        ))
+        .map_err(StorageError::Read)?;
+    read_optional(statement.query_row(params![org_id, identifier], read_document))
+}
+
+fn read_optional(
+    result: rusqlite::Result<StoredDocument>,
+) -> Result<Option<StoredDocument>, StorageError> {
+    result.optional().map_err(StorageError::Read)
+}
+
+fn read_document(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDocument> {
+    let tags: String = row.get(5)?;
+    let metadata: String = row.get(7)?;
+    let filter: String = row.get(10)?;
+    Ok(StoredDocument {
+        document: Document {
+            id: row.get(0)?,
+            content: row.get(1)?,
+            custom_id: row.get(3)?,
+            status: row.get(4)?,
+            container_tags: parse_json(&tags, 5)?,
+            entity_context: row.get(6)?,
+            metadata: parse_json(&metadata, 7)?,
+            task_type: row.get(8)?,
+            filepath: row.get(9)?,
+            filter_by_metadata: parse_json(&filter, 10)?,
+            dreaming: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
+        },
+        content_hash: row.get(2)?,
+    })
+}
+
+fn parse_json<T: serde::de::DeserializeOwned>(value: &str, column: usize) -> rusqlite::Result<T> {
+    serde_json::from_str(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn json(value: &(impl Serialize + ?Sized)) -> Result<String, StorageError> {
+    serde_json::to_string(value).map_err(StorageError::Serialize)
+}
+
+fn table_rows<'a>(
+    tables: &'a HashMap<String, Vec<Map<String, Value>>>,
+    table: &str,
+) -> &'a [Map<String, Value>] {
+    tables.get(table).map_or(&[], Vec::as_slice)
+}
+
+fn value_field<'a>(row: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
+    row.get(key).filter(|value| !value.is_null())
+}
+
+fn optional_field<'a>(row: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    value_field(row, key).and_then(Value::as_str)
+}
+
+fn field<'a>(row: &'a Map<String, Value>, key: &str) -> Result<&'a str, StorageError> {
+    optional_field(row, key).ok_or_else(|| StorageError::MissingLegacyField(key.to_owned()))
+}
+
+fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, StorageError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| StorageError::MissingLegacyField(key.to_owned()))
+}
+
+fn integer_field(row: &Map<String, Value>, key: &str) -> Result<i64, StorageError> {
+    value_field(row, key)
+        .and_then(|value| {
+            value.as_i64().or_else(|| {
+                value
+                    .get("$bigint")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse().ok())
+            })
+        })
+        .ok_or_else(|| StorageError::MissingLegacyField(key.to_owned()))
+}
+
+fn bool_field(row: &Map<String, Value>, key: &str) -> bool {
+    value_field(row, key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn object_field(row: &Map<String, Value>, key: &str) -> Result<Map<String, Value>, StorageError> {
+    match value_field(row, key) {
+        None => Ok(Map::new()),
+        Some(Value::Object(value)) => Ok(value.clone()),
+        Some(Value::String(value)) => {
+            serde_json::from_str(value).map_err(StorageError::DeserializeSearchData)
+        }
+        Some(_) => Err(StorageError::InvalidLegacyField(key.to_owned())),
+    }
+}
+
+fn json_field(
+    row: &Map<String, Value>,
+    key: &str,
+    default: &Value,
+) -> Result<String, StorageError> {
+    json(value_field(row, key).unwrap_or(default))
+}
+
+fn copy_optional_metadata(row: &Map<String, Value>, metadata: &mut Map<String, Value>, key: &str) {
+    if let Some(value) = value_field(row, key) {
+        metadata.insert(key.to_owned(), value.clone());
+    }
+}
+
+fn vector_field(row: &Map<String, Value>, key: &str) -> Result<Option<Vec<f32>>, StorageError> {
+    let Some(value) = value_field(row, key) else {
+        return Ok(None);
+    };
+    let values = if let Some(values) = value.as_array() {
+        values.clone()
+    } else if let Some(values) = value.get("$vector").and_then(Value::as_array) {
+        values.clone()
+    } else if let Some(value) = value.as_str() {
+        serde_json::from_str::<Vec<Value>>(value).map_err(StorageError::DeserializeSearchData)?
+    } else {
+        return Err(StorageError::InvalidLegacyField(key.to_owned()));
+    };
+    let vector = values
+        .into_iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .and_then(|value| value.to_string().parse::<f32>().ok())
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| StorageError::InvalidLegacyField(key.to_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(vector))
+}
+
+fn compatible_document_status(status: Option<&str>) -> &'static str {
+    match status {
+        Some("unknown") => "unknown",
+        Some("queued") => "queued",
+        Some("extracting") => "extracting",
+        Some("chunking") => "chunking",
+        Some("embedding") => "embedding",
+        Some("indexing") => "indexing",
+        Some("failed") => "failed",
+        _ => "done",
+    }
+}
+
+fn compatible_relation(relation: &str) -> &'static str {
+    match relation {
+        "updates" => "updates",
+        "derives" => "derives",
+        _ => "extends",
+    }
+}
+
+fn validate_vector(vector: &[f32], dimensions: usize) -> Result<(), StorageError> {
+    if vector.len() != dimensions {
+        return Err(StorageError::InvalidVectorLength {
+            expected: dimensions,
+            actual: vector.len(),
+        });
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(StorageError::NonFiniteVector);
+    }
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if (norm - 1.0).abs() > 1e-4 {
+        return Err(StorageError::InvalidVectorNorm { norm });
+    }
+    Ok(())
+}
+
+fn vector_bytes(vector: &[f32]) -> Vec<u8> {
+    vector
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn decode_vector(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>, StorageError> {
+    let expected = dimensions
+        .checked_mul(size_of::<f32>())
+        .ok_or(StorageError::InvalidVectorDimensions { dimensions })?;
+    if bytes.len() != expected {
+        return Err(StorageError::MalformedStoredVector {
+            expected,
+            actual: bytes.len(),
+        });
+    }
+    let vector = bytes
+        .chunks_exact(size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect::<Vec<_>>();
+    validate_vector(&vector, dimensions)?;
+    Ok(vector)
+}
+
+fn matches_search_options(
+    document_id: &str,
+    custom_id: Option<&str>,
+    container_tags: &[String],
+    filepath: Option<&str>,
+    metadata: &Map<String, Value>,
+    options: &SearchOptions,
+) -> bool {
+    if options
+        .document_id
+        .as_deref()
+        .is_some_and(|wanted| wanted != document_id && Some(wanted) != custom_id)
+    {
+        return false;
+    }
+    if !options.container_tags.is_empty()
+        && !options
+            .container_tags
+            .iter()
+            .any(|wanted| container_tags.contains(wanted))
+    {
+        return false;
+    }
+    if options.filepath.as_deref().is_some_and(|wanted| {
+        if let Some(prefix) = wanted.strip_suffix('/') {
+            !filepath.is_some_and(|actual| actual.starts_with(prefix))
+        } else {
+            filepath != Some(wanted)
+        }
+    }) {
+        return false;
+    }
+    options
+        .filters
+        .as_ref()
+        .is_none_or(|filter| matches_filter(filter, metadata))
 }
 
 struct ResolvedParent {
@@ -1077,371 +1843,321 @@ struct ResolvedParent {
     root_memory_id: Option<String>,
     version: i64,
 }
-fn resolve_memory_parents<C: GenericClient>(
-    db: &mut C,
-    org: &str,
-    tag: &str,
+
+fn resolve_memory_parents(
+    connection: &Connection,
+    org_id: &str,
+    container_tag: &str,
     parents: &[MemoryParent],
-    temp: &HashMap<String, String>,
+    temporary_ids: &HashMap<String, String>,
 ) -> Result<Vec<ResolvedParent>, StorageError> {
-    let mut out = Vec::new();
-    for p in parents {
-        let id = temp
-            .get(&p.memory_id)
-            .map_or(p.memory_id.as_str(), String::as_str);
-        if let Some(r)=db.query_opt("SELECT id,root_memory_id,version FROM memories WHERE id=$1 AND org_id=$2 AND container_tag=$3",&[&id,&org,&tag]).map_err(StorageError::Read)?{out.push(ResolvedParent{id:r.get(0),relation:p.relation.clone(),root_memory_id:r.get(1),version:r.get(2)})}
+    let mut result = Vec::new();
+    for parent in parents {
+        let id = temporary_ids
+            .get(&parent.memory_id)
+            .map_or(parent.memory_id.as_str(), String::as_str);
+        let resolved = connection
+            .query_row(
+                "SELECT id, root_memory_id, version FROM memories WHERE id=?1 AND org_id=?2 AND container_tag=?3",
+                params![id, org_id, container_tag],
+                |row| {
+                    Ok(ResolvedParent {
+                        id: row.get(0)?,
+                        relation: parent.relation.clone(),
+                        root_memory_id: row.get(1)?,
+                        version: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::Read)?;
+        if let Some(resolved) = resolved {
+            result.push(resolved);
+        }
     }
-    Ok(out)
+    Ok(result)
 }
-const SELECT_MEMORY: &str = "SELECT id,content,metadata,is_inferred,is_static,is_latest,is_forgotten,root_memory_id,parent_memory_id,version,forget_after::text,forget_reason,created_at::text,updated_at::text FROM memories";
-fn find_exact_memory<C: GenericClient>(
-    db: &mut C,
-    org: &str,
-    tag: &str,
+
+fn find_exact_memory(
+    connection: &Connection,
+    org_id: &str,
+    container_tag: &str,
     content: &str,
 ) -> Result<Option<MemoryRecord>, StorageError> {
-    db.query_opt(&format!("{SELECT_MEMORY} WHERE org_id=$1 AND container_tag=$2 AND content=$3 AND is_latest AND NOT is_forgotten ORDER BY created_at LIMIT 1"),&[&org,&tag,&content]).map_err(StorageError::Read)?.map(|r|read_memory(&r)).transpose()
+    connection
+        .query_row(
+            "SELECT id, content, metadata, is_inferred, is_static, is_latest, is_forgotten, root_memory_id, parent_memory_id, version, forget_after, forget_reason, created_at, updated_at FROM memories WHERE org_id=?1 AND container_tag=?2 AND content=?3 AND is_latest=1 AND is_forgotten=0 ORDER BY rowid LIMIT 1",
+            params![org_id, container_tag, content],
+            read_memory,
+        )
+        .optional()
+        .map_err(StorageError::Read)
 }
-fn read_memory_by_id<C: GenericClient>(db: &mut C, id: &str) -> Result<MemoryRecord, StorageError> {
-    let r = db
-        .query_one(&format!("{SELECT_MEMORY} WHERE id=$1"), &[&id])
-        .map_err(StorageError::Read)?;
-    read_memory(&r)
+
+fn read_memory_by_id(connection: &Connection, id: &str) -> Result<MemoryRecord, StorageError> {
+    connection
+        .query_row(
+            "SELECT id, content, metadata, is_inferred, is_static, is_latest, is_forgotten, root_memory_id, parent_memory_id, version, forget_after, forget_reason, created_at, updated_at FROM memories WHERE id=?1",
+            [id],
+            read_memory,
+        )
+        .map_err(StorageError::Read)
 }
-fn read_memory(r: &Row) -> Result<MemoryRecord, StorageError> {
+
+fn read_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
+    let metadata: String = row.get(2)?;
     Ok(MemoryRecord {
-        id: r.get(0),
-        memory: r.get(1),
-        metadata: object(r.get(2))?,
-        is_inferred: r.get(3),
-        is_static: r.get(4),
-        is_latest: r.get(5),
-        is_forgotten: r.get(6),
-        root_memory_id: r.get(7),
-        parent_memory_id: r.get(8),
-        version: r.get(9),
-        forget_after: r.get(10),
-        forget_reason: r.get(11),
-        created_at: r.get(12),
-        updated_at: r.get(13),
+        id: row.get(0)?,
+        memory: row.get(1)?,
+        metadata: parse_json(&metadata, 2)?,
+        is_inferred: row.get(3)?,
+        is_static: row.get(4)?,
+        is_latest: row.get(5)?,
+        is_forgotten: row.get(6)?,
+        root_memory_id: row.get(7)?,
+        parent_memory_id: row.get(8)?,
+        version: row.get(9)?,
+        forget_after: row.get(10)?,
+        forget_reason: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
-fn memory_relations<C: GenericClient>(
-    db: &mut C,
-    id: &str,
+
+fn memory_relations(
+    connection: &Connection,
+    memory_id: &str,
     parents: bool,
     allowed: Option<&[&str]>,
 ) -> Result<Vec<MemoryRelationHit>, StorageError> {
-    let (join, related) = if parents {
+    let (join_id, related_id) = if parents {
         ("child_id", "parent_id")
     } else {
         ("parent_id", "child_id")
     };
-    let rows=db.query(&format!("SELECT r.relation,m.version,m.content,m.metadata,m.updated_at::text FROM memory_relations r JOIN memories m ON m.id=r.{related} WHERE r.{join}=$1 ORDER BY m.version,m.updated_at"),&[&id]).map_err(StorageError::Read)?;
-    rows.into_iter()
-        .filter_map(|r| {
-            let relation: String = r.get(0);
-            allowed
-                .is_none_or(|a| a.contains(&relation.as_str()))
-                .then(|| {
-                    Ok(MemoryRelationHit {
-                        relation,
-                        version: r.get(1),
-                        memory: r.get(2),
-                        metadata: object(r.get(3))?,
-                        updated_at: r.get(4),
-                    })
-                })
+    let sql = format!(
+        "SELECT memory_relations.relation, memories.version, memories.content, memories.metadata, memories.updated_at FROM memory_relations JOIN memories ON memories.id=memory_relations.{related_id} WHERE memory_relations.{join_id}=?1 ORDER BY memories.version, memories.updated_at"
+    );
+    let mut statement = connection.prepare(&sql).map_err(StorageError::Read)?;
+    let rows = statement
+        .query_map([memory_id], |row| {
+            let relation: String = row.get(0)?;
+            let metadata: String = row.get(3)?;
+            Ok(MemoryRelationHit {
+                relation,
+                version: row.get(1)?,
+                memory: row.get(2)?,
+                metadata: parse_json(&metadata, 3)?,
+                updated_at: row.get(4)?,
+            })
         })
-        .collect()
+        .map_err(StorageError::Read)?;
+    let mut result = Vec::new();
+    for row in rows {
+        let row = row.map_err(StorageError::Read)?;
+        if allowed.is_none_or(|allowed| allowed.contains(&row.relation.as_str())) {
+            result.push(row);
+        }
+    }
+    Ok(result)
 }
-fn memory_source_documents<C: GenericClient>(
-    db: &mut C,
-    id: &str,
+
+fn memory_source_documents(
+    connection: &Connection,
+    memory_id: &str,
 ) -> Result<Vec<MemorySourceDocument>, StorageError> {
-    db.query("SELECT COALESCE(d.custom_id,d.id),d.title,d.document_type,d.metadata,d.summary,d.created_at::text,d.updated_at::text FROM memory_sources s JOIN documents d ON d.id=s.document_id WHERE s.memory_id=$1 ORDER BY s.created_at",&[&id]).map_err(StorageError::Read)?.into_iter().map(|r|Ok(MemorySourceDocument{id:r.get(0),title:r.get(1),document_type:r.get(2),metadata:object(r.get(3))?,summary:r.get(4),created_at:r.get(5),updated_at:r.get(6)})).collect()
-}
-fn valid_future_datetime<C: GenericClient>(
-    db: &mut C,
-    v: Option<&str>,
-) -> Result<Option<String>, StorageError> {
-    let Some(v) = v else { return Ok(None) };
-    let valid: bool = db
-        .query_one("SELECT $1::timestamptz>now()", &[&v])
-        .map_err(StorageError::Read)?
-        .get(0);
-    Ok(valid.then(|| v.to_owned()))
-}
-
-fn vector_text(vector: &[f32]) -> String {
-    let mut text = String::from("[");
-    for (index, value) in vector.iter().enumerate() {
-        if index != 0 {
-            text.push(',');
-        }
-        text.push_str(&value.to_string());
-    }
-    text.push(']');
-    text
-}
-
-#[derive(Debug, Clone)]
-struct PgVector(Vec<f32>);
-impl ToSql for PgVector {
-    fn to_sql(
-        &self,
-        ty: &Type,
-        out: &mut BytesMut,
-    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        if ty.name() != "vector" {
-            return Err("expected pgvector vector type".into());
-        }
-        let dimensions = u16::try_from(self.0.len())?;
-        out.extend_from_slice(&dimensions.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-        for value in &self.0 {
-            out.extend_from_slice(&value.to_bits().to_be_bytes());
-        }
-        Ok(IsNull::No)
-    }
-    fn accepts(ty: &Type) -> bool {
-        ty.name() == "vector"
-    }
-    to_sql_checked!();
-}
-impl<'a> FromSql<'a> for PgVector {
-    fn from_sql(
-        ty: &Type,
-        raw: &'a [u8],
-    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if ty.name() != "vector" || raw.len() < 4 {
-            return Err("invalid pgvector value".into());
-        }
-        let n = usize::from(u16::from_be_bytes([raw[0], raw[1]]));
-        if raw.len() != 4 + n * 4 {
-            return Err("invalid pgvector payload length".into());
-        }
-        let values = raw[4..]
-            .chunks_exact(4)
-            .map(|b| f32::from_bits(u32::from_be_bytes([b[0], b[1], b[2], b[3]])))
-            .collect();
-        Ok(Self(values))
-    }
-    fn accepts(ty: &Type) -> bool {
-        ty.name() == "vector"
-    }
-}
-
-fn initialize(db: &mut Client) -> Result<String, StorageError> {
-    db.batch_execute(SCHEMA).map_err(StorageError::Migrate)?;
-    let row = db
-        .query_opt("SELECT id FROM organizations WHERE slug=$1", &[&LOCAL_SLUG])
-        .map_err(StorageError::Migrate)?;
-    let id = row.map(|r| r.get(0)).map_or_else(generate_id, Ok)?;
-    db.execute(
-        "INSERT INTO organizations(id,slug) VALUES($1,$2) ON CONFLICT(slug) DO NOTHING",
-        &[&id, &LOCAL_SLUG],
-    )
-    .map_err(StorageError::Migrate)?;
-    let actual: String = db
-        .query_one("SELECT id FROM organizations WHERE slug=$1", &[&LOCAL_SLUG])
-        .map_err(StorageError::Migrate)?
-        .get(0);
-    db.batch_execute("UPDATE jobs SET status='queued',available_at=now(),updated_at=now() WHERE status IN ('extracting','chunking','embedding','indexing'); UPDATE documents SET status='queued',updated_at=now() WHERE id IN(SELECT document_id FROM jobs WHERE status='queued') AND status IN ('extracting','chunking','embedding','indexing')").map_err(StorageError::Migrate)?;
-    Ok(actual)
-}
-
-const SCHEMA: &str = r"
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE TABLE IF NOT EXISTS organizations(id text PRIMARY KEY,slug text UNIQUE NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS documents(id text PRIMARY KEY,org_id text NOT NULL REFERENCES organizations(id),content text NOT NULL,content_hash text NOT NULL,custom_id text,status text NOT NULL DEFAULT 'queued',container_tags text NOT NULL DEFAULT '[]',entity_context text,metadata text NOT NULL DEFAULT '{}',task_type text NOT NULL,filepath text,filter_by_metadata text NOT NULL DEFAULT '{}',dreaming text NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now(),revision bigint NOT NULL DEFAULT 1,title text,summary text,document_type text,source text,url text,user_id text);
-CREATE INDEX IF NOT EXISTS documents_identity_idx ON documents(org_id,custom_id);
-CREATE TABLE IF NOT EXISTS jobs(id text PRIMARY KEY,document_id text NOT NULL REFERENCES documents(id) ON DELETE CASCADE,kind text NOT NULL DEFAULT 'document',status text NOT NULL DEFAULT 'queued',attempts integer NOT NULL DEFAULT 0,available_at timestamptz NOT NULL DEFAULT now(),last_error text,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now(),revision bigint NOT NULL);
-CREATE TABLE IF NOT EXISTS id_allocator(name text PRIMARY KEY,next_id bigint NOT NULL);
-INSERT INTO id_allocator(name,next_id) VALUES('document_chunks',0) ON CONFLICT(name) DO NOTHING;
-CREATE TABLE IF NOT EXISTS document_chunks(id bigint PRIMARY KEY,document_id text NOT NULL REFERENCES documents(id) ON DELETE CASCADE,ordinal bigint NOT NULL,content text NOT NULL,stable_id text NOT NULL UNIQUE,UNIQUE(document_id,ordinal));
-CREATE TABLE IF NOT EXISTS chunk_embeddings(chunk_id bigint PRIMARY KEY REFERENCES document_chunks(id) ON DELETE CASCADE,model_id text NOT NULL,vector vector(768) NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
-CREATE INDEX IF NOT EXISTS chunk_embeddings_hnsw_idx ON chunk_embeddings USING hnsw(vector vector_cosine_ops);
-CREATE TABLE IF NOT EXISTS memories(id text PRIMARY KEY,org_id text NOT NULL REFERENCES organizations(id),container_tag text NOT NULL,content text NOT NULL,metadata text NOT NULL DEFAULT '{}',is_inferred boolean NOT NULL DEFAULT false,is_static boolean NOT NULL DEFAULT false,is_latest boolean NOT NULL DEFAULT true,is_forgotten boolean NOT NULL DEFAULT false,root_memory_id text REFERENCES memories(id),parent_memory_id text REFERENCES memories(id),version bigint NOT NULL DEFAULT 1,forget_after timestamptz,forget_reason text,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS memory_embeddings(memory_id text PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,model_id text NOT NULL,vector vector(768) NOT NULL,active boolean NOT NULL DEFAULT true,created_at timestamptz NOT NULL DEFAULT now());
-CREATE INDEX IF NOT EXISTS memory_embeddings_hnsw_idx ON memory_embeddings USING hnsw(vector vector_cosine_ops);
-CREATE TABLE IF NOT EXISTS memory_relations(parent_id text REFERENCES memories(id) ON DELETE CASCADE,child_id text REFERENCES memories(id) ON DELETE CASCADE,relation text NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(parent_id,child_id,relation));
-CREATE TABLE IF NOT EXISTS memory_sources(memory_id text REFERENCES memories(id) ON DELETE CASCADE,document_id text REFERENCES documents(id) ON DELETE CASCADE,created_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(memory_id,document_id));
-CREATE TABLE IF NOT EXISTS api_keys(id text PRIMARY KEY,org_id text REFERENCES organizations(id),key_hash bytea NOT NULL,name text,enabled boolean NOT NULL DEFAULT true,expires_at timestamptz,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now());
-";
-
-fn validate_vector(v: &[f32], dimensions: usize) -> Result<(), StorageError> {
-    if v.len() != dimensions {
-        return Err(StorageError::InvalidVectorLength {
-            expected: dimensions,
-            actual: v.len(),
-        });
-    }
-    if v.iter().any(|x| !x.is_finite()) {
-        return Err(StorageError::NonFiniteVector);
-    }
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if (norm - 1.0).abs() > 1e-4 {
-        return Err(StorageError::InvalidVectorNorm { norm });
-    }
-    Ok(())
-}
-fn exact_similarity(left: &[f32], right: &[f32]) -> Result<f32, StorageError> {
-    if left.len() != right.len() {
-        return Err(StorageError::InvalidVectorLength {
-            expected: left.len(),
-            actual: right.len(),
-        });
-    }
-    Ok(left
-        .iter()
-        .zip(right)
-        .map(|(left, right)| left * right)
-        .sum())
-}
-
-fn matches_search_options(
-    document_id: &str,
-    custom: Option<&str>,
-    tags: &[String],
-    filepath: Option<&str>,
-    metadata: &Map<String, Value>,
-    o: &SearchOptions,
-) -> bool {
-    if o.document_id
-        .as_deref()
-        .is_some_and(|x| x != document_id && Some(x) != custom)
-    {
-        return false;
-    }
-    if !o.container_tags.is_empty() && !o.container_tags.iter().any(|x| tags.contains(x)) {
-        return false;
-    }
-    if o.filepath.as_deref().is_some_and(|x| {
-        x.strip_suffix('/').map_or(filepath != Some(x), |p| {
-            !filepath.is_some_and(|f| f.starts_with(p))
+    let mut statement = connection.prepare(
+        "SELECT COALESCE(documents.custom_id, documents.id), documents.title, documents.document_type, documents.metadata, documents.summary, documents.created_at, documents.updated_at FROM memory_sources JOIN documents ON documents.id=memory_sources.document_id WHERE memory_sources.memory_id=?1 ORDER BY memory_sources.created_at",
+    ).map_err(StorageError::Read)?;
+    statement
+        .query_map([memory_id], |row| {
+            let metadata: String = row.get(3)?;
+            Ok(MemorySourceDocument {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                document_type: row.get(2)?,
+                metadata: parse_json(&metadata, 3)?,
+                summary: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
         })
-    }) {
-        return false;
-    }
-    o.filters
-        .as_ref()
-        .is_none_or(|f| matches_filter(f, metadata))
+        .map_err(StorageError::Read)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::Read)
 }
-fn matches_filter(f: &FilterExpression, m: &Map<String, Value>) -> bool {
-    match f {
-        FilterExpression::And(fs) => fs.iter().all(|f| matches_filter(f, m)),
-        FilterExpression::Or(fs) => fs.iter().any(|f| matches_filter(f, m)),
-        FilterExpression::Condition(c) => {
-            m.get(&c.key).is_some_and(|v| matches_condition(c, v)) != c.negate
-        }
-    }
+
+fn valid_future_datetime(
+    connection: &Connection,
+    value: Option<&str>,
+) -> Result<Option<String>, StorageError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let valid: bool = connection
+        .query_row(
+            "SELECT datetime(?1) IS NOT NULL AND datetime(?1) > CURRENT_TIMESTAMP",
+            [value],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::Read)?;
+    Ok(valid.then(|| value.to_owned()))
 }
-fn matches_condition(c: &FilterCondition, v: &Value) -> bool {
-    match c.kind {
-        FilterKind::Metadata => comparable(v).is_some_and(|x| eq(&x, &c.value, c.ignore_case)),
-        FilterKind::StringContains => comparable(v).is_some_and(|x| {
-            if c.ignore_case {
-                x.to_lowercase().contains(&c.value.to_lowercase())
-            } else {
-                x.contains(&c.value)
-            }
-        }),
-        FilterKind::ArrayContains => v.as_array().is_some_and(|a| {
-            a.iter()
-                .any(|v| comparable(v).is_some_and(|x| eq(&x, &c.value, c.ignore_case)))
-        }),
-        FilterKind::Numeric => {
-            v.as_f64()
-                .zip(c.value.parse().ok())
-                .is_some_and(|(a, b)| match c.numeric_operator {
-                    NumericOperator::Greater => a > b,
-                    NumericOperator::Less => a < b,
-                    NumericOperator::GreaterOrEqual => a >= b,
-                    NumericOperator::LessOrEqual => a <= b,
-                    NumericOperator::Equal => a.total_cmp(&b).is_eq(),
-                })
-        }
-    }
-}
-fn comparable(v: &Value) -> Option<String> {
-    match v {
-        Value::String(x) => Some(x.clone()),
-        Value::Number(x) => Some(x.to_string()),
-        Value::Bool(x) => Some(x.to_string()),
-        _ => None,
-    }
-}
-fn eq(a: &str, b: &str, ignore: bool) -> bool {
-    if ignore {
-        a.to_lowercase() == b.to_lowercase()
-    } else {
-        a == b
-    }
-}
+
 fn deduplicate_memories(
-    ms: Vec<MemoryRecord>,
+    memories: Vec<MemoryRecord>,
     limit: usize,
-    excluded: &HashSet<String>,
+    excluded: &std::collections::HashSet<String>,
 ) -> Vec<MemoryRecord> {
     let mut seen = excluded.clone();
-    ms.into_iter()
-        .filter(|m| {
-            let n = normalized_memory(&m.memory);
-            !n.is_empty() && seen.insert(n)
+    memories
+        .into_iter()
+        .filter(|memory| {
+            let normalized = normalized_memory(&memory.memory);
+            !normalized.is_empty() && seen.insert(normalized)
         })
         .take(limit)
         .collect()
 }
-fn normalized_memory(s: &str) -> String {
-    s.to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+
+fn normalized_memory(memory: &str) -> String {
+    let mut normalized = String::new();
+    let mut whitespace = false;
+    for character in memory.to_lowercase().chars() {
+        if character.is_alphanumeric() || character == '_' {
+            normalized.push(character);
+            whitespace = false;
+        } else if character.is_whitespace() && !whitespace && !normalized.is_empty() {
+            normalized.push(' ');
+            whitespace = true;
+        }
+    }
+    normalized.trim().to_owned()
 }
-fn merge_metadata(a: &Map<String, Value>, b: &Map<String, Value>) -> Map<String, Value> {
-    let mut m = a.clone();
-    m.extend(b.clone());
-    m
+
+fn matches_filter(filter: &FilterExpression, metadata: &Map<String, Value>) -> bool {
+    match filter {
+        FilterExpression::And(filters) => filters
+            .iter()
+            .all(|filter| matches_filter(filter, metadata)),
+        FilterExpression::Or(filters) => filters
+            .iter()
+            .any(|filter| matches_filter(filter, metadata)),
+        FilterExpression::Condition(condition) => {
+            let matched = metadata
+                .get(&condition.key)
+                .is_some_and(|value| matches_condition(condition, value));
+            matched != condition.negate
+        }
+    }
 }
-fn metadata_equivalent(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
-    let clean = |m: &Map<String, Value>| {
-        m.iter()
-            .filter(|(k, _)| !k.starts_with("sm_") && k.as_str() != "commonQuestions")
+
+fn matches_condition(condition: &FilterCondition, value: &Value) -> bool {
+    match condition.kind {
+        FilterKind::Metadata => comparable_text(value)
+            .is_some_and(|actual| equal_text(&actual, &condition.value, condition.ignore_case)),
+        FilterKind::StringContains => comparable_text(value)
+            .is_some_and(|actual| contains_text(&actual, &condition.value, condition.ignore_case)),
+        FilterKind::ArrayContains => value.as_array().is_some_and(|values| {
+            values.iter().any(|value| {
+                comparable_text(value).is_some_and(|actual| {
+                    equal_text(&actual, &condition.value, condition.ignore_case)
+                })
+            })
+        }),
+        FilterKind::Numeric => value.as_f64().is_some_and(|actual| {
+            condition.value.parse::<f64>().ok().is_some_and(|wanted| {
+                match condition.numeric_operator {
+                    NumericOperator::Greater => actual > wanted,
+                    NumericOperator::Less => actual < wanted,
+                    NumericOperator::GreaterOrEqual => actual >= wanted,
+                    NumericOperator::LessOrEqual => actual <= wanted,
+                    NumericOperator::Equal => actual.total_cmp(&wanted).is_eq(),
+                }
+            })
+        }),
+    }
+}
+
+fn comparable_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn equal_text(actual: &str, wanted: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        actual.to_lowercase() == wanted.to_lowercase()
+    } else {
+        actual == wanted
+    }
+}
+
+fn contains_text(actual: &str, wanted: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        actual.to_lowercase().contains(&wanted.to_lowercase())
+    } else {
+        actual.contains(wanted)
+    }
+}
+
+fn merge_metadata(
+    existing: &Map<String, Value>,
+    incoming: &Map<String, Value>,
+) -> Map<String, Value> {
+    let mut merged = existing.clone();
+    for (key, value) in incoming {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
+}
+
+fn metadata_equivalent(left: &Map<String, Value>, right: &Map<String, Value>) -> bool {
+    fn comparable(source: &Map<String, Value>) -> Map<String, Value> {
+        source
+            .iter()
+            .filter(|(key, _)| !key.starts_with("sm_") && key.as_str() != "commonQuestions")
             .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<Map<_, _>>()
-    };
-    clean(a) == clean(b)
+            .collect()
+    }
+    serde_json::to_string(&comparable(left)).ok() == serde_json::to_string(&comparable(right)).ok()
 }
+
 fn normalized_tags(tags: &[String]) -> Vec<&str> {
-    let mut v: Vec<_> = tags
+    let mut result: Vec<_> = tags
         .iter()
         .map(String::as_str)
-        .filter(|x| !x.trim().is_empty())
+        .filter(|tag| !tag.trim().is_empty())
         .collect();
-    v.sort_unstable();
-    v
+    result.sort_unstable();
+    result
 }
+
+/// Applies v0.0.5 content sanitization.
 #[must_use]
 pub fn sanitize_content(content: &str) -> String {
-    content
-        .trim()
-        .chars()
-        .filter(|c| !matches!(*c as u32,0x00..=0x08|0x0b|0x0c|0x0e..=0x1f|0x7f))
-        .collect::<String>()
-        .trim()
-        .to_owned()
+    content.trim().chars().filter(|character| !matches!(*character as u32, 0x00..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f)).collect::<String>().trim().to_owned()
 }
+
+/// Computes the lowercase SHA-1 hash of UTF-8 content.
 #[must_use]
 pub fn content_hash(content: &str) -> String {
     format!("{:x}", Sha1::digest(content.as_bytes()))
 }
+
+/// Generates an unbiased 22-character Bitcoin Base58 identifier from OS randomness.
+///
+/// # Errors
+/// Returns an error when the operating system random source is unavailable.
 pub fn generate_id() -> Result<String, StorageError> {
     let mut id = String::with_capacity(22);
-    let mut random = [0u8; 32];
+    let mut random = [0_u8; 32];
     while id.len() < 22 {
         getrandom::fill(&mut random).map_err(StorageError::Random)?;
-        for byte in random.into_iter().filter(|b| *b < 232) {
+        for byte in random.into_iter().filter(|byte| *byte < 232) {
             id.push(char::from(BASE58[usize::from(byte % 58)]));
             if id.len() == 22 {
                 break;
@@ -1451,41 +2167,367 @@ pub fn generate_id() -> Result<String, StorageError> {
     Ok(id)
 }
 
+fn initialize(connection: &mut Connection) -> Result<String, StorageError> {
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(StorageError::Configure)?;
+    connection
+        .execute_batch("PRAGMA foreign_keys=ON;")
+        .map_err(StorageError::Configure)?;
+    configure_wal(connection)?;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(StorageError::Migrate)?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP) STRICT;").map_err(StorageError::Migrate)?;
+    let current: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::Migrate)?;
+    validate_existing_version(&tx, current)?;
+    for &(version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version > current) {
+        tx.execute_batch(sql).map_err(StorageError::Migrate)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version) VALUES (?1)",
+            [version],
+        )
+        .map_err(StorageError::Migrate)?;
+    }
+    validate_current_schema(&tx)?;
+    let org_id = tx
+        .query_row(
+            "SELECT id FROM organizations WHERE slug=?1",
+            [LOCAL_SLUG],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StorageError::Migrate)?;
+    let org_id = if let Some(id) = org_id {
+        id
+    } else {
+        let id = generate_id()?;
+        tx.execute(
+            "INSERT INTO organizations (id, slug) VALUES (?1, ?2)",
+            params![id, LOCAL_SLUG],
+        )
+        .map_err(StorageError::Migrate)?;
+        id
+    };
+    tx.execute(
+        "UPDATE jobs SET status='queued', available_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE status IN ('extracting','chunking','embedding','indexing')",
+        [],
+    )
+    .map_err(StorageError::Migrate)?;
+    tx.execute(
+        "UPDATE documents SET status='queued', updated_at=CURRENT_TIMESTAMP WHERE id IN (SELECT document_id FROM jobs WHERE status='queued') AND status IN ('extracting','chunking','embedding','indexing')",
+        [],
+    )
+    .map_err(StorageError::Migrate)?;
+    tx.commit().map_err(StorageError::Migrate)?;
+    Ok(org_id)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "exact migration column contracts are intentionally explicit"
+)]
+fn validate_current_schema(connection: &Connection) -> Result<(), StorageError> {
+    validate_columns(
+        connection,
+        "organizations",
+        &["id", "slug", "created_at", "name", "metadata"],
+    )?;
+    validate_columns(
+        connection,
+        "documents",
+        &[
+            "id",
+            "org_id",
+            "content",
+            "content_hash",
+            "custom_id",
+            "status",
+            "container_tags",
+            "entity_context",
+            "metadata",
+            "task_type",
+            "filepath",
+            "filter_by_metadata",
+            "dreaming",
+            "created_at",
+            "updated_at",
+            "revision",
+            "title",
+            "summary",
+            "document_type",
+            "source",
+            "url",
+            "user_id",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "document_chunks",
+        &["id", "document_id", "ordinal", "content", "stable_id"],
+    )?;
+    validate_columns(
+        connection,
+        "jobs",
+        &[
+            "id",
+            "document_id",
+            "kind",
+            "status",
+            "attempts",
+            "available_at",
+            "last_error",
+            "created_at",
+            "updated_at",
+            "revision",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "chunk_embeddings",
+        &["chunk_id", "model_id", "dimensions", "vector", "created_at"],
+    )?;
+    validate_columns(
+        connection,
+        "memories",
+        &[
+            "id",
+            "org_id",
+            "container_tag",
+            "content",
+            "metadata",
+            "is_inferred",
+            "is_static",
+            "is_latest",
+            "is_forgotten",
+            "root_memory_id",
+            "parent_memory_id",
+            "version",
+            "forget_after",
+            "forget_reason",
+            "created_at",
+            "updated_at",
+            "source_count",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "memory_sources",
+        &["memory_id", "document_id", "created_at"],
+    )?;
+    validate_columns(
+        connection,
+        "memory_relations",
+        &["parent_id", "child_id", "relation", "created_at"],
+    )?;
+    validate_columns(
+        connection,
+        "memory_embeddings",
+        &[
+            "memory_id",
+            "model_id",
+            "dimensions",
+            "vector",
+            "active",
+            "created_at",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "spaces",
+        &[
+            "id",
+            "org_id",
+            "container_tag",
+            "entity_context",
+            "name",
+            "description",
+            "metadata",
+            "profile_buckets",
+            "created_at",
+            "updated_at",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "api_keys",
+        &[
+            "id",
+            "org_id",
+            "key_hash",
+            "name",
+            "enabled",
+            "expires_at",
+            "created_at",
+            "updated_at",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "legacy_imports",
+        &["source_hash", "imported_at", "report"],
+    )
+}
+
+fn validate_existing_version(connection: &Connection, version: i64) -> Result<(), StorageError> {
+    if (1..5).contains(&version) {
+        validate_columns(connection, "organizations", &["id", "slug", "created_at"])?;
+    }
+    if (1..3).contains(&version) {
+        validate_columns(
+            connection,
+            "documents",
+            &[
+                "id",
+                "org_id",
+                "content",
+                "content_hash",
+                "custom_id",
+                "status",
+                "container_tags",
+                "entity_context",
+                "metadata",
+                "task_type",
+                "filepath",
+                "filter_by_metadata",
+                "dreaming",
+                "created_at",
+                "updated_at",
+            ],
+        )?;
+        validate_columns(
+            connection,
+            "jobs",
+            &[
+                "id",
+                "document_id",
+                "kind",
+                "status",
+                "attempts",
+                "available_at",
+                "last_error",
+                "created_at",
+                "updated_at",
+            ],
+        )?;
+    }
+    if version == 2 {
+        validate_columns(
+            connection,
+            "document_chunks",
+            &["id", "document_id", "ordinal", "content"],
+        )?;
+    }
+    Ok(())
+}
+
+fn configure_wal(connection: &Connection) -> Result<(), StorageError> {
+    const RETRIES: usize = 5;
+    for attempt in 0..=RETRIES {
+        match connection.execute_batch("PRAGMA journal_mode=WAL;") {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < RETRIES && is_lock_error(&error) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(StorageError::Configure(error)),
+        }
+    }
+    unreachable!("bounded WAL configuration loop always returns")
+}
+
+fn is_lock_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+fn validate_columns(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), StorageError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(StorageError::Migrate)?;
+    let actual = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(StorageError::Migrate)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::Migrate)?;
+    if actual
+        .iter()
+        .map(String::as_str)
+        .eq(expected.iter().copied())
+    {
+        Ok(())
+    } else {
+        Err(StorageError::MalformedSchema {
+            table: table.to_owned(),
+            expected: expected.join(", "),
+            actual: actual.join(", "),
+        })
+    }
+}
+
+/// Failure while opening or using application storage.
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("failed to connect to PostgreSQL: {0}")]
-    Open(#[source] postgres::Error),
-    #[error("failed to initialize PostgreSQL schema: {0}")]
-    Migrate(#[source] postgres::Error),
-    #[error("failed to write PostgreSQL data: {0}")]
-    Write(#[source] postgres::Error),
-    #[error("failed to read PostgreSQL data: {0}")]
-    Read(#[source] postgres::Error),
-    #[error("PostgreSQL connection string is not valid UTF-8")]
-    InvalidConnectionString,
-    #[error("DATABASE_URL is required")]
-    MissingDatabaseUrl,
-    #[error("failed to serialize JSON: {0}")]
+    #[error("failed to open the SQLite database: {0}")]
+    Open(#[source] rusqlite::Error),
+    #[error("failed to configure SQLite; the database was not modified: {0}")]
+    Configure(#[source] rusqlite::Error),
+    #[error("failed to apply SQLite migrations; the migration was rolled back: {0}")]
+    Migrate(#[source] rusqlite::Error),
+    #[error("failed to write SQLite data; the transaction was rolled back: {0}")]
+    Write(#[source] rusqlite::Error),
+    #[error("failed to read SQLite data: {0}")]
+    Read(#[source] rusqlite::Error),
+    #[error("failed to read legacy export {path}: {source}")]
+    ReadLegacyExport {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("legacy export contains invalid JSON at line {line}: {source}")]
+    MalformedLegacyExport {
+        line: usize,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("legacy export contains an invalid record at line {line}")]
+    InvalidLegacyRow { line: usize },
+    #[error("legacy export ended without a completion marker; no rows were imported")]
+    IncompleteLegacyExport,
+    #[error("legacy export is missing required field {0}")]
+    MissingLegacyField(String),
+    #[error("legacy export field {0} has an unsupported value")]
+    InvalidLegacyField(String),
+    #[error("failed to serialize document data: {0}")]
     Serialize(#[source] serde_json::Error),
-    #[error("failed to decode stored JSON: {0}")]
+    #[error("failed to decode stored search metadata; rebuild the affected document: {0}")]
     DeserializeSearchData(#[source] serde_json::Error),
-    #[error("stored JSON is not an object")]
-    MalformedJsonObject,
-    #[error("API key hash has {0} bytes, expected 32")]
-    MalformedApiKeyHash(usize),
-    #[error("position exceeds PostgreSQL integer range")]
-    PositionOverflow,
-    #[error("random source failed: {0}")]
+    #[error("the operating system random source failed; no identifier was generated: {0}")]
     Random(getrandom::Error),
-    #[error("embedding dimensions must be 768, found {dimensions}")]
+    #[error("embedding dimensions must be greater than zero, found {dimensions}")]
     InvalidVectorDimensions { dimensions: usize },
     #[error("embedding has {actual} components, expected {expected}")]
     InvalidVectorLength { expected: usize, actual: usize },
-    #[error("embedding contains a non-finite component")]
+    #[error("embedding contains a non-finite component; no vector data was written")]
     NonFiniteVector,
-    #[error("embedding has invalid L2 norm {norm}")]
+    #[error("embedding has invalid L2 norm {norm}; expected a normalized vector")]
     InvalidVectorNorm { norm: f32 },
-    #[error("document {document_id} revision {claimed} is stale; current revision is {current:?}")]
+    #[error("stored embedding contains {actual} bytes, expected {expected}; rebuild this vector")]
+    MalformedStoredVector { expected: usize, actual: usize },
+    #[error(
+        "document {document_id} revision {claimed} is stale; current revision is {current:?}; no searchable data was changed"
+    )]
     StaleRevision {
         document_id: String,
         claimed: i64,
@@ -1493,10 +2535,20 @@ pub enum StorageError {
     },
     #[error("unsupported document processing stage {0}")]
     InvalidJobStage(String),
-    #[error("invalid memory proposal")]
+    #[error("memory proposal is missing a temporary id or content; no memory data was changed")]
     InvalidMemoryProposal,
-    #[error("unknown memory source document {0}")]
+    #[error(
+        "document {0} cannot be used as a memory source because it does not exist in this organization"
+    )]
     UnknownMemorySource(String),
-    #[error("memory was not found or already forgotten")]
+    #[error("memory was not found or is already forgotten")]
     MemoryNotFound,
+    #[error(
+        "existing table {table} has malformed columns; expected [{expected}], found [{actual}]; repair or recreate this unreleased schema-v1 database"
+    )]
+    MalformedSchema {
+        table: String,
+        expected: String,
+        actual: String,
+    },
 }

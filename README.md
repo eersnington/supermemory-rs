@@ -6,7 +6,7 @@
 
 A low-memory Rust reimplementation of [Supermemory Local](https://github.com/supermemoryai/supermemory), based on `supermemory-server` [v0.0.5 release](https://github.com/supermemoryai/supermemory/releases/tag/server-v0.0.5).
 
-The goal is to run the same local Supermemory service with a much smaller memory footprint. Instead of Bun, Hono, PGlite, Drizzle, Rivet, and Transformers.js, this port uses Tokio, Axum, Turso through its PostgreSQL protocol, and ONNX Runtime. Supermemory's API and memory behavior should remain the same; the runtime underneath it is what changes.
+The goal is to run the same local Supermemory service with a much smaller memory footprint. Instead of Bun, Hono, PGlite, Drizzle, Rivet, and Transformers.js, this port uses Tokio, Axum, SQLite, rusqlite, and ONNX Runtime in a single process. Supermemory's API and memory behavior should remain the same; the runtime underneath it is what changes.
 
 > ⚠️ Note: This is still a work in progress. The implemented routes work with the Supermemory SDKs, but some v0.0.5 behavior is not available yet.
 
@@ -22,6 +22,7 @@ The goal is to run the same local Supermemory service with a much smaller memory
 - Memory relationships and profile projection
 - Container tags, metadata filters, and organization-scoped data
 - Local BGE embeddings with the same 768-dimensional model
+- Migration from an existing `~/.supermemory` installation
 
 The worker uses a durable, revision-guarded queue. Chunks and embeddings are committed together, interrupted jobs resume after restart, and stale workers cannot overwrite newer document revisions.
 
@@ -29,7 +30,7 @@ See the [semantic porting guidelines](docs/semantic-porting.md) for the compatib
 
 ## Requirements
 
-- Rust 1.88 or newer
+- Rust 1.85 or newer
 - The BGE tokenizer and ONNX model under `~/.supermemory/models/Xenova/bge-base-en-v1.5`
 - The ONNX Runtime library used by Supermemory under `~/.supermemory/runtime/ort-native/`
 
@@ -50,13 +51,13 @@ To run directly from the checkout during development:
 cargo run -p supermemory
 ```
 
-The server listens on `127.0.0.1:6767` and stores its Turso database and local configuration in `~/.supermemory-rs`. The PostgreSQL-compatible Turso server is embedded in the binary and starts automatically.
+The server listens on `127.0.0.1:6767` and stores its database and configuration in `~/.supermemory-rs`.
 
 Other startup options:
 
 ```text
 --bind <address>          SUPERMEMORY_BIND
---data <path>            SUPERMEMORY_DATA
+--database <path>        SUPERMEMORY_DATABASE
 --model <path>           SUPERMEMORY_MODEL
 --ort-library <path>     SUPERMEMORY_ORT_LIBRARY
 ```
@@ -85,7 +86,7 @@ V4 search supports three modes:
 - `documents` searches document chunks
 - `hybrid` searches both and gives memory results a small ranking boost
 
-Without a loaded embedding model, document search falls back to a text query through Turso. Memory search requires embeddings.
+Without a loaded embedding model, document search falls back to SQLite FTS5. Memory search requires embeddings.
 
 ## Memory extraction
 

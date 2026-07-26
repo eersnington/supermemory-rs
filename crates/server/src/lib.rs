@@ -58,11 +58,19 @@ fn router_with_port(
     embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
     port: u16,
 ) -> Router {
-    let local_org_id = storage.lock().map_or_else(
-        |_| String::new(),
-        |storage| storage.local_organization_id().to_owned(),
+    let (local_org_id, mut api_keys) = storage.lock().map_or_else(
+        |_| (String::new(), Vec::new()),
+        |storage| {
+            let local = storage.local_organization_id().to_owned();
+            let imported = storage
+                .api_key_identities()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(hash, org)| (hash, org.unwrap_or_else(|| local.clone())))
+                .collect();
+            (local, imported)
+        },
     );
-    let mut api_keys = Vec::new();
     if let Some(key) = api_key.as_ref() {
         api_keys.push((Sha256::digest(key).into(), local_org_id.clone()));
     }
