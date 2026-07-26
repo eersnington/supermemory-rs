@@ -474,11 +474,12 @@ impl Storage {
         };
         let mut db = self.client();
         let mut tx = db.transaction().map_err(StorageError::Write)?;
-        let a=tx.execute("UPDATE jobs SET status=$3,updated_at=now() WHERE id=$1 AND revision=$2 AND status=$4", &[&job.id,&job.revision,&stage,&expected]).map_err(StorageError::Write)?;
+        let revision_parameter = job.revision.to_string();
+        let a=tx.execute("UPDATE jobs SET status=$3,updated_at=now() WHERE id=$1 AND revision=$2::bigint AND status=$4", &[&job.id,&revision_parameter,&stage,&expected]).map_err(StorageError::Write)?;
         let b = tx
             .execute(
-                "UPDATE documents SET status=$3,updated_at=now() WHERE id=$1 AND revision=$2",
-                &[&job.document_id, &job.revision, &stage],
+                "UPDATE documents SET status=$3,updated_at=now() WHERE id=$1 AND revision=$2::bigint",
+                &[&job.document_id, &revision_parameter, &stage],
             )
             .map_err(StorageError::Write)?;
         if a != 1 || b != 1 {
@@ -493,16 +494,18 @@ impl Storage {
     pub fn fail_job(&mut self, job: &ClaimedJob, error: &str) -> Result<(), StorageError> {
         let mut db = self.client();
         let mut tx = db.transaction().map_err(StorageError::Write)?;
-        tx.execute("UPDATE jobs SET status='failed',last_error=$3,updated_at=now() WHERE id=$1 AND revision=$2",&[&job.id,&job.revision,&error]).map_err(StorageError::Write)?;
+        let revision_parameter = job.revision.to_string();
+        tx.execute("UPDATE jobs SET status='failed',last_error=$3,updated_at=now() WHERE id=$1 AND revision=$2::bigint",&[&job.id,&revision_parameter,&error]).map_err(StorageError::Write)?;
         tx.execute(
-            "UPDATE documents SET status='failed',updated_at=now() WHERE id=$1 AND revision=$2",
-            &[&job.document_id, &job.revision],
+            "UPDATE documents SET status='failed',updated_at=now() WHERE id=$1 AND revision=$2::bigint",
+            &[&job.document_id, &revision_parameter],
         )
         .map_err(StorageError::Write)?;
         tx.commit().map_err(StorageError::Write)
     }
     pub fn delete_empty_document(&mut self, job: &ClaimedJob) -> Result<(), StorageError> {
-        self.client().execute("DELETE FROM documents WHERE id=$1 AND revision=$2 AND status IN ('extracting','chunking')",&[&job.document_id,&job.revision]).map(|_|()).map_err(StorageError::Write)
+        let revision_parameter = job.revision.to_string();
+        self.client().execute("DELETE FROM documents WHERE id=$1 AND revision=$2::bigint AND status IN ('extracting','chunking')",&[&job.document_id,&revision_parameter]).map(|_|()).map_err(StorageError::Write)
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StorageError> {
@@ -643,8 +646,11 @@ impl Storage {
             let version = primary.map_or(1, |x| x.version + 1);
             let inferred = p.is_inferred || parents.iter().any(|x| x.relation == "derives");
             let forget = valid_future_datetime(&mut tx, p.forget_after.as_deref())?;
-            let metadata = Value::Object(p.metadata.clone());
-            tx.execute("INSERT INTO memories(id,org_id,container_tag,content,metadata,is_inferred,is_static,root_memory_id,parent_memory_id,version,forget_after,forget_reason) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::timestamptz,$12)",&[&id,&org_id,&container_tag,&p.content,&metadata,&inferred,&p.is_static,&root,&parent,&version,&forget,&p.forget_reason]).map_err(StorageError::Write)?;
+            let metadata = json_value(&p.metadata)?;
+            let inferred_parameter = inferred.to_string();
+            let static_parameter = p.is_static.to_string();
+            let version_parameter = version.to_string();
+            tx.execute("INSERT INTO memories(id,org_id,container_tag,content,metadata,is_inferred,is_static,root_memory_id,parent_memory_id,version,forget_after,forget_reason) VALUES($1,$2,$3,$4,$5,$6::boolean,$7::boolean,$8,$9,$10::bigint,$11::timestamptz,$12)",&[&id,&org_id,&container_tag,&p.content,&metadata,&inferred_parameter,&static_parameter,&root,&parent,&version_parameter,&forget,&p.forget_reason]).map_err(StorageError::Write)?;
             tx.execute(
                 "INSERT INTO memory_sources(memory_id,document_id) VALUES($1,$2)",
                 &[&id, &document_id],
@@ -663,7 +669,7 @@ impl Storage {
             }
             tx.execute(
                 "INSERT INTO memory_embeddings(memory_id,model_id,vector) VALUES($1,$2,$3)",
-                &[&id, &model_id, &vector_text(&p.vector)],
+                &[&id, &model_id, &PgVector(p.vector.clone())],
             )
             .map_err(StorageError::Write)?;
             temp.insert(p.temporary_id.clone(), id.clone());
@@ -713,7 +719,8 @@ impl Storage {
         is_static: bool,
         excluded: &HashSet<String>,
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        let rows=self.client().query("SELECT id,content,metadata,is_inferred,is_static,is_latest,is_forgotten,root_memory_id,parent_memory_id,version,forget_after::text,forget_reason,created_at::text,updated_at::text FROM memories WHERE org_id=$1 AND container_tag=$2 AND is_static=$3 AND is_latest AND NOT is_forgotten AND (forget_after IS NULL OR forget_after>now()) ORDER BY updated_at DESC LIMIT 300",&[&org,&tag,&is_static]).map_err(StorageError::Read)?;
+        let static_parameter = is_static.to_string();
+        let rows=self.client().query("SELECT id,content,metadata,is_inferred,is_static,is_latest,is_forgotten,root_memory_id,parent_memory_id,version,forget_after::text,forget_reason,created_at::text,updated_at::text FROM memories WHERE org_id=$1 AND container_tag=$2 AND is_static=$3::boolean AND is_latest AND NOT is_forgotten AND (forget_after IS NULL OR forget_after>now()) ORDER BY updated_at DESC LIMIT 300",&[&org,&tag,&static_parameter]).map_err(StorageError::Read)?;
         let records = rows.iter().map(read_memory).collect::<Result<_, _>>()?;
         Ok(deduplicate_memories(records, 100, excluded))
     }

@@ -110,15 +110,17 @@ fn normalized_vectors_are_published_and_ranked_exactly() {
         .upsert_document(input("first semantic chunk"))
         .expect("first document");
     let first_job = storage.claim_job().expect("claim").expect("first job");
+    let mut first_vector = vec![0.0; 768];
+    first_vector[0] = 1.0;
     storage
         .complete_embedded_job(
             &first_job,
             &[EmbeddedChunk {
                 content: &first_job.content,
-                vector: &[1.0, 0.0],
+                vector: &first_vector,
             }],
             "fixture-model",
-            2,
+            768,
         )
         .expect("publish first");
 
@@ -126,21 +128,24 @@ fn normalized_vectors_are_published_and_ranked_exactly() {
         .upsert_document(input("second semantic chunk"))
         .expect("second document");
     let second_job = storage.claim_job().expect("claim").expect("second job");
+    let mut second_vector = vec![0.0; 768];
+    second_vector[0] = 0.8;
+    second_vector[1] = 0.6;
     storage
         .complete_embedded_job(
             &second_job,
             &[EmbeddedChunk {
                 content: &second_job.content,
-                vector: &[0.8, 0.6],
+                vector: &second_vector,
             }],
             "fixture-model",
-            2,
+            768,
         )
         .expect("publish second");
 
     let hits = storage
         .search_semantic(
-            &[1.0, 0.0],
+            &first_vector,
             "fixture-model",
             10,
             0.0,
@@ -160,15 +165,16 @@ fn malformed_vectors_are_rejected_before_publication() {
         .upsert_document(input("invalid embedding"))
         .expect("document");
     let job = storage.claim_job().expect("claim").expect("job");
+    let malformed_vector = vec![0.5; 768];
     let error = storage
         .complete_embedded_job(
             &job,
             &[EmbeddedChunk {
                 content: &job.content,
-                vector: &[0.5, 0.5],
+                vector: &malformed_vector,
             }],
             "fixture-model",
-            2,
+            768,
         )
         .expect_err("non-normalized vector must fail");
     assert!(matches!(error, StorageError::InvalidVectorNorm { .. }));
