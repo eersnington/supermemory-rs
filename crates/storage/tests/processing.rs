@@ -35,6 +35,24 @@ fn claimed_job_becomes_searchable_only_after_atomic_completion() {
 }
 
 #[test]
+fn duplicate_pending_ingestion_reuses_the_existing_job() {
+    let mut storage = Storage::in_memory().expect("storage");
+    let document = input("the same pending episode");
+    let first = storage
+        .upsert_document(document.clone())
+        .expect("first ingestion");
+    let duplicate = storage
+        .upsert_document(document)
+        .expect("duplicate ingestion");
+
+    assert_eq!(duplicate.id, first.id);
+    assert!(!duplicate.enqueued);
+    let claimed = storage.claim_job().expect("claim").expect("one job");
+    assert_eq!(claimed.document_id, first.id);
+    assert!(storage.claim_job().expect("no duplicate job").is_none());
+}
+
+#[test]
 fn reprocessing_replaces_old_searchable_content() {
     let mut storage = Storage::in_memory().expect("storage");
     let mut value = input("first albatross content");
@@ -148,6 +166,7 @@ fn normalized_vectors_are_published_and_ranked_exactly() {
             &first_vector,
             "fixture-model",
             10,
+            100,
             0.0,
             &storage::SearchOptions::default(),
         )
@@ -156,6 +175,51 @@ fn normalized_vectors_are_published_and_ranked_exactly() {
     assert_eq!(hits[0].document_id, first.id);
     assert_eq!(hits[1].document_id, second.id);
     assert!((hits[0].score - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn memory_extraction_is_durable_and_controls_document_completion() {
+    let mut storage = Storage::in_memory().expect("storage");
+    let mut document = input("A dated memory extraction source");
+    document.metadata.insert("date".into(), "2025-01-02".into());
+    storage.upsert_document(document).expect("document");
+    let job = storage.claim_job().expect("claim").expect("document job");
+    assert_eq!(job.document_date.as_deref(), Some("2025-01-02"));
+    assert_eq!(job.container_tag, "sm_project_default");
+
+    let mut vector = vec![0.0; 768];
+    vector[0] = 1.0;
+    storage
+        .complete_embedded_job_with_memory_extraction(
+            &job,
+            &[EmbeddedChunk {
+                content: &job.content,
+                vector: &vector,
+            }],
+            "fixture-model",
+            768,
+        )
+        .expect("publish and schedule extraction");
+
+    let pending = storage
+        .find_document(&job.document_id)
+        .expect("lookup")
+        .expect("document");
+    assert_eq!(pending.status, "indexing");
+    assert!(storage.claim_job().expect("document queue").is_none());
+    let memory_job = storage
+        .claim_memory_job()
+        .expect("claim memory")
+        .expect("memory job");
+    assert_eq!(memory_job.document_date.as_deref(), Some("2025-01-02"));
+    storage
+        .complete_memory_job(&memory_job)
+        .expect("complete memory");
+    let complete = storage
+        .find_document(&job.document_id)
+        .expect("lookup")
+        .expect("document");
+    assert_eq!(complete.status, "done");
 }
 
 #[test]

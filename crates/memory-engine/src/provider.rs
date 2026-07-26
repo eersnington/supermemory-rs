@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -135,7 +135,27 @@ pub struct ParentRelation {
 #[serde(rename_all = "camelCase")]
 pub struct TemporalContext {
     pub document_date: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_event_dates")]
     pub event_date: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EventDates {
+    One(String),
+    Many(Vec<String>),
+}
+
+fn deserialize_event_dates<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(
+        Option::<EventDates>::deserialize(deserializer)?.map(|dates| match dates {
+            EventDates::One(date) => vec![date],
+            EventDates::Many(dates) => dates,
+        }),
+    )
 }
 
 /// One validated memory proposal.
@@ -207,6 +227,22 @@ impl MemoryProvider {
     #[must_use]
     pub const fn kind(&self) -> ProviderKind {
         self.config.kind
+    }
+
+    /// Performs one extraction attempt for a durable external retry queue.
+    ///
+    /// # Errors
+    /// Returns a request or structured-response failure without retrying.
+    pub async fn extract_once(
+        &self,
+        document: &str,
+        document_date: Option<&str>,
+        existing_memories: &[(String, String)],
+    ) -> Result<Vec<MemoryCandidate>, ProviderError> {
+        let prompt = extraction_prompt(document, document_date, existing_memories);
+        self.request(&prompt)
+            .await
+            .and_then(|content| parse_candidates(&content))
     }
 
     /// Extracts future-useful memories from one document with v0.0.5 retry bounds.
