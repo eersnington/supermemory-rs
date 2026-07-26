@@ -20,7 +20,6 @@ use storage::{EmbeddedChunk, Storage, UpsertDocument};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 
 /// Safely shared application storage.
@@ -32,8 +31,6 @@ struct AppState {
     api_key: Option<String>,
     port: u16,
     storage: SharedStorage,
-    search_connections: Arc<Mutex<Vec<Storage>>>,
-    search_permits: Arc<Semaphore>,
     embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
     local_org_id: String,
 }
@@ -74,8 +71,6 @@ fn router_with_port(
         api_key,
         port,
         storage,
-        search_connections: Arc::new(Mutex::new(Vec::new())),
-        search_permits: Arc::new(Semaphore::new(8)),
         embeddings,
         local_org_id,
     };
@@ -241,16 +236,6 @@ pub async fn serve_with_services_ready(
         embeddings.as_ref().map(Arc::clone),
         provider.as_ref().map(Arc::clone),
     ));
-    let memory_worker = provider
-        .as_ref()
-        .zip(embeddings.as_ref())
-        .map(|(provider, embeddings)| {
-            tokio::spawn(memory_worker_loop(
-                Arc::clone(&storage),
-                Arc::clone(embeddings),
-                Arc::clone(provider),
-            ))
-        });
     let result = axum::serve(
         listener,
         router_with_port(api_key, storage, embeddings, address.port())
@@ -260,9 +245,6 @@ pub async fn serve_with_services_ready(
     .await
     .map_err(ServerError::Serve);
     worker.abort();
-    if let Some(worker) = memory_worker {
-        worker.abort();
-    }
     result
 }
 
@@ -508,45 +490,22 @@ async fn v3_search(
         filters,
     };
     let storage = Arc::clone(&state.storage);
-    let connections = Arc::clone(&state.search_connections);
-    let permit = Arc::clone(&state.search_permits)
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::StorageUnavailable)?;
     let hits = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let connection = connections
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
-            .pop();
-        let connection = match connection {
-            Some(connection) => connection,
-            None => storage
-                .lock()
-                .map_err(|_| ApiError::StorageUnavailable)?
-                .fork()
-                .map_err(ApiError::Storage)?,
-        };
-        let result = query_vector
+        let storage = storage.lock().map_err(|_| ApiError::StorageUnavailable)?;
+        query_vector
             .map_or_else(
-                || connection.search_for(&organization.0, &query, candidate_limit),
+                || storage.search_for(&organization.0, &query, candidate_limit),
                 |vector| {
-                    connection.search_semantic(
+                    storage.search_semantic(
                         vector.as_slice(),
                         "Xenova/bge-base-en-v1.5:q8:mean:normalized",
                         candidate_limit,
-                        candidate_limit.saturating_mul(10).max(100),
                         request.chunk_threshold,
                         &options,
                     )
                 },
             )
-            .map_err(ApiError::Storage);
-        connections
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
-            .push(connection);
-        result
+            .map_err(ApiError::Storage)
     })
     .await
     .map_err(ApiError::DatabaseExecutor)??;
@@ -842,28 +801,11 @@ async fn search(
         filters,
     };
     let candidate_limit = limit.saturating_mul(if request.aggregate { 5 } else { 3 });
-    let connections = Arc::clone(&state.search_connections);
-    let permit = Arc::clone(&state.search_permits)
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::StorageUnavailable)?;
     let (memory_hits, chunk_hits) = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let connection = connections
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
-            .pop();
-        let connection = match connection {
-            Some(connection) => connection,
-            None => storage
-                .lock()
-                .map_err(|_| ApiError::StorageUnavailable)?
-                .fork()
-                .map_err(ApiError::Storage)?,
-        };
-        let result = if let Some(vector) = query_vector {
+        let storage = storage.lock().map_err(|_| ApiError::StorageUnavailable)?;
+        if let Some(vector) = query_vector {
             let memories = if memory_mode {
-                connection
+                storage
                     .search_memories_for(
                         &organization.0,
                         vector.as_slice(),
@@ -873,7 +815,6 @@ async fn search(
                             .first()
                             .map_or("sm_project_default", String::as_str),
                         candidate_limit,
-                        candidate_limit.saturating_mul(10).max(100),
                         threshold,
                         include_forgotten,
                     )
@@ -882,12 +823,11 @@ async fn search(
                 Vec::new()
             };
             let chunks = if document_mode {
-                connection
+                storage
                     .search_semantic(
                         vector.as_slice(),
                         "Xenova/bge-base-en-v1.5:q8:mean:normalized",
                         candidate_limit,
-                        candidate_limit.saturating_mul(10).max(100),
                         threshold,
                         &options,
                     )
@@ -898,19 +838,14 @@ async fn search(
             Ok((memories, chunks))
         } else {
             let chunks = if document_mode {
-                connection
+                storage
                     .search_for(&organization.0, &query, candidate_limit)
                     .map_err(ApiError::Storage)?
             } else {
                 Vec::new()
             };
             Ok((Vec::new(), chunks))
-        };
-        connections
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
-            .push(connection);
-        result
+        }
     })
     .await
     .map_err(ApiError::DatabaseExecutor)??;
@@ -1342,7 +1277,6 @@ async fn profile_search(
                 "Xenova/bge-base-en-v1.5:q8:mean:normalized",
                 &container_tag,
                 15,
-                150,
                 threshold,
                 false,
             )
@@ -1446,6 +1380,10 @@ pub async fn process_next_job_with_embeddings(
 ///
 /// # Errors
 /// Returns an error if durable document publication fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "durable stage transitions remain visible in one orchestration function"
+)]
 pub async fn process_next_job_with_services(
     storage: SharedStorage,
     embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
@@ -1515,29 +1453,42 @@ pub async fn process_next_job_with_services(
                     vector: vector.as_slice(),
                 })
                 .collect();
-            let mut storage = publication_storage
+            publication_storage
                 .lock()
-                .map_err(|_| WorkerError::StorageUnavailable)?;
-            if provider.is_some() {
-                storage.complete_embedded_job_with_memory_extraction(
+                .map_err(|_| WorkerError::StorageUnavailable)?
+                .complete_embedded_job(
                     &publication_job,
                     &embedded,
                     "Xenova/bge-base-en-v1.5:q8:mean:normalized",
                     memory_engine::BGE_DIMENSIONS,
                 )
-            } else {
-                storage.complete_embedded_job(
-                    &publication_job,
-                    &embedded,
-                    "Xenova/bge-base-en-v1.5:q8:mean:normalized",
-                    memory_engine::BGE_DIMENSIONS,
-                )
-            }
-            .map_err(WorkerError::Storage)
+                .map_err(WorkerError::Storage)
         })
         .await
         .map_err(WorkerError::Executor)??;
 
+        if let Some(provider) = provider {
+            match provider.extract(&job.content, None, &[]).await {
+                Ok(candidates) if !candidates.is_empty() => {
+                    let values = candidates
+                        .iter()
+                        .map(|candidate| candidate.memory.clone())
+                        .collect::<Vec<_>>();
+                    let memory_embeddings = Arc::clone(&embeddings);
+                    let vectors =
+                        tokio::task::spawn_blocking(move || memory_embeddings.embed(&values))
+                            .await
+                            .map_err(WorkerError::Executor)?
+                            .map_err(WorkerError::Embedding)?;
+                    reconcile_extracted_memories(Arc::clone(&storage), &job, candidates, vectors)
+                        .await?;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, document_id = %job.document_id, "skipping memory generation after provider failure");
+                }
+            }
+        }
         return Ok(true);
     }
     tokio::task::spawn_blocking(move || {
@@ -1571,13 +1522,12 @@ async fn mark_job_stage(
 
 async fn reconcile_extracted_memories(
     storage: SharedStorage,
-    job: &storage::ClaimedMemoryJob,
+    job: &storage::ClaimedJob,
     candidates: Vec<memory_engine::MemoryCandidate>,
     vectors: Vec<memory_engine::EmbeddingVector>,
 ) -> Result<(), WorkerError> {
     let document_id = job.document_id.clone();
     let organization_id = job.organization_id.clone();
-    let container_tag = job.container_tag.clone();
     let proposals = candidates
         .into_iter()
         .zip(vectors)
@@ -1622,7 +1572,7 @@ async fn reconcile_extracted_memories(
             .reconcile_memories_for(
                 &organization_id,
                 &document_id,
-                &container_tag,
+                "sm_project_default",
                 &proposals,
                 "Xenova/bge-base-en-v1.5:q8:mean:normalized",
                 memory_engine::BGE_DIMENSIONS,
@@ -1650,166 +1600,6 @@ async fn persist_job_failure(
     .await
     .map_err(WorkerError::Executor)??;
     Ok(())
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "durable cache, retry, embedding, and publication transitions remain explicit"
-)]
-async fn process_next_memory_job(
-    storage: SharedStorage,
-    embeddings: Arc<memory_engine::EmbeddingModel>,
-    provider: Arc<memory_engine::MemoryProvider>,
-) -> Result<bool, WorkerError> {
-    let job = tokio::task::spawn_blocking({
-        let storage = Arc::clone(&storage);
-        move || {
-            storage
-                .lock()
-                .map_err(|_| WorkerError::StorageUnavailable)?
-                .claim_memory_job()
-                .map_err(WorkerError::Storage)
-        }
-    })
-    .await
-    .map_err(WorkerError::Executor)??;
-    let Some(job) = job else {
-        return Ok(false);
-    };
-    let candidates = if let Some(cached) = job.extraction_result.as_deref() {
-        serde_json::from_str(cached).map_err(WorkerError::CachedExtraction)?
-    } else {
-        let existing = tokio::task::spawn_blocking({
-            let storage = Arc::clone(&storage);
-            let org = job.organization_id.clone();
-            let tag = job.container_tag.clone();
-            move || {
-                storage
-                    .lock()
-                    .map_err(|_| WorkerError::StorageUnavailable)?
-                    .existing_memories_for_extraction(&org, &tag)
-                    .map_err(WorkerError::Storage)
-            }
-        })
-        .await
-        .map_err(WorkerError::Executor)??;
-        let context: Vec<_> = existing
-            .into_iter()
-            .map(|memory| (memory.id, memory.content))
-            .collect();
-        let candidates = match provider
-            .extract_once(&job.content, job.document_date.as_deref(), &context)
-            .await
-        {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                retry_memory_job(Arc::clone(&storage), job.clone(), error.to_string()).await?;
-                return Err(WorkerError::Provider(error));
-            }
-        };
-        let cached = serde_json::to_string(&candidates).map_err(WorkerError::CachedExtraction)?;
-        tokio::task::spawn_blocking({
-            let storage = Arc::clone(&storage);
-            let job = job.clone();
-            move || {
-                storage
-                    .lock()
-                    .map_err(|_| WorkerError::StorageUnavailable)?
-                    .cache_memory_extraction(&job, &cached)
-                    .map_err(WorkerError::Storage)
-            }
-        })
-        .await
-        .map_err(WorkerError::Executor)??;
-        candidates
-    };
-    if !candidates.is_empty() {
-        let values = candidates
-            .iter()
-            .map(|candidate| candidate.memory.clone())
-            .collect::<Vec<_>>();
-        let vectors = match tokio::task::spawn_blocking(move || embeddings.embed(&values))
-            .await
-            .map_err(WorkerError::Executor)?
-        {
-            Ok(vectors) => vectors,
-            Err(error) => {
-                retry_memory_job(Arc::clone(&storage), job.clone(), error.to_string()).await?;
-                return Err(WorkerError::Embedding(error));
-            }
-        };
-        let current = tokio::task::spawn_blocking({
-            let storage = Arc::clone(&storage);
-            let job = job.clone();
-            move || {
-                storage
-                    .lock()
-                    .map_err(|_| WorkerError::StorageUnavailable)?
-                    .memory_job_is_current(&job)
-                    .map_err(WorkerError::Storage)
-            }
-        })
-        .await
-        .map_err(WorkerError::Executor)??;
-        if current {
-            if let Err(error) =
-                reconcile_extracted_memories(Arc::clone(&storage), &job, candidates, vectors).await
-            {
-                retry_memory_job(Arc::clone(&storage), job.clone(), error.to_string()).await?;
-                return Err(error);
-            }
-        }
-    }
-    tokio::task::spawn_blocking(move || {
-        storage
-            .lock()
-            .map_err(|_| WorkerError::StorageUnavailable)?
-            .complete_memory_job(&job)
-            .map_err(WorkerError::Storage)
-    })
-    .await
-    .map_err(WorkerError::Executor)??;
-    Ok(true)
-}
-
-async fn retry_memory_job(
-    storage: SharedStorage,
-    job: storage::ClaimedMemoryJob,
-    message: String,
-) -> Result<(), WorkerError> {
-    tokio::task::spawn_blocking(move || {
-        storage
-            .lock()
-            .map_err(|_| WorkerError::StorageUnavailable)?
-            .retry_memory_job(&job, &message)
-            .map_err(WorkerError::Storage)
-    })
-    .await
-    .map_err(WorkerError::Executor)??;
-    Ok(())
-}
-
-async fn memory_worker_loop(
-    storage: SharedStorage,
-    embeddings: Arc<memory_engine::EmbeddingModel>,
-    provider: Arc<memory_engine::MemoryProvider>,
-) {
-    loop {
-        match process_next_memory_job(
-            Arc::clone(&storage),
-            Arc::clone(&embeddings),
-            Arc::clone(&provider),
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => sleep(Duration::from_millis(100)).await,
-            Err(error) => {
-                tracing::error!(%error, "memory worker failed; retrying");
-                sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
 }
 
 async fn worker_loop(
@@ -2055,8 +1845,4 @@ pub enum WorkerError {
     Chunking(#[source] memory_engine::ChunkingError),
     #[error("document embedding failed: {0}")]
     Embedding(#[source] memory_engine::EmbeddingError),
-    #[error("memory extraction failed: {0}")]
-    Provider(#[source] memory_engine::ProviderError),
-    #[error("cached memory extraction is invalid: {0}")]
-    CachedExtraction(#[source] serde_json::Error),
 }

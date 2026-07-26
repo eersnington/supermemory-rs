@@ -56,10 +56,7 @@ async fn openai_compatible_response_is_validated_and_normalized() {
                     {"memoryId":"mem_parent", "relation":"updates"},
                     {"memoryId":"invalid", "relation":"updates"}
                 ],
-                "temporalContext": {
-                    "documentDate": "2025-01-02",
-                    "eventDate": "2025-01-02"
-                },
+                "temporalContext": null,
                 "forgetAfter": null,
                 "forgetReason": null
             }]
@@ -92,13 +89,6 @@ async fn openai_compatible_response_is_validated_and_normalized() {
     assert!(request.contains(r#""reasoning_effort":"medium""#));
     assert_eq!(candidates.len(), 1);
     assert!(candidates[0].buckets.is_empty());
-    assert_eq!(
-        candidates[0]
-            .temporal_context
-            .as_ref()
-            .and_then(|context| context.event_date.as_deref()),
-        Some(["2025-01-02".to_owned()].as_slice())
-    );
     assert_eq!(candidates[0].parent_relations.len(), 1);
     assert_eq!(
         candidates[0].parent_relations[0].relation,
