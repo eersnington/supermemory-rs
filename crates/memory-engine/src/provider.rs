@@ -139,23 +139,36 @@ pub struct TemporalContext {
     pub event_date: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum EventDates {
-    One(String),
-    Many(Vec<String>),
-}
-
 fn deserialize_event_dates<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Ok(
-        Option::<EventDates>::deserialize(deserializer)?.map(|dates| match dates {
-            EventDates::One(date) => vec![date],
-            EventDates::Many(dates) => dates,
-        }),
-    )
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(Value::String(date)) => Some(vec![date]),
+        Some(Value::Array(dates)) => Some(
+            dates
+                .into_iter()
+                .filter_map(|date| date.as_str().map(str::to_owned))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+fn deserialize_buckets<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(Value::Array(buckets)) => buckets
+            .into_iter()
+            .filter_map(|bucket| bucket.as_str().map(str::to_owned))
+            .collect(),
+        Some(Value::String(bucket)) => vec![bucket],
+        _ => Vec::new(),
+    })
 }
 
 /// One validated memory proposal.
@@ -176,19 +189,20 @@ pub struct MemoryCandidate {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct ExtractionResponse {
     memories_to_add_or_update: Vec<RawMemoryCandidate>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct RawMemoryCandidate {
     tmp_id: String,
     memory: String,
     is_inferred: bool,
     add_to_static_profile: bool,
-    buckets: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_buckets")]
+    buckets: Vec<String>,
     #[serde(default)]
     parent_relations: Vec<RawParentRelation>,
     temporal_context: Option<TemporalContext>,
@@ -199,8 +213,8 @@ struct RawMemoryCandidate {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawParentRelation {
-    memory_id: String,
-    relation: String,
+    memory_id: Option<String>,
+    relation: Option<String>,
 }
 
 /// A configured provider client used by document processing.
@@ -390,29 +404,30 @@ fn normalize_candidate(candidate: RawMemoryCandidate) -> MemoryCandidate {
     let parent_relations = candidate
         .parent_relations
         .into_iter()
-        .filter(|parent| {
-            !parent.memory_id.is_empty()
-                && (parent.memory_id.starts_with("tmp_")
-                    || parent.memory_id.starts_with("mem_")
-                    || parent.memory_id.starts_with("doc_"))
-                && seen.insert(parent.memory_id.clone())
+        .filter_map(|parent| {
+            let memory_id = parent.memory_id?;
+            ((!memory_id.is_empty())
+                && (memory_id.starts_with("tmp_")
+                    || memory_id.starts_with("mem_")
+                    || memory_id.starts_with("doc_"))
+                && seen.insert(memory_id.clone()))
+            .then_some(ParentRelation {
+                memory_id,
+                relation: match parent.relation.as_deref() {
+                    Some("updates") => RelationKind::Updates,
+                    Some("derives") => RelationKind::Derives,
+                    _ => RelationKind::Extends,
+                },
+            })
         })
         .take(MAX_PARENTS)
-        .map(|parent| ParentRelation {
-            memory_id: parent.memory_id,
-            relation: match parent.relation.as_str() {
-                "updates" => RelationKind::Updates,
-                "derives" => RelationKind::Derives,
-                _ => RelationKind::Extends,
-            },
-        })
         .collect();
     MemoryCandidate {
         tmp_id: candidate.tmp_id,
         memory: candidate.memory,
         is_inferred: candidate.is_inferred,
         add_to_static_profile: candidate.add_to_static_profile,
-        buckets: candidate.buckets.unwrap_or_default(),
+        buckets: candidate.buckets,
         parent_relations,
         temporal_context: candidate.temporal_context,
         forget_after: candidate.forget_after,
