@@ -62,7 +62,24 @@ async fn openai_compatible_response_is_validated_and_normalized() {
             }]
         });
         let body = serde_json::json!({
-            "choices": [{"message": {"content": extracted.to_string()}}]
+            "id": "fixture",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "fixture",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_fixture",
+                        "type": "function",
+                        "function": {"name": "submit", "arguments": extracted.to_string()}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
         })
         .to_string();
         let response = format!(
@@ -82,7 +99,7 @@ async fn openai_compatible_response_is_validated_and_normalized() {
     })
     .expect("provider");
     let candidates = provider
-        .extract("The user prefers concise answers.", None, &[])
+        .extract_once("The user prefers concise answers.", None, &[])
         .await
         .expect("extract");
     let request = server.await.expect("server");

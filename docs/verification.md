@@ -85,6 +85,12 @@ One release run processed 50 short documents and sent 100 requests to each measu
 
 Use the matched MemoryBench results for cross-server conclusions.
 
+## SQLite vector search decision
+
+The SQLite branch ranks normalized embedding blobs with a deterministic `cosine_similarity` function registered on every connection. Filtering and ranking happen in SQLite, and only the selected rows are hydrated.
+
+`sqlite-vec` 0.1.9 was considered first. Its Rust setup registers the extension through `sqlite3_auto_extension`, which requires an unsafe call. This workspace forbids unsafe code. Its `vec0` tables would also duplicate the existing chunk and memory embedding tables. The registered exact function keeps the current schema and gives us a reference path for a later `sqlite-vec` integration if its safe Rust API matures.
+
 ## Track remaining parity gaps
 
 The following behavior still differs from or lacks full verification against v0.0.5:

@@ -3,12 +3,14 @@
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
     thread,
     time::Duration,
 };
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, TransactionBehavior, functions::FunctionFlags, params,
+};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha1::{Digest, Sha1};
@@ -29,6 +31,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         5,
         include_str!("../../../migrations/0005_legacy_compatibility.sql"),
+    ),
+    (
+        6,
+        include_str!("../../../migrations/0006_memory_job_state.sql"),
     ),
 ];
 const BASE58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -64,6 +70,29 @@ pub struct ClaimedJob {
     pub content: String,
     pub revision: i64,
     pub organization_id: String,
+    pub container_tag: String,
+    pub document_date: Option<String>,
+}
+
+/// A durable provider-extraction job claimed independently of document indexing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedMemoryJob {
+    pub id: String,
+    pub document_id: String,
+    pub content: String,
+    pub revision: i64,
+    pub organization_id: String,
+    pub container_tag: String,
+    pub document_date: Option<String>,
+    pub extraction_result: Option<String>,
+    pub attempts: i64,
+}
+
+/// Existing organization memory supplied as extraction context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingMemory {
+    pub id: String,
+    pub content: String,
 }
 
 /// A chunk and its normalized embedding ready for atomic publication.
@@ -263,6 +292,7 @@ struct StoredDocument {
 pub struct Storage {
     connection: Connection,
     local_org_id: String,
+    database_path: Option<PathBuf>,
 }
 
 impl Storage {
@@ -271,11 +301,13 @@ impl Storage {
     /// # Errors
     /// Returns an error when the database cannot be opened, migrated, or seeded.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let mut connection = Connection::open(path).map_err(StorageError::Open)?;
+        let database_path = path.as_ref().to_path_buf();
+        let mut connection = Connection::open(&database_path).map_err(StorageError::Open)?;
         let local_org_id = initialize(&mut connection)?;
         Ok(Self {
             connection,
             local_org_id,
+            database_path: Some(database_path),
         })
     }
 
@@ -289,6 +321,31 @@ impl Storage {
         Ok(Self {
             connection,
             local_org_id,
+            database_path: None,
+        })
+    }
+
+    /// Opens an independent read connection without rerunning migrations or job recovery.
+    ///
+    /// # Errors
+    /// Returns an error for in-memory storage or when the read connection cannot be configured.
+    pub fn fork(&self) -> Result<Self, StorageError> {
+        let path = self
+            .database_path
+            .as_ref()
+            .ok_or(StorageError::CannotForkInMemory)?;
+        let connection = Connection::open(path).map_err(StorageError::Open)?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(StorageError::Configure)?;
+        connection
+            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA query_only=ON;")
+            .map_err(StorageError::Configure)?;
+        register_vector_functions(&connection)?;
+        Ok(Self {
+            connection,
+            local_org_id: self.local_org_id.clone(),
+            database_path: Some(path.clone()),
         })
     }
 
@@ -373,9 +430,21 @@ impl Storage {
             .map_err(StorageError::Write)?;
         let job = tx
             .query_row(
-                "SELECT jobs.id, documents.id, documents.content, jobs.revision, documents.org_id FROM jobs JOIN documents ON documents.id=jobs.document_id WHERE jobs.status='queued' AND jobs.revision=documents.revision AND jobs.available_at <= CURRENT_TIMESTAMP ORDER BY jobs.created_at, jobs.rowid LIMIT 1",
+                "SELECT jobs.id, documents.id, documents.content, jobs.revision, documents.org_id, documents.container_tags, documents.metadata FROM jobs JOIN documents ON documents.id=jobs.document_id WHERE jobs.kind='document' AND jobs.status='queued' AND jobs.revision=documents.revision AND jobs.available_at <= CURRENT_TIMESTAMP ORDER BY jobs.created_at, jobs.rowid LIMIT 1",
                 [],
-                |row| Ok(ClaimedJob { id: row.get(0)?, document_id: row.get(1)?, content: row.get(2)?, revision: row.get(3)?, organization_id: row.get(4)? }),
+                |row| {
+                    let tags: Vec<String> = parse_json(&row.get::<_, String>(5)?, 5)?;
+                    let metadata: Map<String, Value> = parse_json(&row.get::<_, String>(6)?, 6)?;
+                    Ok(ClaimedJob {
+                        id: row.get(0)?,
+                        document_id: row.get(1)?,
+                        content: row.get(2)?,
+                        revision: row.get(3)?,
+                        organization_id: row.get(4)?,
+                        container_tag: tags.into_iter().next().unwrap_or_else(|| "sm_project_default".to_owned()),
+                        document_date: metadata.get("date").and_then(Value::as_str).map(str::to_owned),
+                    })
+                },
             )
             .optional()
             .map_err(StorageError::Read)?;
@@ -413,7 +482,7 @@ impl Storage {
                 vector: &[],
             })
             .collect();
-        self.publish_job(job, &embedded, None)
+        self.publish_job(job, &embedded, None, false)
     }
 
     /// Atomically publishes chunks and normalized vectors for a claimed revision.
@@ -433,7 +502,27 @@ impl Storage {
         for chunk in chunks {
             validate_vector(chunk.vector, dimensions)?;
         }
-        self.publish_job(job, chunks, Some((model_id, dimensions)))
+        self.publish_job(job, chunks, Some((model_id, dimensions)), false)
+    }
+
+    /// Publishes chunks and schedules durable memory extraction in the same transaction.
+    ///
+    /// # Errors
+    /// Returns an error for invalid vectors, stale revisions, or failed persistence.
+    pub fn complete_embedded_job_with_memory_extraction(
+        &mut self,
+        job: &ClaimedJob,
+        chunks: &[EmbeddedChunk<'_>],
+        model_id: &str,
+        dimensions: usize,
+    ) -> Result<(), StorageError> {
+        if dimensions != 768 {
+            return Err(StorageError::InvalidVectorDimensions { dimensions });
+        }
+        for chunk in chunks {
+            validate_vector(chunk.vector, dimensions)?;
+        }
+        self.publish_job(job, chunks, Some((model_id, dimensions)), true)
     }
 
     fn publish_job(
@@ -441,6 +530,7 @@ impl Storage {
         job: &ClaimedJob,
         chunks: &[EmbeddedChunk<'_>],
         embedding: Option<(&str, usize)>,
+        schedule_memory_extraction: bool,
     ) -> Result<(), StorageError> {
         let tx = self.connection.transaction().map_err(StorageError::Write)?;
         let current_revision: Option<i64> = tx
@@ -507,11 +597,24 @@ impl Storage {
             params![job.id, job.revision],
         )
         .map_err(StorageError::Write)?;
-        tx.execute(
-            "UPDATE documents SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
-            params![job.document_id, job.revision],
-        )
-        .map_err(StorageError::Write)?;
+        if schedule_memory_extraction {
+            tx.execute(
+                "INSERT INTO jobs (id, document_id, kind, status, revision) VALUES (?1, ?2, 'memory', 'queued', ?3)",
+                params![generate_id()?, job.document_id, job.revision],
+            )
+            .map_err(StorageError::Write)?;
+            tx.execute(
+                "UPDATE documents SET status='indexing', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+                params![job.document_id, job.revision],
+            )
+            .map_err(StorageError::Write)?;
+        } else {
+            tx.execute(
+                "UPDATE documents SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+                params![job.document_id, job.revision],
+            )
+            .map_err(StorageError::Write)?;
+        }
         tx.commit().map_err(StorageError::Write)
     }
 
@@ -585,6 +688,187 @@ impl Storage {
         tx.commit().map_err(StorageError::Write)
     }
 
+    /// Claims one provider-extraction job and increments its durable attempt count.
+    ///
+    /// # Errors
+    /// Returns an error when the claim transaction cannot be completed.
+    pub fn claim_memory_job(&mut self) -> Result<Option<ClaimedMemoryJob>, StorageError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StorageError::Write)?;
+        let job = tx
+            .query_row(
+                "SELECT jobs.id, documents.id, documents.content, jobs.revision, documents.org_id, documents.container_tags, documents.metadata, jobs.extraction_result, jobs.attempts FROM jobs JOIN documents ON documents.id=jobs.document_id WHERE jobs.kind='memory' AND jobs.status='queued' AND jobs.revision=documents.revision AND jobs.available_at<=CURRENT_TIMESTAMP ORDER BY jobs.created_at, jobs.rowid LIMIT 1",
+                [],
+                |row| {
+                    let tags: Vec<String> = parse_json(&row.get::<_, String>(5)?, 5)?;
+                    let metadata: Map<String, Value> = parse_json(&row.get::<_, String>(6)?, 6)?;
+                    Ok(ClaimedMemoryJob {
+                        id: row.get(0)?,
+                        document_id: row.get(1)?,
+                        content: row.get(2)?,
+                        revision: row.get(3)?,
+                        organization_id: row.get(4)?,
+                        container_tag: tags.into_iter().next().unwrap_or_else(|| "sm_project_default".to_owned()),
+                        document_date: metadata.get("date").and_then(Value::as_str).map(str::to_owned),
+                        extraction_result: row.get(7)?,
+                        attempts: row.get::<_, i64>(8)?.saturating_add(1),
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::Read)?;
+        let Some(job) = job else {
+            tx.commit().map_err(StorageError::Write)?;
+            return Ok(None);
+        };
+        let updated = tx
+            .execute(
+                "UPDATE jobs SET status='extracting', attempts=attempts+1, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status='queued'",
+                params![job.id, job.revision],
+            )
+            .map_err(StorageError::Write)?;
+        if updated != 1 {
+            return Err(StorageError::StaleRevision {
+                document_id: job.document_id,
+                claimed: job.revision,
+                current: None,
+            });
+        }
+        tx.commit().map_err(StorageError::Write)?;
+        Ok(Some(job))
+    }
+
+    /// Returns current active memories used as provider extraction context.
+    ///
+    /// # Errors
+    /// Returns an error when stored memories cannot be read.
+    pub fn existing_memories_for_extraction(
+        &self,
+        org_id: &str,
+        container_tag: &str,
+    ) -> Result<Vec<ExistingMemory>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, content FROM memories WHERE org_id=?1 AND container_tag=?2 AND is_latest=1 AND is_forgotten=0 AND (forget_after IS NULL OR datetime(forget_after)>CURRENT_TIMESTAMP) ORDER BY updated_at DESC, id LIMIT 100",
+        ).map_err(StorageError::Read)?;
+        statement
+            .query_map(params![org_id, container_tag], |row| {
+                Ok(ExistingMemory {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(StorageError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Read)
+    }
+
+    /// Persists provider output separately from retry error text.
+    ///
+    /// # Errors
+    /// Returns an error when the revision is stale or the write fails.
+    pub fn cache_memory_extraction(
+        &mut self,
+        job: &ClaimedMemoryJob,
+        result: &str,
+    ) -> Result<(), StorageError> {
+        let updated = self.connection.execute(
+            "UPDATE jobs SET extraction_result=?3, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status='extracting' AND EXISTS(SELECT 1 FROM documents WHERE id=jobs.document_id AND revision=jobs.revision)",
+            params![job.id, job.revision, result],
+        ).map_err(StorageError::Write)?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(StorageError::StaleRevision {
+                document_id: job.document_id.clone(),
+                claimed: job.revision,
+                current: None,
+            })
+        }
+    }
+
+    /// Marks a memory job complete only while its claimed document revision is current.
+    ///
+    /// # Errors
+    /// Returns an error when the completion transaction fails.
+    pub fn complete_memory_job(&mut self, job: &ClaimedMemoryJob) -> Result<(), StorageError> {
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM documents WHERE id=?1",
+                [&job.document_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StorageError::Read)?;
+        if current != Some(job.revision) {
+            tx.execute(
+                "UPDATE jobs SET status='failed', last_error_kind='stale_revision', last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+                params![job.id, job.revision],
+            )
+            .map_err(StorageError::Write)?;
+            tx.commit().map_err(StorageError::Write)?;
+            return Ok(());
+        }
+        let jobs = tx.execute(
+            "UPDATE jobs SET status='done', last_error_kind=NULL, last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status='extracting'",
+            params![job.id, job.revision],
+        ).map_err(StorageError::Write)?;
+        let documents = tx.execute(
+            "UPDATE documents SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+            params![job.document_id, job.revision],
+        ).map_err(StorageError::Write)?;
+        if jobs != 1 || documents != 1 {
+            return Err(StorageError::StaleRevision {
+                document_id: job.document_id.clone(),
+                claimed: job.revision,
+                current,
+            });
+        }
+        tx.commit().map_err(StorageError::Write)
+    }
+
+    /// Persists a bounded retry or terminal memory-extraction failure.
+    ///
+    /// # Errors
+    /// Returns an error when the revision is stale or retry state cannot be committed.
+    pub fn retry_memory_job(
+        &mut self,
+        job: &ClaimedMemoryJob,
+        error_kind: &str,
+        error: &str,
+        retry_delay: Option<Duration>,
+    ) -> Result<(), StorageError> {
+        const MAX_ATTEMPTS: i64 = 4;
+        let terminal = retry_delay.is_none() || job.attempts >= MAX_ATTEMPTS;
+        let delay_seconds = retry_delay
+            .map(|delay| delay.as_secs().max(1))
+            .unwrap_or_default();
+        let modifier = format!("+{delay_seconds} seconds");
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        let status = if terminal { "failed" } else { "queued" };
+        let updated = tx.execute(
+            "UPDATE jobs SET status=?3, last_error_kind=?4, last_error=?5, available_at=datetime(CURRENT_TIMESTAMP, ?6), updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status='extracting'",
+            params![job.id, job.revision, status, error_kind, error, modifier],
+        ).map_err(StorageError::Write)?;
+        if updated != 1 {
+            return Err(StorageError::StaleRevision {
+                document_id: job.document_id.clone(),
+                claimed: job.revision,
+                current: None,
+            });
+        }
+        if terminal {
+            tx.execute(
+                "UPDATE documents SET status='failed', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+                params![job.document_id, job.revision],
+            )
+            .map_err(StorageError::Write)?;
+        }
+        tx.commit().map_err(StorageError::Write)
+    }
+
     /// Searches completed local documents using `SQLite` FTS5 relevance.
     ///
     /// # Errors
@@ -646,92 +930,65 @@ impl Storage {
             .organization_id
             .as_deref()
             .unwrap_or(&self.local_org_id);
+        let query_bytes = vector_bytes(query);
+        let container_tag = options.container_tags.first().map(String::as_str);
+        let candidate_limit = limit.saturating_mul(10).max(100);
         let mut statement = self.connection.prepare(
-            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, chunk_embeddings.vector, document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.container_tags, documents.content FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?1 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?3 AND documents.status='done'",
+            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, cosine_similarity(chunk_embeddings.vector, ?1, ?2) AS score, document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.container_tags, documents.content FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?3 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?4 AND documents.status='done' AND (?5 IS NULL OR EXISTS(SELECT 1 FROM json_each(documents.container_tags) WHERE value=?5)) AND (?6 IS NULL OR documents.id=?6 OR documents.custom_id=?6) AND (?7 IS NULL OR documents.filepath=?7) AND cosine_similarity(chunk_embeddings.vector, ?1, ?2)>=?8 ORDER BY score DESC, documents.id, document_chunks.ordinal, document_chunks.stable_id LIMIT ?9",
         ).map_err(StorageError::Read)?;
         let rows = statement
-            .query_map(params![model_id, dimensions, organization_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, usize>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, String>(11)?,
-                ))
-            })
+            .query_map(
+                params![
+                    query_bytes,
+                    dimensions,
+                    model_id,
+                    organization_id,
+                    container_tag,
+                    options.document_id,
+                    options.filepath,
+                    threshold,
+                    candidate_limit
+                ],
+                |row| {
+                    Ok((
+                        SearchHit {
+                            id: row.get(0)?,
+                            document_id: row.get(1)?,
+                            chunk: row.get(2)?,
+                            score: row.get(3)?,
+                            position: row.get(4)?,
+                            custom_id: row.get(5)?,
+                            metadata: parse_json(&row.get::<_, String>(6)?, 6)?,
+                            filepath: row.get(7)?,
+                            created_at: row.get(8)?,
+                            updated_at: row.get(9)?,
+                            document_content: row.get(11)?,
+                        },
+                        row.get::<_, String>(10)?,
+                    ))
+                },
+            )
             .map_err(StorageError::Read)?;
         let mut hits = Vec::new();
         for row in rows {
-            let (
-                id,
-                document_id,
-                chunk,
-                bytes,
-                ordinal,
-                custom_id,
-                metadata,
-                filepath,
-                created_at,
-                updated_at,
-                container_tags,
-                document_content,
-            ) = row.map_err(StorageError::Read)?;
-            let metadata: Map<String, Value> =
-                serde_json::from_str(&metadata).map_err(StorageError::DeserializeSearchData)?;
+            let (hit, container_tags) = row.map_err(StorageError::Read)?;
             let container_tags: Vec<String> = serde_json::from_str(&container_tags)
                 .map_err(StorageError::DeserializeSearchData)?;
-            if !matches_search_options(
-                &document_id,
-                custom_id.as_deref(),
+            if matches_search_options(
+                &hit.document_id,
+                hit.custom_id.as_deref(),
                 &container_tags,
-                filepath.as_deref(),
-                &metadata,
+                hit.filepath.as_deref(),
+                &hit.metadata,
                 options,
             ) {
-                continue;
-            }
-            let vector = decode_vector(&bytes, dimensions)?;
-            let score: f32 = query
-                .iter()
-                .zip(vector)
-                .map(|(left, right)| left * right)
-                .sum();
-            if score >= threshold {
-                hits.push((
-                    SearchHit {
-                        id,
-                        document_id,
-                        chunk,
-                        score: f64::from(score),
-                        position: ordinal,
-                        custom_id,
-                        metadata,
-                        filepath,
-                        created_at,
-                        updated_at,
-                        document_content,
-                    },
-                    ordinal,
-                ));
+                hits.push(hit);
+                if hits.len() == limit {
+                    break;
+                }
             }
         }
-        hits.sort_by(|(left, left_ordinal), (right, right_ordinal)| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.document_id.cmp(&right.document_id))
-                .then_with(|| left_ordinal.cmp(right_ordinal))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        hits.truncate(limit);
-        Ok(hits.into_iter().map(|(hit, _)| hit).collect())
+        Ok(hits)
     }
 
     /// Reconciles extracted memories, lineage, sources, and vectors in one transaction.
@@ -750,6 +1007,8 @@ impl Storage {
         self.reconcile_memories_for(
             &org_id,
             document_id,
+            None,
+            None,
             container_tag,
             proposals,
             model_id,
@@ -761,10 +1020,17 @@ impl Storage {
     ///
     /// # Errors
     /// Returns an error if proposals or persistence are invalid.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "revision-gated proposal publication and completion share one transaction"
+    )]
     pub fn reconcile_memories_for(
         &mut self,
         org_id: &str,
         document_id: &str,
+        expected_revision: Option<i64>,
+        completion_job_id: Option<&str>,
         container_tag: &str,
         proposals: &[MemoryProposal],
         model_id: &str,
@@ -778,15 +1044,25 @@ impl Storage {
         }
         let org_id = org_id.to_owned();
         let tx = self.connection.transaction().map_err(StorageError::Write)?;
-        let document_exists: bool = tx
+        let source_revision: Option<i64> = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM documents WHERE id=?1 AND org_id=?2)",
+                "SELECT revision FROM documents WHERE id=?1 AND org_id=?2",
                 params![document_id, org_id],
                 |row| row.get(0),
             )
+            .optional()
             .map_err(StorageError::Read)?;
-        if !document_exists {
+        let Some(source_revision) = source_revision else {
             return Err(StorageError::UnknownMemorySource(document_id.to_owned()));
+        };
+        if let Some(expected_revision) = expected_revision
+            && expected_revision != source_revision
+        {
+            return Err(StorageError::StaleRevision {
+                document_id: document_id.to_owned(),
+                claimed: expected_revision,
+                current: Some(source_revision),
+            });
         }
         let mut temporary_ids = HashMap::new();
         let mut record_ids = Vec::new();
@@ -863,6 +1139,23 @@ impl Storage {
             .iter()
             .map(|id| read_memory_by_id(&tx, id))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(job_id) = completion_job_id {
+            let jobs = tx.execute(
+                "UPDATE jobs SET status='done', last_error_kind=NULL, last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND document_id=?2 AND revision=?3 AND status='extracting'",
+                params![job_id, document_id, source_revision],
+            ).map_err(StorageError::Write)?;
+            let documents = tx.execute(
+                "UPDATE documents SET status='done', updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2",
+                params![document_id, source_revision],
+            ).map_err(StorageError::Write)?;
+            if jobs != 1 || documents != 1 {
+                return Err(StorageError::StaleRevision {
+                    document_id: document_id.to_owned(),
+                    claimed: source_revision,
+                    current: None,
+                });
+            }
+        }
         tx.commit().map_err(StorageError::Write)?;
         Ok(records)
     }
@@ -1078,69 +1371,38 @@ impl Storage {
         include_forgotten: bool,
     ) -> Result<Vec<MemorySearchHit>, StorageError> {
         validate_vector(query, query.len())?;
+        let query_bytes = vector_bytes(query);
         let mut statement = self.connection.prepare(
-            "SELECT memories.id, memories.content, memories.metadata, memories.is_inferred, memories.is_static, memories.is_latest, memories.is_forgotten, memories.root_memory_id, memories.parent_memory_id, memories.version, memories.forget_after, memories.forget_reason, memories.created_at, memories.updated_at, memory_embeddings.vector FROM memory_embeddings JOIN memories ON memories.id=memory_embeddings.memory_id WHERE memories.org_id=?1 AND memories.container_tag=?2 AND memory_embeddings.model_id=?3 AND memory_embeddings.dimensions=?4 AND (memory_embeddings.active=1 OR ?5=1) AND (memories.is_forgotten=0 OR ?5=1) AND (memories.forget_after IS NULL OR datetime(memories.forget_after) > CURRENT_TIMESTAMP OR ?5=1)",
+            "SELECT memories.id, memories.content, memories.metadata, memories.is_inferred, memories.is_static, memories.is_latest, memories.is_forgotten, memories.root_memory_id, memories.parent_memory_id, memories.version, memories.forget_after, memories.forget_reason, memories.created_at, memories.updated_at, cosine_similarity(memory_embeddings.vector, ?1, ?2) AS similarity FROM memory_embeddings JOIN memories ON memories.id=memory_embeddings.memory_id WHERE memories.org_id=?3 AND memories.container_tag=?4 AND memory_embeddings.model_id=?5 AND memory_embeddings.dimensions=?2 AND (memory_embeddings.active=1 OR ?6=1) AND (memories.is_latest=1 OR ?6=1) AND (memories.is_forgotten=0 OR ?6=1) AND (memories.forget_after IS NULL OR datetime(memories.forget_after)>CURRENT_TIMESTAMP OR ?6=1) AND cosine_similarity(memory_embeddings.vector, ?1, ?2)>=?7 ORDER BY similarity DESC, memories.id LIMIT ?8",
         ).map_err(StorageError::Read)?;
         let rows = statement
             .query_map(
                 params![
+                    query_bytes,
+                    query.len(),
                     org_id,
                     container_tag,
                     model_id,
-                    query.len(),
-                    include_forgotten
+                    include_forgotten,
+                    threshold,
+                    limit
                 ],
                 |row| {
-                    let record = read_memory(row)?;
-                    Ok((record, row.get::<_, Vec<u8>>(14)?))
+                    Ok(MemorySearchHit {
+                        record: read_memory(row)?,
+                        similarity: row.get(14)?,
+                        parents: Vec::new(),
+                        children: Vec::new(),
+                        related: Vec::new(),
+                        documents: Vec::new(),
+                    })
                 },
             )
             .map_err(StorageError::Read)?;
-        let mut hits = Vec::new();
-        for row in rows {
-            let (record, bytes) = row.map_err(StorageError::Read)?;
-            let vector = decode_vector(&bytes, query.len())?;
-            let similarity: f32 = query
-                .iter()
-                .zip(vector)
-                .map(|(left, right)| left * right)
-                .sum();
-            if similarity >= threshold {
-                hits.push(MemorySearchHit {
-                    record,
-                    similarity: f64::from(similarity),
-                    parents: Vec::new(),
-                    children: Vec::new(),
-                    related: Vec::new(),
-                    documents: Vec::new(),
-                });
-            }
-        }
-        hits.sort_by(|left, right| {
-            right
-                .similarity
-                .total_cmp(&left.similarity)
-                .then_with(|| left.record.id.cmp(&right.record.id))
-        });
-        hits.truncate(limit);
-        for hit in &mut hits {
-            hit.parents = memory_relations(&self.connection, &hit.record.id, true, None)?;
-            hit.children = memory_relations(&self.connection, &hit.record.id, false, None)?;
-            let mut related = memory_relations(
-                &self.connection,
-                &hit.record.id,
-                true,
-                Some(&["extends", "derives"]),
-            )?;
-            related.extend(memory_relations(
-                &self.connection,
-                &hit.record.id,
-                false,
-                Some(&["extends", "derives"]),
-            )?);
-            hit.related = related;
-            hit.documents = memory_source_documents(&self.connection, &hit.record.id)?;
-        }
+        let mut hits = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Read)?;
+        hydrate_memory_hits(&self.connection, &mut hits)?;
         Ok(hits)
     }
 
@@ -1781,24 +2043,6 @@ fn vector_bytes(vector: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn decode_vector(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>, StorageError> {
-    let expected = dimensions
-        .checked_mul(size_of::<f32>())
-        .ok_or(StorageError::InvalidVectorDimensions { dimensions })?;
-    if bytes.len() != expected {
-        return Err(StorageError::MalformedStoredVector {
-            expected,
-            actual: bytes.len(),
-        });
-    }
-    let vector = bytes
-        .chunks_exact(size_of::<f32>())
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect::<Vec<_>>();
-    validate_vector(&vector, dimensions)?;
-    Ok(vector)
-}
-
 fn matches_search_options(
     document_id: &str,
     custom_id: Option<&str>,
@@ -1884,14 +2128,20 @@ fn find_exact_memory(
     container_tag: &str,
     content: &str,
 ) -> Result<Option<MemoryRecord>, StorageError> {
-    connection
-        .query_row(
-            "SELECT id, content, metadata, is_inferred, is_static, is_latest, is_forgotten, root_memory_id, parent_memory_id, version, forget_after, forget_reason, created_at, updated_at FROM memories WHERE org_id=?1 AND container_tag=?2 AND content=?3 AND is_latest=1 AND is_forgotten=0 ORDER BY rowid LIMIT 1",
-            params![org_id, container_tag, content],
-            read_memory,
-        )
-        .optional()
-        .map_err(StorageError::Read)
+    let wanted = normalized_memory(content);
+    let mut statement = connection.prepare(
+        "SELECT id, content, metadata, is_inferred, is_static, is_latest, is_forgotten, root_memory_id, parent_memory_id, version, forget_after, forget_reason, created_at, updated_at FROM memories WHERE org_id=?1 AND container_tag=?2 AND is_latest=1 AND is_forgotten=0 ORDER BY rowid",
+    ).map_err(StorageError::Read)?;
+    let rows = statement
+        .query_map(params![org_id, container_tag], read_memory)
+        .map_err(StorageError::Read)?;
+    for row in rows {
+        let memory = row.map_err(StorageError::Read)?;
+        if normalized_memory(&memory.memory) == wanted {
+            return Ok(Some(memory));
+        }
+    }
+    Ok(None)
 }
 
 fn read_memory_by_id(connection: &Connection, id: &str) -> Result<MemoryRecord, StorageError> {
@@ -1924,67 +2174,85 @@ fn read_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
     })
 }
 
-fn memory_relations(
+fn hydrate_memory_hits(
     connection: &Connection,
-    memory_id: &str,
-    parents: bool,
-    allowed: Option<&[&str]>,
-) -> Result<Vec<MemoryRelationHit>, StorageError> {
-    let (join_id, related_id) = if parents {
-        ("child_id", "parent_id")
-    } else {
-        ("parent_id", "child_id")
-    };
+    hits: &mut [MemorySearchHit],
+) -> Result<(), StorageError> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let ids = hits
+        .iter()
+        .map(|hit| hit.record.id.clone())
+        .collect::<Vec<_>>();
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    for (parents, owner_column, related_column) in [
+        (true, "child_id", "parent_id"),
+        (false, "parent_id", "child_id"),
+    ] {
+        let sql = format!(
+            "SELECT memory_relations.{owner_column}, memory_relations.relation, memories.version, memories.content, memories.metadata, memories.updated_at FROM memory_relations JOIN memories ON memories.id=memory_relations.{related_column} WHERE memory_relations.{owner_column} IN ({placeholders}) ORDER BY memories.version, memories.updated_at, memories.id"
+        );
+        let mut statement = connection.prepare(&sql).map_err(StorageError::Read)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                let metadata: String = row.get(4)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    MemoryRelationHit {
+                        relation: row.get(1)?,
+                        version: row.get(2)?,
+                        memory: row.get(3)?,
+                        metadata: parse_json(&metadata, 4)?,
+                        updated_at: row.get(5)?,
+                    },
+                ))
+            })
+            .map_err(StorageError::Read)?;
+        for row in rows {
+            let (owner, relation) = row.map_err(StorageError::Read)?;
+            if let Some(hit) = hits.iter_mut().find(|hit| hit.record.id == owner) {
+                if matches!(relation.relation.as_str(), "extends" | "derives") {
+                    hit.related.push(relation.clone());
+                }
+                if parents {
+                    hit.parents.push(relation);
+                } else {
+                    hit.children.push(relation);
+                }
+            }
+        }
+    }
     let sql = format!(
-        "SELECT memory_relations.relation, memories.version, memories.content, memories.metadata, memories.updated_at FROM memory_relations JOIN memories ON memories.id=memory_relations.{related_id} WHERE memory_relations.{join_id}=?1 ORDER BY memories.version, memories.updated_at"
+        "SELECT memory_sources.memory_id, COALESCE(documents.custom_id, documents.id), documents.title, documents.document_type, documents.metadata, documents.summary, documents.created_at, documents.updated_at FROM memory_sources JOIN documents ON documents.id=memory_sources.document_id WHERE memory_sources.memory_id IN ({placeholders}) ORDER BY memory_sources.created_at, documents.id"
     );
     let mut statement = connection.prepare(&sql).map_err(StorageError::Read)?;
     let rows = statement
-        .query_map([memory_id], |row| {
-            let relation: String = row.get(0)?;
-            let metadata: String = row.get(3)?;
-            Ok(MemoryRelationHit {
-                relation,
-                version: row.get(1)?,
-                memory: row.get(2)?,
-                metadata: parse_json(&metadata, 3)?,
-                updated_at: row.get(4)?,
-            })
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            let metadata: String = row.get(4)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                MemorySourceDocument {
+                    id: row.get(1)?,
+                    title: row.get(2)?,
+                    document_type: row.get(3)?,
+                    metadata: parse_json(&metadata, 4)?,
+                    summary: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                },
+            ))
         })
         .map_err(StorageError::Read)?;
-    let mut result = Vec::new();
     for row in rows {
-        let row = row.map_err(StorageError::Read)?;
-        if allowed.is_none_or(|allowed| allowed.contains(&row.relation.as_str())) {
-            result.push(row);
+        let (owner, document) = row.map_err(StorageError::Read)?;
+        if let Some(hit) = hits.iter_mut().find(|hit| hit.record.id == owner) {
+            hit.documents.push(document);
         }
     }
-    Ok(result)
-}
-
-fn memory_source_documents(
-    connection: &Connection,
-    memory_id: &str,
-) -> Result<Vec<MemorySourceDocument>, StorageError> {
-    let mut statement = connection.prepare(
-        "SELECT COALESCE(documents.custom_id, documents.id), documents.title, documents.document_type, documents.metadata, documents.summary, documents.created_at, documents.updated_at FROM memory_sources JOIN documents ON documents.id=memory_sources.document_id WHERE memory_sources.memory_id=?1 ORDER BY memory_sources.created_at",
-    ).map_err(StorageError::Read)?;
-    statement
-        .query_map([memory_id], |row| {
-            let metadata: String = row.get(3)?;
-            Ok(MemorySourceDocument {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                document_type: row.get(2)?,
-                metadata: parse_json(&metadata, 3)?,
-                summary: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        })
-        .map_err(StorageError::Read)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(StorageError::Read)
+    Ok(())
 }
 
 fn valid_future_datetime(
@@ -2174,6 +2442,7 @@ fn initialize(connection: &mut Connection) -> Result<String, StorageError> {
     connection
         .execute_batch("PRAGMA foreign_keys=ON;")
         .map_err(StorageError::Configure)?;
+    register_vector_functions(connection)?;
     configure_wal(connection)?;
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2221,7 +2490,12 @@ fn initialize(connection: &mut Connection) -> Result<String, StorageError> {
     )
     .map_err(StorageError::Migrate)?;
     tx.execute(
-        "UPDATE documents SET status='queued', updated_at=CURRENT_TIMESTAMP WHERE id IN (SELECT document_id FROM jobs WHERE status='queued') AND status IN ('extracting','chunking','embedding','indexing')",
+        "UPDATE documents SET status='queued', updated_at=CURRENT_TIMESTAMP WHERE id IN (SELECT document_id FROM jobs WHERE kind='document' AND status='queued') AND status IN ('extracting','chunking','embedding','indexing')",
+        [],
+    )
+    .map_err(StorageError::Migrate)?;
+    tx.execute(
+        "UPDATE documents SET status='indexing', updated_at=CURRENT_TIMESTAMP WHERE id IN (SELECT document_id FROM jobs WHERE kind='memory' AND status='queued') AND status IN ('extracting','chunking','embedding','indexing')",
         [],
     )
     .map_err(StorageError::Migrate)?;
@@ -2286,6 +2560,8 @@ fn validate_current_schema(connection: &Connection) -> Result<(), StorageError> 
             "created_at",
             "updated_at",
             "revision",
+            "extraction_result",
+            "last_error_kind",
         ],
     )?;
     validate_columns(
@@ -2427,6 +2703,43 @@ fn validate_existing_version(connection: &Connection, version: i64) -> Result<()
     Ok(())
 }
 
+fn register_vector_functions(connection: &Connection) -> Result<(), StorageError> {
+    connection
+        .create_scalar_function(
+            "cosine_similarity",
+            3,
+            FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+            |context| {
+                let left = context.get_raw(0).as_blob()?;
+                let right = context.get_raw(1).as_blob()?;
+                let dimensions = usize::try_from(context.get::<i64>(2)?)
+                    .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                let expected = dimensions.saturating_mul(std::mem::size_of::<f32>());
+                if left.len() != expected || right.len() != expected {
+                    return Err(rusqlite::Error::UserFunctionError(
+                        format!(
+                            "vector byte length mismatch: expected {expected}, found {} and {}",
+                            left.len(),
+                            right.len()
+                        )
+                        .into(),
+                    ));
+                }
+                let score = left
+                    .chunks_exact(4)
+                    .zip(right.chunks_exact(4))
+                    .map(|(left, right)| {
+                        let left = f32::from_le_bytes([left[0], left[1], left[2], left[3]]);
+                        let right = f32::from_le_bytes([right[0], right[1], right[2], right[3]]);
+                        f64::from(left) * f64::from(right)
+                    })
+                    .sum::<f64>();
+                Ok(score)
+            },
+        )
+        .map_err(StorageError::Configure)
+}
+
 fn configure_wal(connection: &Connection) -> Result<(), StorageError> {
     const RETRIES: usize = 5;
     for attempt in 0..=RETRIES {
@@ -2541,6 +2854,8 @@ pub enum StorageError {
         "document {0} cannot be used as a memory source because it does not exist in this organization"
     )]
     UnknownMemorySource(String),
+    #[error("an independent read connection cannot be opened for an in-memory database")]
+    CannotForkInMemory,
     #[error("memory was not found or is already forgotten")]
     MemoryNotFound,
     #[error(
@@ -2551,4 +2866,33 @@ pub enum StorageError {
         expected: String,
         actual: String,
     },
+}
+
+impl StorageError {
+    /// Returns whether continuing could expose corrupted or misleading storage state.
+    #[must_use]
+    pub fn is_fatal(&self) -> bool {
+        fn fatal_sqlite(error: &rusqlite::Error) -> bool {
+            matches!(
+                error.sqlite_error_code(),
+                Some(
+                    rusqlite::ErrorCode::DatabaseCorrupt
+                        | rusqlite::ErrorCode::NotADatabase
+                        | rusqlite::ErrorCode::SystemIoFailure
+                        | rusqlite::ErrorCode::DiskFull
+                        | rusqlite::ErrorCode::CannotOpen
+                )
+            )
+        }
+        match self {
+            Self::Open(_)
+            | Self::Configure(_)
+            | Self::Migrate(_)
+            | Self::MalformedSchema { .. }
+            | Self::DeserializeSearchData(_)
+            | Self::MalformedStoredVector { .. } => true,
+            Self::Write(error) | Self::Read(error) => fatal_sqlite(error),
+            _ => false,
+        }
+    }
 }

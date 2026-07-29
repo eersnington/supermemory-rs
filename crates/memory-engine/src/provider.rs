@@ -1,15 +1,21 @@
-//! Configured model-provider boundary for structured memory extraction.
+//! One-shot Rig provider boundary; durable retry policy belongs to the job queue.
 
 use std::time::Duration;
 
-use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use rig::{
+    completion::CompletionError,
+    extractor::{ExtractionError, ExtractorBuilder},
+    prelude::CompletionClient,
+    providers::{anthropic, gemini, groq, openai},
+};
+use rig_core as rig;
+use schemars::JsonSchema;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
 const MAX_CANDIDATES: usize = 100;
 const MAX_PARENTS: usize = 20;
-const MAX_ATTEMPTS: usize = 4;
 
 /// Supported self-hosted text-model providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +120,7 @@ fn nonempty(value: Option<String>) -> Option<String> {
 }
 
 /// Valid relation between an extracted memory and an existing memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum RelationKind {
     Updates,
@@ -123,7 +129,7 @@ pub enum RelationKind {
 }
 
 /// Relation proposed by the extraction model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ParentRelation {
     pub memory_id: String,
@@ -131,11 +137,44 @@ pub struct ParentRelation {
 }
 
 /// Explicit temporal metadata attached to a memory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TemporalContext {
     pub document_date: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_event_dates")]
     pub event_date: Option<Vec<String>>,
+}
+
+fn deserialize_event_dates<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(Value::String(date)) => Some(vec![date]),
+        Some(Value::Array(dates)) => Some(
+            dates
+                .into_iter()
+                .filter_map(|date| date.as_str().map(str::to_owned))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+fn deserialize_buckets<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(Value::Array(buckets)) => buckets
+            .into_iter()
+            .filter_map(|bucket| bucket.as_str().map(str::to_owned))
+            .collect(),
+        Some(Value::String(bucket)) => vec![bucket],
+        _ => Vec::new(),
+    })
 }
 
 /// One validated memory proposal.
@@ -155,241 +194,357 @@ pub struct MemoryCandidate {
     pub forget_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ExtractionResponse {
+/// Provider-facing tool output normalized into validated memory candidates.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+#[schemars(with = "RawExtractionObject")]
+enum RawExtractionResponse {
+    Wrapped(RawExtractionObject),
+    Many(Vec<RawMemoryCandidate>),
+    One(RawMemoryCandidate),
+    #[schemars(skip)]
+    Text(String),
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct RawExtractionObject {
+    #[serde(
+        alias = "memories",
+        alias = "memoryCandidates",
+        deserialize_with = "deserialize_candidates"
+    )]
     memories_to_add_or_update: Vec<RawMemoryCandidate>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+fn deserialize_candidates<'de, D>(deserializer: D) -> Result<Vec<RawMemoryCandidate>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Array(_) => serde_json::from_value(value).map_err(serde::de::Error::custom),
+        Value::Object(_) => serde_json::from_value(value)
+            .map(|candidate| vec![candidate])
+            .map_err(serde::de::Error::custom),
+        _ => Err(serde::de::Error::custom(
+            "memory candidates must be an object or array",
+        )),
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct RawMemoryCandidate {
     tmp_id: String,
     memory: String,
+    #[serde(default)]
     is_inferred: bool,
+    #[serde(default)]
     add_to_static_profile: bool,
-    buckets: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_buckets")]
+    buckets: Vec<String>,
     #[serde(default)]
     parent_relations: Vec<RawParentRelation>,
+    #[serde(default)]
     temporal_context: Option<TemporalContext>,
+    #[serde(default)]
     forget_after: Option<String>,
+    #[serde(default)]
     forget_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct RawParentRelation {
-    memory_id: String,
-    relation: String,
+    memory_id: Option<String>,
+    relation: Option<String>,
 }
 
-/// A configured provider client used by document processing.
+/// Provider-reported token counts for one extraction attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtractionUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+/// A successful extraction and its provider usage metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionOutcome {
+    pub memories: Vec<MemoryCandidate>,
+    pub usage: ExtractionUsage,
+}
+
+enum ConfiguredExtractor {
+    OpenAi(openai::CompletionsClient),
+    Anthropic(anthropic::Client),
+    Gemini(gemini::Client),
+    Groq(groq::Client),
+}
+
+/// A configured Rig-backed provider client used by document processing.
 pub struct MemoryProvider {
-    client: Client,
-    config: ProviderConfig,
+    kind: ProviderKind,
+    model: String,
+    reasoning_effort: Option<String>,
+    backend: ConfiguredExtractor,
 }
 
 impl MemoryProvider {
     /// Creates a provider with bounded request timeouts.
     ///
     /// # Errors
-    /// Returns an error if the HTTP client cannot be initialized.
+    /// Returns an error if the provider or its HTTP client cannot be configured.
     pub fn new(config: ProviderConfig) -> Result<Self, ProviderError> {
-        let client = Client::builder()
+        let ProviderConfig {
+            kind,
+            api_key,
+            model,
+            base_url,
+            reasoning_effort,
+        } = config;
+        let http_client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()
-            .map_err(ProviderError::BuildClient)?;
-        Ok(Self { client, config })
+            .map_err(|error| ProviderError::Configuration(error.to_string()))?;
+        let backend = match kind {
+            ProviderKind::OpenAi => {
+                let mut builder = openai::CompletionsClient::builder()
+                    .api_key(api_key)
+                    .http_client(http_client);
+                if let Some(base_url) = base_url.as_deref() {
+                    builder = builder.base_url(base_url);
+                }
+                ConfiguredExtractor::OpenAi(
+                    builder
+                        .build()
+                        .map_err(|error| ProviderError::Configuration(error.to_string()))?,
+                )
+            }
+            ProviderKind::Anthropic => ConfiguredExtractor::Anthropic(
+                anthropic::Client::builder()
+                    .api_key(api_key)
+                    .http_client(http_client)
+                    .build()
+                    .map_err(|error| ProviderError::Configuration(error.to_string()))?,
+            ),
+            ProviderKind::Gemini => ConfiguredExtractor::Gemini(
+                gemini::Client::builder()
+                    .api_key(api_key)
+                    .http_client(http_client)
+                    .build()
+                    .map_err(|error| ProviderError::Configuration(error.to_string()))?,
+            ),
+            ProviderKind::Groq => ConfiguredExtractor::Groq(
+                groq::Client::builder()
+                    .api_key(api_key)
+                    .http_client(http_client)
+                    .build()
+                    .map_err(|error| ProviderError::Configuration(error.to_string()))?,
+            ),
+        };
+        Ok(Self {
+            kind,
+            model,
+            reasoning_effort,
+            backend,
+        })
     }
 
     /// Returns the configured provider without exposing credentials.
     #[must_use]
     pub const fn kind(&self) -> ProviderKind {
-        self.config.kind
+        self.kind
     }
 
-    /// Extracts future-useful memories from one document with v0.0.5 retry bounds.
+    /// Performs one extraction attempt for a durable external retry queue.
     ///
     /// # Errors
-    /// Returns the last structured provider failure after four total attempts.
-    pub async fn extract(
+    /// Returns a request or structured-response failure without retrying.
+    pub async fn extract_once(
         &self,
         document: &str,
         document_date: Option<&str>,
         existing_memories: &[(String, String)],
     ) -> Result<Vec<MemoryCandidate>, ProviderError> {
+        self.extract_once_with_usage(document, document_date, existing_memories)
+            .await
+            .map(|outcome| outcome.memories)
+    }
+
+    /// Performs one extraction attempt and returns provider token usage.
+    ///
+    /// # Errors
+    /// Returns a request or structured-response failure without retrying.
+    pub async fn extract_once_with_usage(
+        &self,
+        document: &str,
+        document_date: Option<&str>,
+        existing_memories: &[(String, String)],
+    ) -> Result<ExtractionOutcome, ProviderError> {
         let prompt = extraction_prompt(document, document_date, existing_memories);
-        let mut last_error = None;
-        for attempt in 0..MAX_ATTEMPTS {
-            match self
-                .request(&prompt)
-                .await
-                .and_then(|content| parse_candidates(&content))
-            {
-                Ok(candidates) => return Ok(candidates),
-                Err(error) => {
-                    last_error = Some(error);
-                    if attempt + 1 < MAX_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
-                    }
+        let response = match &self.backend {
+            ConfiguredExtractor::OpenAi(client) => {
+                let mut builder = ExtractorBuilder::<_, RawExtractionResponse>::new(
+                    client.completion_model(&self.model),
+                )
+                .retries(0);
+                if let Some(reasoning_effort) = self.reasoning_effort.as_deref() {
+                    builder = builder.additional_params(json!({
+                        "reasoning_effort": reasoning_effort,
+                    }));
                 }
+                builder.build().extract_with_usage(prompt).await
+            }
+            ConfiguredExtractor::Anthropic(client) => {
+                ExtractorBuilder::<_, RawExtractionResponse>::new(
+                    client.completion_model(&self.model),
+                )
+                .retries(0)
+                .build()
+                .extract_with_usage(prompt)
+                .await
+            }
+            ConfiguredExtractor::Gemini(client) => {
+                ExtractorBuilder::<_, RawExtractionResponse>::new(
+                    client.completion_model(&self.model),
+                )
+                .retries(0)
+                .build()
+                .extract_with_usage(prompt)
+                .await
+            }
+            ConfiguredExtractor::Groq(client) => {
+                ExtractorBuilder::<_, RawExtractionResponse>::new(
+                    client.completion_model(&self.model),
+                )
+                .retries(0)
+                .build()
+                .extract_with_usage(prompt)
+                .await
             }
         }
-        Err(last_error.unwrap_or(ProviderError::NoResponse))
+        .map_err(ProviderError::from_extraction)?;
+        Ok(ExtractionOutcome {
+            memories: normalize_candidates(response.data)?,
+            usage: ExtractionUsage {
+                input_tokens: response.usage.input_tokens,
+                output_tokens: response.usage.output_tokens,
+                total_tokens: response.usage.total_tokens,
+                reasoning_tokens: response.usage.reasoning_tokens,
+            },
+        })
     }
+}
 
-    async fn request(&self, prompt: &str) -> Result<String, ProviderError> {
-        match self.config.kind {
-            ProviderKind::OpenAi | ProviderKind::Groq => self.request_openai(prompt).await,
-            ProviderKind::Anthropic => self.request_anthropic(prompt).await,
-            ProviderKind::Gemini => self.request_gemini(prompt).await,
+fn normalize_candidates(
+    response: RawExtractionResponse,
+) -> Result<Vec<MemoryCandidate>, ProviderError> {
+    let candidates = raw_candidates(response)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut temporary_ids = std::collections::HashSet::new();
+    let mut normalized = Vec::new();
+    for candidate in candidates {
+        let candidate = normalize_candidate(candidate)?;
+        if !temporary_ids.insert(candidate.tmp_id.clone()) {
+            return Err(ProviderError::InvalidOutput(format!(
+                "duplicate temporary memory id {}",
+                candidate.tmp_id
+            )));
+        }
+        if seen.insert(normalized_memory(&candidate.memory)) {
+            normalized.push(candidate);
+            if normalized.len() == MAX_CANDIDATES {
+                break;
+            }
         }
     }
+    Ok(normalized)
+}
 
-    async fn request_openai(&self, prompt: &str) -> Result<String, ProviderError> {
-        let base = self
-            .config
-            .base_url
-            .as_deref()
-            .unwrap_or(match self.config.kind {
-                ProviderKind::Groq => "https://api.groq.com/openai/v1",
-                _ => "https://api.openai.com/v1",
-            });
-        let mut body = json!({
-            "model": self.config.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"}
-        });
-        if let Some(reasoning_effort) = self.config.reasoning_effort.as_deref() {
-            body["reasoning_effort"] = Value::String(reasoning_effort.to_owned());
+fn raw_candidates(
+    response: RawExtractionResponse,
+) -> Result<Vec<RawMemoryCandidate>, ProviderError> {
+    match response {
+        RawExtractionResponse::Wrapped(response) => Ok(response.memories_to_add_or_update),
+        RawExtractionResponse::Many(candidates) => Ok(candidates),
+        RawExtractionResponse::One(candidate) => Ok(vec![candidate]),
+        RawExtractionResponse::Text(content) => {
+            let json = extract_json(&content).ok_or_else(|| {
+                ProviderError::InvalidOutput("structured output contained no JSON".to_owned())
+            })?;
+            let response = serde_json::from_str(json)
+                .map_err(|error| ProviderError::InvalidOutput(error.to_string()))?;
+            raw_candidates(response)
         }
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", base.trim_end_matches('/')))
-            .bearer_auth(&self.config.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(ProviderError::Request)?;
-        let value = response_json(response).await?;
-        value
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or(ProviderError::MalformedResponse)
-    }
-
-    async fn request_anthropic(&self, prompt: &str) -> Result<String, ProviderError> {
-        let response = self
-            .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.config.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&json!({
-                "model": self.config.model,
-                "max_tokens": 12000,
-                "messages": [{"role": "user", "content": prompt}]
-            }))
-            .send()
-            .await
-            .map_err(ProviderError::Request)?;
-        let value = response_json(response).await?;
-        value
-            .pointer("/content/0/text")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or(ProviderError::MalformedResponse)
-    }
-
-    async fn request_gemini(&self, prompt: &str) -> Result<String, ProviderError> {
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-            self.config.model
-        );
-        let response = self
-            .client
-            .post(url)
-            .header("x-goog-api-key", &self.config.api_key)
-            .json(&json!({
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json"}
-            }))
-            .send()
-            .await
-            .map_err(ProviderError::Request)?;
-        let value = response_json(response).await?;
-        value
-            .pointer("/candidates/0/content/parts/0/text")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or(ProviderError::MalformedResponse)
     }
 }
 
-async fn response_json(response: reqwest::Response) -> Result<Value, ProviderError> {
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.map_err(ProviderError::Request)?;
-        return Err(ProviderError::Http { status, body });
-    }
-    response.json().await.map_err(ProviderError::Request)
+fn extract_json(content: &str) -> Option<&str> {
+    let object = content.find('{').map(|start| (start, '}'));
+    let array = content.find('[').map(|start| (start, ']'));
+    let (start, closing) = match (object, array) {
+        (Some(object), Some(array)) => object.min(array),
+        (Some(object), None) => object,
+        (None, Some(array)) => array,
+        (None, None) => return None,
+    };
+    let end = content.rfind(closing)?;
+    (start <= end).then(|| &content[start..=end])
 }
 
-fn parse_candidates(content: &str) -> Result<Vec<MemoryCandidate>, ProviderError> {
-    let response: ExtractionResponse = serde_json::from_str(content)
-        .or_else(|_| serde_json::from_str(extract_json_object(content)))
-        .map_err(ProviderError::Decode)?;
-    Ok(response
-        .memories_to_add_or_update
-        .into_iter()
-        .filter(|candidate| !candidate.tmp_id.is_empty() && !candidate.memory.is_empty())
-        .take(MAX_CANDIDATES)
-        .map(normalize_candidate)
-        .collect())
-}
-
-fn normalize_candidate(candidate: RawMemoryCandidate) -> MemoryCandidate {
+fn normalize_candidate(candidate: RawMemoryCandidate) -> Result<MemoryCandidate, ProviderError> {
     let mut seen = std::collections::HashSet::new();
     let parent_relations = candidate
         .parent_relations
         .into_iter()
-        .filter(|parent| {
-            !parent.memory_id.is_empty()
-                && (parent.memory_id.starts_with("tmp_")
-                    || parent.memory_id.starts_with("mem_")
-                    || parent.memory_id.starts_with("doc_"))
-                && seen.insert(parent.memory_id.clone())
+        .filter_map(|parent| {
+            let memory_id = parent.memory_id?;
+            ((!memory_id.is_empty())
+                && (memory_id.starts_with("tmp_")
+                    || memory_id.starts_with("mem_")
+                    || memory_id.starts_with("doc_"))
+                && seen.insert(memory_id.clone()))
+            .then_some(ParentRelation {
+                memory_id,
+                relation: match parent.relation.as_deref() {
+                    Some("updates") => RelationKind::Updates,
+                    Some("derives") => RelationKind::Derives,
+                    _ => RelationKind::Extends,
+                },
+            })
         })
         .take(MAX_PARENTS)
-        .map(|parent| ParentRelation {
-            memory_id: parent.memory_id,
-            relation: match parent.relation.as_str() {
-                "updates" => RelationKind::Updates,
-                "derives" => RelationKind::Derives,
-                _ => RelationKind::Extends,
-            },
-        })
         .collect();
-    MemoryCandidate {
-        tmp_id: candidate.tmp_id,
-        memory: candidate.memory,
+    let tmp_id = candidate.tmp_id.trim().to_owned();
+    let memory = candidate.memory.trim().to_owned();
+    if tmp_id.is_empty() || memory.is_empty() {
+        return Err(ProviderError::InvalidOutput(
+            "memory candidates require non-empty tmpId and memory".to_owned(),
+        ));
+    }
+    Ok(MemoryCandidate {
+        tmp_id,
+        memory,
         is_inferred: candidate.is_inferred,
         add_to_static_profile: candidate.add_to_static_profile,
-        buckets: candidate.buckets.unwrap_or_default(),
+        buckets: candidate.buckets,
         parent_relations,
         temporal_context: candidate.temporal_context,
         forget_after: candidate.forget_after,
         forget_reason: candidate.forget_reason,
-    }
+    })
 }
 
-fn extract_json_object(content: &str) -> &str {
-    content
-        .find('{')
-        .zip(content.rfind('}'))
-        .and_then(|(start, end)| content.get(start..=end))
-        .unwrap_or(content)
+fn normalized_memory(memory: &str) -> String {
+    memory
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect()
 }
 
 fn extraction_prompt(
@@ -427,19 +582,139 @@ Return exactly one strict JSON object with this shape:
     )
 }
 
+/// A durable retry classification for a failed extraction attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionFailure {
+    RateLimited,
+    Transport,
+    InvalidOutput,
+    Authentication,
+    Configuration,
+    Provider,
+}
+
 /// Failure while configuring or invoking a memory provider.
 #[derive(Debug, Error)]
 pub enum ProviderError {
-    #[error("failed to initialize model-provider HTTP client: {0}")]
-    BuildClient(#[source] reqwest::Error),
-    #[error("model-provider request failed: {0}")]
-    Request(#[source] reqwest::Error),
-    #[error("model provider returned HTTP {status}; response body: {body}")]
-    Http { status: StatusCode, body: String },
-    #[error("model provider returned an unrecognized response shape")]
-    MalformedResponse,
-    #[error("model provider returned invalid structured memory JSON: {0}")]
-    Decode(#[source] serde_json::Error),
-    #[error("model provider returned no response")]
-    NoResponse,
+    #[error("model provider configuration failed: {0}")]
+    Configuration(String),
+    #[error("model provider returned invalid structured output: {0}")]
+    InvalidOutput(String),
+    #[error("model provider request failed with status {status:?}: {message}")]
+    Request {
+        message: String,
+        status: Option<u16>,
+        transport: bool,
+    },
+}
+
+impl ProviderError {
+    fn from_extraction(error: ExtractionError) -> Self {
+        match error {
+            ExtractionError::NoData | ExtractionError::DeserializationError(_) => {
+                Self::InvalidOutput(error.to_string())
+            }
+            ExtractionError::CompletionError(error) => Self::from_completion(&error),
+        }
+    }
+
+    fn from_completion(error: &CompletionError) -> Self {
+        let status = error
+            .provider_response_status()
+            .map(|status| status.as_u16());
+        let transport = status.is_none()
+            && matches!(
+                error,
+                CompletionError::HttpError(_)
+                    | CompletionError::UrlError(_)
+                    | CompletionError::RequestError(_)
+            );
+        Self::Request {
+            status,
+            transport,
+            message: error.to_string(),
+        }
+    }
+
+    /// Classifies a provider error for durable retry scheduling.
+    #[must_use]
+    pub fn failure(&self) -> ExtractionFailure {
+        match self {
+            Self::Configuration(_) => ExtractionFailure::Configuration,
+            Self::InvalidOutput(_) => ExtractionFailure::InvalidOutput,
+            Self::Request {
+                status: Some(401 | 403),
+                ..
+            } => ExtractionFailure::Authentication,
+            Self::Request {
+                status: Some(429), ..
+            } => ExtractionFailure::RateLimited,
+            Self::Request {
+                status: Some(status),
+                ..
+            } if (400..500).contains(status) && !matches!(status, 408 | 409 | 425) => {
+                ExtractionFailure::Configuration
+            }
+            Self::Request {
+                status: None,
+                transport: true,
+                ..
+            } => ExtractionFailure::Transport,
+            Self::Request { .. } => ExtractionFailure::Provider,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProviderError, RawExtractionResponse, normalize_candidates};
+
+    #[test]
+    fn fenced_json_normalizes_optional_fields_and_event_date() {
+        let response = RawExtractionResponse::Text(
+            r#"```json
+            {"memories":[{"tmpId":"tmp_1","memory":"A dated fact","temporalContext":{"documentDate":"2026-01-01","eventDate":"2025-12-31"}}]}
+            ```"#
+                .to_owned(),
+        );
+        let memories = normalize_candidates(response).expect("valid extraction");
+
+        assert_eq!(
+            memories[0]
+                .temporal_context
+                .as_ref()
+                .and_then(|temporal| temporal.event_date.as_ref())
+                .expect("event date"),
+            &["2025-12-31"]
+        );
+    }
+
+    #[test]
+    fn array_output_deduplicates_normalized_equivalent_memories() {
+        let response: RawExtractionResponse = serde_json::from_str(
+            r#"[
+                {"tmpId":"tmp_1","memory":"The user prefers SQLite."},
+                {"tmpId":"tmp_2","memory":"the user prefers sqlite"}
+            ]"#,
+        )
+        .expect("array output");
+
+        assert_eq!(
+            normalize_candidates(response)
+                .expect("valid extraction")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn empty_memory_is_structurally_invalid() {
+        let response: RawExtractionResponse =
+            serde_json::from_str(r#"{"tmpId":"tmp_1","memory":"  "}"#).expect("candidate shape");
+
+        assert!(matches!(
+            normalize_candidates(response),
+            Err(ProviderError::InvalidOutput(_))
+        ));
+    }
 }

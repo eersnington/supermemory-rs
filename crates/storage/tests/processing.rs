@@ -1,5 +1,5 @@
 use serde_json::Map;
-use storage::{EmbeddedChunk, Storage, StorageError, UpsertDocument, generate_id};
+use storage::{EmbeddedChunk, MemoryProposal, Storage, StorageError, UpsertDocument, generate_id};
 
 fn input(content: &str) -> UpsertDocument {
     UpsertDocument {
@@ -151,6 +151,127 @@ fn normalized_vectors_are_published_and_ranked_exactly() {
     assert_eq!(hits[0].document_id, first.id);
     assert_eq!(hits[1].document_id, second.id);
     assert!((hits[0].score - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn interrupted_memory_job_reuses_cached_extraction_after_restart() {
+    let path = std::env::temp_dir().join(format!(
+        "supermemory-memory-recovery-{}.db",
+        generate_id().expect("id")
+    ));
+    let mut storage = Storage::open(&path).expect("storage");
+    storage
+        .upsert_document(input("A durable extraction source"))
+        .expect("document");
+    let document_job = storage.claim_job().expect("claim").expect("document job");
+    let mut vector = vec![0.0; 768];
+    vector[0] = 1.0;
+    storage
+        .complete_embedded_job_with_memory_extraction(
+            &document_job,
+            &[EmbeddedChunk {
+                content: &document_job.content,
+                vector: &vector,
+            }],
+            "fixture-model",
+            768,
+        )
+        .expect("schedule extraction");
+    let memory_job = storage
+        .claim_memory_job()
+        .expect("claim memory")
+        .expect("memory job");
+    storage
+        .cache_memory_extraction(&memory_job, "[]")
+        .expect("cache extraction");
+    drop(storage);
+
+    let mut reopened = Storage::open(&path).expect("reopen");
+    let recovered = reopened
+        .claim_memory_job()
+        .expect("claim recovered")
+        .expect("recovered memory job");
+    assert_eq!(recovered.extraction_result.as_deref(), Some("[]"));
+    assert_eq!(recovered.attempts, 2);
+    reopened
+        .complete_memory_job(&recovered)
+        .expect("complete recovered job");
+
+    drop(reopened);
+    std::fs::remove_file(path).expect("remove database");
+}
+
+#[test]
+fn permanent_memory_failure_is_terminal() {
+    let mut storage = Storage::in_memory().expect("storage");
+    let document = storage
+        .upsert_document(input("A permanently failed extraction"))
+        .expect("document");
+    let document_job = storage.claim_job().expect("claim").expect("document job");
+    let mut vector = vec![0.0; 768];
+    vector[0] = 1.0;
+    storage
+        .complete_embedded_job_with_memory_extraction(
+            &document_job,
+            &[EmbeddedChunk {
+                content: &document_job.content,
+                vector: &vector,
+            }],
+            "fixture-model",
+            768,
+        )
+        .expect("schedule extraction");
+    let memory_job = storage
+        .claim_memory_job()
+        .expect("claim memory")
+        .expect("memory job");
+    storage
+        .retry_memory_job(&memory_job, "authentication", "denied", None)
+        .expect("terminal failure");
+
+    assert_eq!(
+        storage
+            .find_document(&document.id)
+            .expect("document")
+            .expect("stored document")
+            .status,
+        "failed"
+    );
+    assert!(storage.claim_memory_job().expect("claim again").is_none());
+}
+
+#[test]
+fn stale_revision_rejects_memory_publication() {
+    let mut storage = Storage::in_memory().expect("storage");
+    let document = storage
+        .upsert_document(input("A stale memory source"))
+        .expect("document");
+    let proposal = MemoryProposal {
+        temporary_id: "tmp_1".to_owned(),
+        content: "This must not be published.".to_owned(),
+        is_inferred: false,
+        is_static: false,
+        metadata: Map::new(),
+        parents: Vec::new(),
+        forget_after: None,
+        forget_reason: None,
+        vector: vec![1.0, 0.0],
+    };
+    let organization = storage.local_organization_id().to_owned();
+    let error = storage
+        .reconcile_memories_for(
+            &organization,
+            &document.id,
+            Some(2),
+            None,
+            "sm_project_default",
+            &[proposal],
+            "fixture-model",
+            2,
+        )
+        .expect_err("stale revision");
+
+    assert!(matches!(error, StorageError::StaleRevision { .. }));
 }
 
 #[test]
