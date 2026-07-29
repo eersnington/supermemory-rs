@@ -4,10 +4,19 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+default-run = "supermemory-rs"
+
+[features]
+storage-benchmark = ["storage/search-profile"]
 
 [[bin]]
 name = "supermemory-rs"
 path = "src/main.rs"
+
+[[bin]]
+name = "storage-benchmark"
+path = "src/bin/storage-benchmark.rs"
+required-features = ["storage-benchmark"]
 
 [dependencies]
 aes-gcm.workspace = true
@@ -17,6 +26,7 @@ memory-engine = { path = "../memory-engine" }
 pbkdf2.workspace = true
 rpassword.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 server = { path = "../server" }
 sha2.workspace = true
 storage = { path = "../storage" }

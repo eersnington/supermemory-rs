@@ -205,15 +205,10 @@ async fn start_embedded_turso(database: PathBuf) -> Result<storage::Storage, Sta
         options,
     )
     .map_err(|error| StartupError::EmbeddedTurso(error.to_string()))?;
-    let connection = turso_pg::Connection::new(
-        database
-            .connect()
-            .map_err(|error| StartupError::EmbeddedTurso(error.to_string()))?,
-    );
     let server = turso_pg_server::TursoPgServer::new(
         address.to_string(),
         database_text,
-        connection,
+        database,
         std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     );
     std::thread::Builder::new()
@@ -235,11 +230,25 @@ async fn start_embedded_turso(database: PathBuf) -> Result<storage::Storage, Sta
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        Err(last_error.expect("embedded Turso connection was attempted"))
+        Err(last_error)
     })
     .await
     .map_err(StartupError::DatabaseExecutor)?
-    .map_err(StartupError::Storage)
+    .map_err(|error| {
+        error.map_or_else(
+            || StartupError::EmbeddedTurso("database connection was not attempted".to_owned()),
+            StartupError::Storage,
+        )
+    })
+}
+
+/// Starts isolated embedded storage for the feature-gated storage benchmark.
+#[cfg(feature = "storage-benchmark")]
+#[doc(hidden)]
+pub async fn start_embedded_turso_for_benchmark(
+    database: PathBuf,
+) -> Result<storage::Storage, StartupError> {
+    start_embedded_turso(database).await
 }
 
 fn provider_config(

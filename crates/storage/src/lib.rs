@@ -10,10 +10,14 @@ use std::{
     cell::{RefCell, RefMut},
     collections::{HashMap, HashSet},
     path::Path,
+    time::Duration,
 };
 
+#[cfg(feature = "search-profile")]
+use std::time::Instant;
+
 use bytes::BytesMut;
-use postgres::{Client, GenericClient, NoTls, Row};
+use postgres::{Client, GenericClient, NoTls, Row, error::SqlState};
 use postgres_types::{FromSql, IsNull, ToSql, Type, to_sql_checked};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -68,6 +72,7 @@ pub struct ClaimedMemoryJob {
     pub container_tag: String,
     pub document_date: Option<String>,
     pub extraction_result: Option<String>,
+    pub attempts: i32,
 }
 
 /// Existing organization memory supplied as context to provider extraction.
@@ -203,6 +208,15 @@ pub struct MemorySearchHit {
     pub children: Vec<MemoryRelationHit>,
     pub related: Vec<MemoryRelationHit>,
     pub documents: Vec<MemorySourceDocument>,
+}
+
+#[derive(Debug)]
+struct MemorySearchProfile {
+    hits: Vec<MemorySearchHit>,
+    #[cfg(feature = "search-profile")]
+    vector_sql: Duration,
+    #[cfg(feature = "search-profile")]
+    hydration: Duration,
 }
 
 /// One memory connected through the lineage graph.
@@ -582,10 +596,11 @@ impl Storage {
         self.client().execute("DELETE FROM documents WHERE id=$1 AND revision=$2::bigint AND status IN ('extracting','chunking')",&[&job.document_id,&revision_parameter]).map(|_|()).map_err(StorageError::Write)
     }
 
+    /// Claims the next available memory job and increments its durable attempt count.
     pub fn claim_memory_job(&mut self) -> Result<Option<ClaimedMemoryJob>, StorageError> {
         let mut db = self.client();
         let mut tx = db.transaction().map_err(StorageError::Write)?;
-        let row = tx.query_opt("SELECT j.id,d.id,d.content,j.revision,d.org_id,d.container_tags,d.metadata,j.last_error FROM jobs j JOIN documents d ON d.id=j.document_id WHERE j.kind='memory' AND j.status='queued' AND j.revision=d.revision AND j.available_at<=now() ORDER BY j.created_at FOR UPDATE OF j SKIP LOCKED LIMIT 1", &[]).map_err(StorageError::Read)?;
+        let row = tx.query_opt("SELECT j.id,d.id,d.content,j.revision,d.org_id,d.container_tags,d.metadata,j.extraction_result,j.attempts::text FROM jobs j JOIN documents d ON d.id=j.document_id WHERE j.kind='memory' AND j.status='queued' AND j.revision=d.revision AND j.available_at<=now() ORDER BY j.created_at FOR UPDATE OF j SKIP LOCKED LIMIT 1", &[]).map_err(StorageError::Read)?;
         let Some(row) = row else {
             tx.commit().map_err(StorageError::Write)?;
             return Ok(None);
@@ -608,9 +623,12 @@ impl Storage {
                 .get("date")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            extraction_result: row
-                .get::<_, Option<String>>(7)
-                .and_then(|value| value.strip_prefix("result:").map(str::to_owned)),
+            extraction_result: row.get(7),
+            attempts: row
+                .get::<_, String>(8)
+                .parse::<i32>()
+                .map_err(StorageError::InvalidJobAttempts)?
+                .saturating_add(1),
         };
         let revision = job.revision.to_string();
         tx.execute("UPDATE jobs SET status='extracting',attempts=attempts+1,updated_at=now() WHERE id=$1 AND revision=$2::bigint", &[&job.id, &revision]).map_err(StorageError::Write)?;
@@ -626,58 +644,72 @@ impl Storage {
         self.client().query("SELECT id,content FROM memories WHERE org_id=$1 AND container_tag=$2 AND is_latest AND NOT is_forgotten ORDER BY updated_at DESC LIMIT 100", &[&org_id, &container_tag]).map_err(StorageError::Read).map(|rows| rows.into_iter().map(|row| ExistingMemory { id: row.get(0), content: row.get(1) }).collect())
     }
 
+    /// Persists provider output independently from retry errors for restart recovery.
     pub fn cache_memory_extraction(
         &mut self,
         job: &ClaimedMemoryJob,
         result: &str,
     ) -> Result<(), StorageError> {
-        let cached = format!("result:{result}");
-        self.client()
-            .execute(
-                "UPDATE jobs SET last_error=$2,updated_at=now() WHERE id=$1 AND status='extracting'",
-                &[&job.id, &cached],
-            )
-            .map(|_| ())
-            .map_err(StorageError::Write)
-    }
-
-    pub fn memory_job_is_current(&self, job: &ClaimedMemoryJob) -> Result<bool, StorageError> {
         let revision = job.revision.to_string();
-        self.client()
-            .query_opt(
-                "SELECT 1 FROM documents WHERE id=$1 AND revision=$2::bigint",
-                &[&job.document_id, &revision],
+        let updated = self
+            .client()
+            .execute(
+                "UPDATE jobs SET extraction_result=$3,updated_at=now() WHERE id=$1 AND revision=$2::bigint AND status='extracting'",
+                &[&job.id, &revision, &result],
             )
-            .map(|row| row.is_some())
-            .map_err(StorageError::Read)
+            .map_err(StorageError::Write)?;
+        if updated != 1 {
+            return Err(StorageError::StaleRevision {
+                document_id: job.document_id.clone(),
+                claimed: job.revision,
+                current: None,
+            });
+        }
+        Ok(())
     }
 
+    /// Atomically marks the memory job and its current document revision complete.
     pub fn complete_memory_job(&mut self, job: &ClaimedMemoryJob) -> Result<(), StorageError> {
         let revision = job.revision.to_string();
         let mut db = self.client();
         let mut tx = db.transaction().map_err(StorageError::Write)?;
-        tx.execute("UPDATE jobs SET status='done',last_error=NULL,updated_at=now() WHERE id=$1 AND revision=$2::bigint", &[&job.id, &revision]).map_err(StorageError::Write)?;
+        tx.execute("UPDATE jobs SET status='done',last_error_kind=NULL,last_error=NULL,updated_at=now() WHERE id=$1 AND revision=$2::bigint", &[&job.id, &revision]).map_err(StorageError::Write)?;
         tx.execute("UPDATE documents SET status='done',updated_at=now() WHERE id=$1 AND revision=$2::bigint", &[&job.document_id, &revision]).map_err(StorageError::Write)?;
         tx.commit().map_err(StorageError::Write)
     }
 
+    /// Persists either a delayed retry or a terminal failure for the claimed revision.
     pub fn retry_memory_job(
         &mut self,
         job: &ClaimedMemoryJob,
+        error_kind: &str,
         error: &str,
+        retry_delay: Option<Duration>,
     ) -> Result<(), StorageError> {
         let revision = job.revision.to_string();
+        let terminal = retry_delay.is_none().to_string();
+        let delay = format!(
+            "{} milliseconds",
+            retry_delay.unwrap_or(Duration::ZERO).as_millis()
+        );
         let mut db = self.client();
         let mut tx = db.transaction().map_err(StorageError::Write)?;
-        let status: String = tx
-            .query_one(
-                "UPDATE jobs SET status=CASE WHEN attempts>=4 THEN 'failed' ELSE 'queued' END,last_error=CASE WHEN last_error LIKE 'result:%' THEN last_error ELSE $2 END,available_at=now(),updated_at=now() WHERE id=$1 RETURNING status",
-                &[&job.id, &error],
+        let row = tx
+            .query_opt(
+                "UPDATE jobs SET status=CASE WHEN $6::boolean OR attempts>=4 THEN 'failed' ELSE 'queued' END,last_error_kind=$3,last_error=$4,available_at=now()+$5::interval,updated_at=now() WHERE id=$1 AND revision=$2::bigint AND status='extracting' RETURNING status",
+                &[&job.id, &revision, &error_kind, &error, &delay, &terminal],
             )
-            .map_err(StorageError::Write)?
-            .get(0);
+            .map_err(StorageError::Write)?;
+        let Some(row) = row else {
+            return Err(StorageError::StaleRevision {
+                document_id: job.document_id.clone(),
+                claimed: job.revision,
+                current: None,
+            });
+        };
+        let status: String = row.get(0);
         if status == "failed" {
-            tx.execute("UPDATE documents SET status='done',updated_at=now() WHERE id=$1 AND revision=$2::bigint", &[&job.document_id, &revision]).map_err(StorageError::Write)?;
+            tx.execute("UPDATE documents SET status='failed',updated_at=now() WHERE id=$1 AND revision=$2::bigint", &[&job.document_id, &revision]).map_err(StorageError::Write)?;
         }
         tx.commit().map_err(StorageError::Write)
     }
@@ -766,6 +798,7 @@ impl Storage {
         self.reconcile_memories_for(
             &org,
             document_id,
+            None,
             container_tag,
             proposals,
             model_id,
@@ -773,13 +806,15 @@ impl Storage {
         )
     }
     #[expect(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "the set-based preload and atomic proposal writes share one transaction"
+        reason = "revision-gated proposal writes share one transaction"
     )]
     pub fn reconcile_memories_for(
         &mut self,
         org_id: &str,
         document_id: &str,
+        expected_revision: Option<i64>,
         container_tag: &str,
         proposals: &[MemoryProposal],
         model_id: &str,
@@ -796,15 +831,24 @@ impl Storage {
         }
         let mut db = self.client();
         let mut tx = db.transaction().map_err(StorageError::Write)?;
-        if tx
+        let source_revision = tx
             .query_opt(
-                "SELECT 1 FROM documents WHERE id=$1 AND org_id=$2",
+                "SELECT revision FROM documents WHERE id=$1 AND org_id=$2 FOR UPDATE",
                 &[&document_id, &org_id],
             )
             .map_err(StorageError::Read)?
-            .is_none()
-        {
+            .map(|row| row.get(0));
+        let Some(source_revision) = source_revision else {
             return Err(StorageError::UnknownMemorySource(document_id.to_owned()));
+        };
+        if let Some(expected_revision) = expected_revision
+            && expected_revision != source_revision
+        {
+            return Err(StorageError::StaleRevision {
+                document_id: document_id.to_owned(),
+                claimed: expected_revision,
+                current: Some(source_revision),
+            });
         }
         let mut exact: HashMap<String, String> = tx
             .query(
@@ -1024,13 +1068,40 @@ impl Storage {
         threshold: f32,
         forgotten: bool,
     ) -> Result<Vec<MemorySearchHit>, StorageError> {
+        self.memory_search_profile(
+            org,
+            q,
+            model,
+            tag,
+            result_limit,
+            candidate_limit,
+            threshold,
+            forgotten,
+        )
+        .map(|profile| profile.hits)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "internal search contract")]
+    fn memory_search_profile(
+        &self,
+        org: &str,
+        q: &[f32],
+        model: &str,
+        tag: &str,
+        result_limit: usize,
+        candidate_limit: usize,
+        threshold: f32,
+        forgotten: bool,
+    ) -> Result<MemorySearchProfile, StorageError> {
         validate_vector(q, 768)?;
         let candidate_limit = i64::try_from(candidate_limit).unwrap_or(i64::MAX);
         let query_parameter = PgVector(q.to_vec());
         let forgotten_parameter = forgotten.to_string();
         let sql = format!(
-            "SELECT m.id,m.content,m.metadata,m.is_inferred,m.is_static,m.is_latest,m.is_forgotten,m.root_memory_id,m.parent_memory_id,m.version,m.forget_after::text,m.forget_reason,m.created_at::text,m.updated_at::text,e.vector FROM memory_embeddings e JOIN memories m ON m.id=e.memory_id WHERE m.org_id=$2 AND m.container_tag=$3 AND e.model_id=$4 AND (e.active OR $5::boolean) AND (NOT m.is_forgotten OR $5::boolean) ORDER BY e.vector<=>$1::vector LIMIT {candidate_limit}"
+            "SELECT m.id,m.content,m.metadata,m.is_inferred,m.is_static,m.is_latest,m.is_forgotten,m.root_memory_id,m.parent_memory_id,m.version,m.forget_after::text,m.forget_reason,m.created_at::text,m.updated_at::text,1.0-(e.vector<=>$1::vector) AS similarity FROM memory_embeddings e JOIN memories m ON m.id=e.memory_id WHERE m.org_id=$2 AND m.container_tag=$3 AND e.model_id=$4 AND (e.active OR $5::boolean) AND (NOT m.is_forgotten OR $5::boolean) ORDER BY e.vector<=>$1::vector LIMIT {candidate_limit}"
         );
+        #[cfg(feature = "search-profile")]
+        let sql_started = Instant::now();
         let rows = self
             .client()
             .query(
@@ -1038,14 +1109,15 @@ impl Storage {
                 &[&query_parameter, &org, &tag, &model, &forgotten_parameter],
             )
             .map_err(StorageError::Read)?;
+        #[cfg(feature = "search-profile")]
+        let vector_sql = sql_started.elapsed();
         let mut hits = Vec::new();
         for row in rows {
-            let vector: PgVector = row.get(14);
-            let similarity = exact_similarity(q, &vector.0)?;
-            if similarity >= threshold {
+            let similarity: f64 = row.get(14);
+            if similarity >= f64::from(threshold) {
                 hits.push(MemorySearchHit {
                     record: read_memory(&row)?,
-                    similarity: f64::from(similarity),
+                    similarity,
                     parents: Vec::new(),
                     children: Vec::new(),
                     related: Vec::new(),
@@ -1060,8 +1132,44 @@ impl Storage {
                 .then_with(|| left.record.id.cmp(&right.record.id))
         });
         hits.truncate(result_limit);
+        #[cfg(feature = "search-profile")]
+        let hydration_started = Instant::now();
         hydrate_memory_hits(&mut *self.client(), &mut hits)?;
-        Ok(hits)
+        Ok(MemorySearchProfile {
+            hits,
+            #[cfg(feature = "search-profile")]
+            vector_sql,
+            #[cfg(feature = "search-profile")]
+            hydration: hydration_started.elapsed(),
+        })
+    }
+
+    /// Returns search hits with separate vector-SQL and hydration durations.
+    #[cfg(feature = "search-profile")]
+    #[doc(hidden)]
+    #[expect(clippy::too_many_arguments, reason = "benchmark-only search contract")]
+    pub fn profile_memory_search(
+        &self,
+        org: &str,
+        q: &[f32],
+        model: &str,
+        tag: &str,
+        result_limit: usize,
+        candidate_limit: usize,
+        threshold: f32,
+        forgotten: bool,
+    ) -> Result<(Vec<MemorySearchHit>, Duration, Duration), StorageError> {
+        self.memory_search_profile(
+            org,
+            q,
+            model,
+            tag,
+            result_limit,
+            candidate_limit,
+            threshold,
+            forgotten,
+        )
+        .map(|profile| (profile.hits, profile.vector_sql, profile.hydration))
     }
 
     pub fn api_key_hashes(&self) -> Result<Vec<[u8; 32]>, StorageError> {
@@ -1390,7 +1498,19 @@ fn valid_future_datetime<C: GenericClient>(
     let Some(v) = v else { return Ok(None) };
     let valid: String = db
         .query_one("SELECT ($1::timestamptz>now())::text", &[&v])
-        .map_err(StorageError::Read)?
+        .map_err(|error| {
+            let invalid_datetime = error.as_db_error().is_some_and(|database_error| {
+                matches!(
+                    database_error.code(),
+                    &SqlState::INVALID_DATETIME_FORMAT | &SqlState::DATETIME_FIELD_OVERFLOW
+                )
+            });
+            if invalid_datetime {
+                StorageError::InvalidForgetAfter(v.to_owned())
+            } else {
+                StorageError::Read(error)
+            }
+        })?
         .try_get(0)
         .map_err(StorageError::Read)?;
     Ok((valid == "true").then(|| v.to_owned()))
@@ -1457,6 +1577,31 @@ impl<'a> FromSql<'a> for PgVector {
 
 fn initialize(db: &mut Client) -> Result<String, StorageError> {
     db.batch_execute(SCHEMA).map_err(StorageError::Migrate)?;
+    let job_columns = db
+        .query("SELECT name FROM pragma_table_info('jobs')", &[])
+        .map_err(StorageError::Migrate)?
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<HashSet<_>>();
+    for (column, statement) in [
+        (
+            "extraction_result",
+            "ALTER TABLE jobs ADD COLUMN extraction_result text",
+        ),
+        (
+            "last_error_kind",
+            "ALTER TABLE jobs ADD COLUMN last_error_kind text",
+        ),
+    ] {
+        if !job_columns.contains(column) {
+            db.batch_execute(statement).map_err(StorageError::Migrate)?;
+        }
+    }
+    // Preserve extraction output written by the legacy last_error encoding.
+    db.batch_execute(
+        "UPDATE jobs SET extraction_result=substr(last_error,8),last_error=NULL WHERE extraction_result IS NULL AND last_error LIKE 'result:%'",
+    )
+    .map_err(StorageError::Migrate)?;
     let row = db
         .query_opt("SELECT id FROM organizations WHERE slug=$1", &[&LOCAL_SLUG])
         .map_err(StorageError::Migrate)?;
@@ -1479,7 +1624,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS organizations(id text PRIMARY KEY,slug text UNIQUE NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS documents(id text PRIMARY KEY,org_id text NOT NULL REFERENCES organizations(id),content text NOT NULL,content_hash text NOT NULL,custom_id text,status text NOT NULL DEFAULT 'queued',container_tags text NOT NULL DEFAULT '[]',entity_context text,metadata text NOT NULL DEFAULT '{}',task_type text NOT NULL,filepath text,filter_by_metadata text NOT NULL DEFAULT '{}',dreaming text NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now(),revision bigint NOT NULL DEFAULT 1,title text,summary text,document_type text,source text,url text,user_id text);
 CREATE INDEX IF NOT EXISTS documents_identity_idx ON documents(org_id,custom_id);
-CREATE TABLE IF NOT EXISTS jobs(id text PRIMARY KEY,document_id text NOT NULL REFERENCES documents(id) ON DELETE CASCADE,kind text NOT NULL DEFAULT 'document',status text NOT NULL DEFAULT 'queued',attempts integer NOT NULL DEFAULT 0,available_at timestamptz NOT NULL DEFAULT now(),last_error text,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now(),revision bigint NOT NULL);
+CREATE TABLE IF NOT EXISTS jobs(id text PRIMARY KEY,document_id text NOT NULL REFERENCES documents(id) ON DELETE CASCADE,kind text NOT NULL DEFAULT 'document',status text NOT NULL DEFAULT 'queued',attempts integer NOT NULL DEFAULT 0,available_at timestamptz NOT NULL DEFAULT now(),extraction_result text,last_error_kind text,last_error text,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now(),revision bigint NOT NULL);
 CREATE TABLE IF NOT EXISTS id_allocator(name text PRIMARY KEY,next_id bigint NOT NULL);
 INSERT INTO id_allocator(name,next_id) VALUES('document_chunks',0) ON CONFLICT(name) DO NOTHING;
 CREATE TABLE IF NOT EXISTS document_chunks(id bigint PRIMARY KEY,document_id text NOT NULL REFERENCES documents(id) ON DELETE CASCADE,ordinal bigint NOT NULL,content text NOT NULL,stable_id text NOT NULL UNIQUE,UNIQUE(document_id,ordinal));
@@ -1714,12 +1859,34 @@ pub enum StorageError {
         claimed: i64,
         current: Option<i64>,
     },
+    #[error("stored job attempt count is invalid: {0}")]
+    InvalidJobAttempts(#[source] std::num::ParseIntError),
     #[error("unsupported document processing stage {0}")]
     InvalidJobStage(String),
     #[error("invalid memory proposal")]
     InvalidMemoryProposal,
+    #[error("memory expiration is not a valid timestamp: {0}")]
+    InvalidForgetAfter(String),
     #[error("unknown memory source document {0}")]
     UnknownMemorySource(String),
     #[error("memory was not found or already forgotten")]
     MemoryNotFound,
+}
+
+impl StorageError {
+    /// Returns whether continuing after this failure could report misleading results.
+    #[must_use]
+    pub const fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::Open(_)
+                | Self::Migrate(_)
+                | Self::Write(_)
+                | Self::Read(_)
+                | Self::DeserializeSearchData(_)
+                | Self::MalformedJsonObject
+                | Self::MalformedApiKeyHash(_)
+                | Self::InvalidJobAttempts(_)
+        )
+    }
 }
