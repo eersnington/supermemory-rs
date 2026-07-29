@@ -17,29 +17,25 @@ The release binary passes the tested client flows, legacy migration, local embed
 
 ## Compare matched MemoryBench results
 
-The official MemoryBench runner tested both servers on July 19, 2026. Each run used fresh data, the same 127 LoCoMo episodes, and the same five question IDs. Both runs used the existing local `bge-base-en-v1.5` embedding model, Gemini memory extraction, and Gemini 2.5 Flash for answers and judging.
+The official MemoryBench runner tested three storage and search configurations on the same five-question LoCoMo panel. Each run used fresh data, the same 95 episode references, and question IDs `conv-26-q0` through `conv-26-q4`. The runs used the local `bge-base-en-v1.5` embedding model and Gemini 2.5 Flash for memory extraction, answers, and judging.
 
-Memory sampling ran once per second from server readiness through evaluation. The v0.0.5 measurements include `supermemory-server` and its detached Rivet engine.
+The `tursopg` run used Turso through its PostgreSQL protocol and ranked vectors with pgvector SQL. The earlier Rust run stored data in SQLite and searched vectors from filesystem-backed indexes. The third run used `supermemory-server` v0.0.5 with its detached Rivet engine.
 
-| Measurement | Rust | v0.0.5 | Relative result |
-| --- | ---: | ---: | --- |
-| Answer accuracy | 80% (4/5) | 100% (5/5) | v0.0.5: +20 percentage points |
-| Retrieval Hit@10 | 80% | 80% | Equal |
-| Mean reciprocal rank (MRR) | 0.700 | 0.640 | Rust: 1.09x higher |
-| Normalized discounted cumulative gain (NDCG) | 0.726 | 0.632 | Rust: 1.15x higher |
-| Ingestion acceptance, mean | 47 ms | 1,900 ms | Rust: 40.4x faster |
-| Cold indexing, mean | 419,121 ms | 349,442 ms | Rust: 1.20x slower |
-| Search, mean | 32 ms | 111 ms | Rust: 3.47x faster |
-| Search, p95 | 47 ms | 158 ms | Rust: 3.36x faster |
-| Answer context, mean | 7,297 tokens | 11,122 tokens | v0.0.5: 1.52x as many |
-| Ready resident set size (RSS) | 218,640 KiB | 1,581,312 KiB | Rust: 7.23x lower |
-| Workload RSS, mean | 337,907 KiB | 1,353,826 KiB | Rust: 4.01x lower |
-| Workload RSS, peak | 412,352 KiB | 1,824,096 KiB | Rust: 4.42x lower |
-| Populated restart RSS | 188,384 KiB | 1,041,314 KiB | Rust: 5.53x lower |
+| Measurement | Turso via `tursopg` + pgvector SQL search | SQLite + filesystem vector search | `supermemory-server` v0.0.5 |
+| --- | ---: | ---: | ---: |
+| Answer accuracy | 100% (5/5) | 60% (3/5) | 100% (5/5) |
+| Retrieval Hit@10 | 100% | 100% | 100% |
+| Mean reciprocal rank (MRR) | 0.900 | 0.469 | 1.000 |
+| Normalized discounted cumulative gain (NDCG) | 0.856 | 0.563 | 0.937 |
+| Ingestion acceptance, mean | 171 ms | 145 ms | 1,392 ms |
+| Cold indexing, mean | 3,428,997 ms | 3,322,927 ms | 236,437 ms |
+| Search, mean | 367 ms | 398 ms | 83 ms |
+| Search, p95 | 397 ms | 638 ms | 109 ms |
+| Answer context, mean | 822 tokens | 7,353 tokens | 9,679 tokens |
 
-Rust used less memory and returned search results faster, but its cold indexing took 20% longer. v0.0.5 answered one additional question correctly, while both implementations achieved the same Hit@10.
+The `tursopg` configuration answered all five questions correctly and cut mean answer context from 7,353 to 822 tokens compared with the SQLite and filesystem search configuration. Search improved slightly, but cold indexing remained about 14.5 times slower than `supermemory-server`.
 
-Do not use answer and judge latency to compare server performance because those phases include external Gemini requests. Five questions can expose compatibility and resource differences, but they cannot establish a stable quality ranking.
+Do not use answer and judge latency to compare server performance because those phases include external Gemini requests. Five questions can expose compatibility and performance differences, but they cannot establish a stable quality ranking.
 
 ### Reset the v0.0.5 Rivet engine
 
