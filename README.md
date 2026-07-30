@@ -24,9 +24,16 @@ The goal is to run the same local Supermemory service with a much smaller memory
 - Local BGE embeddings with the same 768-dimensional model
 - Migration from an existing `~/.supermemory` installation
 
-The worker uses a durable, revision-guarded queue. Chunks and embeddings are committed together, interrupted jobs resume after restart, and stale workers cannot overwrite newer document revisions.
-
 See the [semantic porting guidelines](docs/semantic-porting.md) for the compatibility rules that guide the implementation.
+
+## How it works
+
+1. Ingestion stores the document and a revision-scoped job in SQLite, then returns immediately.
+2. A document worker chunks the content, generates local BGE embeddings, and publishes the chunks and vectors together.
+3. With an LLM provider configured, ten memory workers extract memories concurrently. Provider calls run outside the database lock. SQLite stores retries and cached extraction output, then reconciles memory versions, relationships, and sources in a transaction.
+4. Search embeds the query locally and ranks normalized vector blobs with a registered SQLite cosine function. Filters run before ranking, and V4 responses use a 4,000-byte context budget.
+
+SQLite uses one controlled writer and five pooled search connections. Interrupted jobs resume after restart, and revision checks prevent stale workers from publishing over newer documents. Fatal storage failures put the service into a degraded state.
 
 ## Requirements
 
@@ -60,7 +67,10 @@ Other startup options:
 --database <path>        SUPERMEMORY_DATABASE
 --model <path>           SUPERMEMORY_MODEL
 --ort-library <path>     SUPERMEMORY_ORT_LIBRARY
+--monitor                SUPERMEMORY_MONITOR
 ```
+
+Use `--monitor` in an interactive terminal to show current and peak process memory below the startup summary.
 
 Open [http://localhost:6767](http://localhost:6767) for the local landing page. The API reference is available at `/v4/reference`, and the OpenAPI document is at `/v4/openapi`.
 
@@ -86,7 +96,7 @@ V4 search supports three modes:
 - `documents` searches document chunks
 - `hybrid` searches both and gives memory results a small ranking boost
 
-Without a loaded embedding model, document search falls back to SQLite FTS5. Memory search requires embeddings.
+The executable loads the local embedding model at startup. Document and memory search both require it.
 
 ## Memory extraction
 

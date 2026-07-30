@@ -40,7 +40,7 @@ Generic infrastructure may be replaced when the replacement preserves behavior:
 | Bun and Hono | Tokio and Axum |
 | PGlite and Drizzle | SQLite and rusqlite |
 | Transformers.js | ONNX Runtime and tokenizers |
-| pgvector candidate search | Embedded vector index plus exact reranking |
+| pgvector candidate search | Exact cosine ranking in SQLite |
 | Rivet workflow execution | Persisted Rust job state machine |
 | Better Auth local setup | Equivalent local identity and API-key handling |
 

@@ -10,6 +10,7 @@ fn config_parses_explicit_startup_values() {
         "0.0.0.0:8080",
         "--database",
         "data.db",
+        "--monitor",
     ])
     .expect("valid configuration");
     assert_eq!(
@@ -17,17 +18,14 @@ fn config_parses_explicit_startup_values() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080)
     );
     assert_eq!(config.database.to_string_lossy(), "data.db");
+    assert!(config.monitor);
 }
 
 #[test]
 fn config_uses_compatibility_default_port() {
-    assert_eq!(
-        Config::try_parse_from(["supermemory"])
-            .expect("config")
-            .bind
-            .port(),
-        6767
-    );
+    let config = Config::try_parse_from(["supermemory"]).expect("config");
+    assert_eq!(config.bind.port(), 6767);
+    assert!(!config.monitor);
 }
 
 #[test]

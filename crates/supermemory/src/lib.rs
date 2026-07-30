@@ -9,11 +9,16 @@ use std::{
     io::{self, IsTerminal, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
 use clap::Parser;
 use sha2::{Digest, Sha256};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 use unicode_width::UnicodeWidthStr;
@@ -37,6 +42,10 @@ pub struct Config {
     /// Existing native ONNX Runtime dynamic library.
     #[arg(long, env = "SUPERMEMORY_ORT_LIBRARY", default_value_os_t = default_ort_library_path())]
     pub ort_library: PathBuf,
+
+    /// Show live process memory usage in an interactive terminal.
+    #[arg(long, env = "SUPERMEMORY_MONITOR")]
+    pub monitor: bool,
 }
 
 fn default_database_path() -> PathBuf {
@@ -142,7 +151,7 @@ async fn start(config: Config) -> Result<(), StartupError> {
     })
     .await
     .map_err(StartupError::ModelExecutor)??;
-    let embeddings = std::sync::Arc::new(embeddings);
+    let embeddings = Arc::new(embeddings);
     print_success(
         "local embeddings",
         "BGE 768d ready",
@@ -158,8 +167,9 @@ async fn start(config: Config) -> Result<(), StartupError> {
     print_step("http server", &format!("port {}", config.bind.port()));
     let address = config.bind;
     let database = config.database.clone();
-    let displayed_api_key = api_key.clone();
-    server::serve_with_services_ready(
+    let monitor = MemoryMonitor::new(config.monitor && io::stdout().is_terminal());
+    let ready_monitor = monitor.clone();
+    let result = server::serve_with_services_ready(
         address,
         Some(api_key),
         storage,
@@ -171,16 +181,13 @@ async fn start(config: Config) -> Result<(), StartupError> {
                 &format!("listening on http://localhost:{}", address.port()),
                 boot.elapsed(),
             );
-            print_ready(
-                address.port(),
-                &database,
-                &displayed_api_key,
-                &organization_id,
-                boot.elapsed(),
-            );
+            print_ready(address.port(), &database, &organization_id, boot.elapsed());
+            ready_monitor.begin();
         },
     )
-    .await?;
+    .await;
+    monitor.stop().await;
+    result?;
     Ok(())
 }
 
@@ -328,8 +335,106 @@ fn init_tracing() -> Result<(), StartupError> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(|| MonitorAwareStderr)
         .try_init()
         .map_err(StartupError::Tracing)
+}
+
+static TERMINAL_OUTPUT_LOCK: Mutex<()> = Mutex::new(());
+static MEMORY_MONITOR_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone)]
+struct MemoryMonitor {
+    enabled: bool,
+    task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+impl MemoryMonitor {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            task: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn begin(&self) {
+        if self.enabled
+            && let Ok(mut task) = self.task.lock()
+            && task.is_none()
+        {
+            *task = Some(tokio::spawn(monitor_memory()));
+        }
+    }
+
+    async fn stop(self) {
+        let task = self.task.lock().ok().and_then(|mut task| task.take());
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+            clear_memory_monitor();
+        }
+    }
+}
+
+struct MonitorAwareStderr;
+
+impl Write for MonitorAwareStderr {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let _guard = TERMINAL_OUTPUT_LOCK.lock().ok();
+        let mut stderr = io::stderr().lock();
+        if MEMORY_MONITOR_ACTIVE.load(Ordering::Acquire) {
+            stderr.write_all(b"\r\x1b[2K")?;
+        }
+        stderr.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().flush()
+    }
+}
+
+async fn monitor_memory() {
+    let pid = Pid::from_u32(std::process::id());
+    let mut system = System::new();
+    let mut peak = 0;
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    MEMORY_MONITOR_ACTIVE.store(true, Ordering::Release);
+    loop {
+        interval.tick().await;
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            false,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        let Some(process) = system.process(pid) else {
+            continue;
+        };
+        let rss = process.memory();
+        peak = peak.max(rss);
+        if let Ok(_guard) = TERMINAL_OUTPUT_LOCK.lock() {
+            let mut stdout = io::stdout().lock();
+            let _ = write!(stdout, "\r\x1b[2K  {}", memory_status(rss, peak));
+            let _ = stdout.flush();
+        }
+    }
+}
+
+fn clear_memory_monitor() {
+    MEMORY_MONITOR_ACTIVE.store(false, Ordering::Release);
+    if let Ok(_guard) = TERMINAL_OUTPUT_LOCK.lock() {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(b"\r\x1b[2K");
+        let _ = stdout.flush();
+    }
+}
+
+fn memory_status(rss: u64, peak: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    format!(
+        "memory  {} MiB RSS · {} MiB peak",
+        rss.div_ceil(MIB),
+        peak.div_ceil(MIB)
+    )
 }
 
 const RESET: &str = "\x1b[0m";
@@ -378,26 +483,29 @@ fn print_success(label: &str, detail: &str, elapsed: std::time::Duration) {
     }
 }
 
-fn print_ready(
+fn ready_rows(
     port: u16,
     database: &Path,
-    api_key: &str,
     organization_id: &str,
     elapsed: std::time::Duration,
-) {
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("url", format!("http://localhost:{port}")),
+        ("database", format!("local SQLite ({})", database.display())),
+        ("search", "local BGE vectors ranked in SQLite".to_owned()),
+        ("embeddings", "BGE base 768d · local q8".to_owned()),
+        ("workers", "1 document · 10 memory".to_owned()),
+        ("jobs", "durable · revision-guarded".to_owned()),
+        ("org id", organization_id.to_owned()),
+        ("boot", format_duration(elapsed)),
+    ]
+}
+
+fn print_ready(port: u16, database: &Path, organization_id: &str, elapsed: std::time::Duration) {
     if !io::stdout().is_terminal() {
         return;
     }
-    let rows = vec![
-        ("url", format!("http://localhost:{port}")),
-        ("database", format!("local SQLite ({})", database.display())),
-        ("search", "exact BGE semantic + SQLite FTS5".to_owned()),
-        ("embeddings", "BGE base 768d · local q8".to_owned()),
-        ("workflow", "revision-guarded durable worker".to_owned()),
-        ("api key", api_key.to_owned()),
-        ("org id", organization_id.to_owned()),
-        ("boot", format_duration(elapsed)),
-    ];
+    let rows = ready_rows(port, database, organization_id, elapsed);
     let label_width = rows
         .iter()
         .map(|(label, _)| display_width(label))
@@ -428,9 +536,7 @@ fn print_ready(
         );
     }
     println!("\x1b[38;5;81m╰{horizontal}╯{RESET}\n");
-    println!(
-        "  {DIM}the api key above is auto-applied for unauthenticated localhost requests.{RESET}\n"
-    );
+    println!("  {DIM}localhost requests do not need an API key.{RESET}\n");
     let _ = io::stdout().flush();
 }
 
@@ -512,11 +618,35 @@ pub enum StartupError {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_width, provider_selection};
+    use std::{path::Path, time::Duration};
+
+    use super::{display_width, memory_status, provider_selection, ready_rows};
 
     #[test]
     fn display_width_counts_middle_dot_as_one_column() {
         assert_eq!(display_width("BGE base 768d · local q8"), 24);
+    }
+
+    #[test]
+    fn memory_status_uses_binary_units() {
+        assert_eq!(
+            memory_status(214 * 1024 * 1024, 445 * 1024 * 1024),
+            "memory  214 MiB RSS · 445 MiB peak"
+        );
+    }
+
+    #[test]
+    fn ready_output_describes_current_workers_without_exposing_a_key() {
+        let rows = ready_rows(
+            6767,
+            Path::new("/tmp/supermemory.db"),
+            "org_1",
+            Duration::ZERO,
+        );
+        assert!(rows.contains(&("search", "local BGE vectors ranked in SQLite".to_owned())));
+        assert!(rows.contains(&("workers", "1 document · 10 memory".to_owned())));
+        assert!(rows.iter().all(|(label, _)| *label != "api key"));
+        assert!(rows.iter().all(|(_, value)| !value.contains("FTS5")));
     }
 
     #[test]
