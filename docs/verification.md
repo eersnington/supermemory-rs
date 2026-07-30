@@ -17,22 +17,23 @@ The release binary passes the tested SDK flows, legacy migration, local embeddin
 
 The July 30, 2026 run used MemoryBench commit `118209a746d97d0d85e5a7234267f0b6962857e9`, 95 episodes, local BGE embeddings, and Gemini 2.5 Flash. The `supermemory-server` result used an earlier 127-episode run, so that comparison is directional.
 
-| Measurement | Turso/Postgres | Current SQLite | `supermemory-server` v0.0.5 |
-| --- | ---: | ---: | ---: |
-| Accuracy | 100% | 80% | 100% |
-| Hit@10 | 100% | 100% | 80% |
-| MRR | 0.900 | 0.700 | 0.640 |
-| NDCG | 0.856 | 0.737 | 0.632 |
-| Indexing, mean | 57m 9s | 5m 21s | 5m 49s |
-| Search, mean | 367 ms | 54 ms | 111 ms |
-| Search, p95 | 397 ms | 73 ms | 158 ms |
-| Context, mean | 822 tokens | 316 tokens | 11,122 tokens |
-| Ready RSS | Not measured | 214 MiB | 1,544 MiB |
-| Workload RSS, mean | Not measured | 286 MiB | 1,322 MiB |
-| Workload RSS, peak | Not measured | 445 MiB | 1,781 MiB |
-| Populated restart RSS | Not measured | 213 MiB | 1,017 MiB |
+| Measurement | Meaning | `supermemory-rs` | `supermemory-server` v0.0.5 | Better by |
+| --- | --- | ---: | ---: | --- |
+| Accuracy | Questions judged correct | 80% | 100% | `supermemory-server` by 20 percentage points |
+| Hit@10 | Questions with a relevant result in the top 10 | 100% | 80% | `supermemory-rs` by 20 percentage points |
+| MRR | How early the first relevant result appears | 0.700 | 0.640 | `supermemory-rs` by 9.4% |
+| NDCG | Overall ordering of relevant results | 0.737 | 0.632 | `supermemory-rs` by 16.6% |
+| Ingestion, mean | Time to accept a document | 47 ms | 1,900 ms | `supermemory-rs` 40.4x faster |
+| Indexing, mean | Time until submitted episodes finish indexing | 5m 21s | 5m 49s | `supermemory-rs` 8.1% faster |
+| Search, mean | Average search request time | 54 ms | 111 ms | `supermemory-rs` 2.06x faster |
+| Search, p95 | Time covering 95% of search requests | 73 ms | 158 ms | `supermemory-rs` 2.16x faster |
+| Context, mean | Retrieved tokens sent to the answer model | 316 tokens | 11,122 tokens | `supermemory-rs` uses 97.2% fewer |
+| Ready RSS | Memory after startup | 214 MiB | 1,544 MiB | `supermemory-rs` uses 7.2x less |
+| Workload RSS, mean | Average memory during the benchmark | 286 MiB | 1,322 MiB | `supermemory-rs` uses 4.6x less |
+| Workload RSS, peak | Highest memory during the benchmark | 445 MiB | 1,781 MiB | `supermemory-rs` uses 4.0x less |
+| Populated restart RSS | Memory after restarting with indexed data | 213 MiB | 1,017 MiB | `supermemory-rs` uses 4.8x less |
 
-Ten extraction workers brought indexing below the `supermemory-server` result. Current SQLite also searched faster and used 4 to 7 times less memory. Accuracy ranged from 80% to 100% across two runs with the same code, so this sample does not establish a stable quality difference.
+`supermemory-rs` was faster, retrieved relevant results more consistently, used less context, and used less memory. `supermemory-server` answered one more question correctly in the latest run. `supermemory-rs` scored 100% in another run with the same code, so five questions are not enough to establish a stable accuracy difference.
 
 Answer and judge latency are excluded because they measure external Gemini requests.
 
