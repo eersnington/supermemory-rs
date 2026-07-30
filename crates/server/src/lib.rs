@@ -2236,17 +2236,16 @@ fn validate_request(request: &CreateDocumentRequest) -> Result<(), ApiError> {
             "entityContext must be at most 1500 characters",
         ));
     }
-    if let Some(custom_id) = &request.custom_id {
-        if custom_id.chars().count() > 100
+    if let Some(custom_id) = &request.custom_id
+        && (custom_id.chars().count() > 100
             || custom_id.is_empty()
             || !custom_id
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-'))
-        {
-            return Err(ApiError::Validation(
-                "customId must be 1-100 characters containing only letters, numbers, _, :, or -",
-            ));
-        }
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-')))
+    {
+        return Err(ApiError::Validation(
+            "customId must be 1-100 characters containing only letters, numbers, _, :, or -",
+        ));
     }
     if request.filepath.as_deref() == Some("/profile.md") {
         return Err(ApiError::Validation("filepath /profile.md is reserved"));

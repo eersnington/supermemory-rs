@@ -29,7 +29,7 @@ fn claimed_job_becomes_searchable_only_after_atomic_completion() {
     assert!(storage.search("kingfisher", 10).expect("search").is_empty());
 
     storage
-        .complete_job(&job, &[job.content.clone()])
+        .complete_job(&job, std::slice::from_ref(&job.content))
         .expect("complete");
     let hits = storage.search("kingfisher", 10).expect("search");
     assert_eq!(hits.len(), 1);
@@ -45,14 +45,14 @@ fn reprocessing_replaces_old_searchable_content() {
     storage.upsert_document(value.clone()).expect("create");
     let first = storage.claim_job().expect("claim").expect("first job");
     storage
-        .complete_job(&first, &[first.content.clone()])
+        .complete_job(&first, std::slice::from_ref(&first.content))
         .expect("complete first");
 
     value.content = "second narwhal content".into();
     storage.upsert_document(value).expect("update");
     let second = storage.claim_job().expect("claim").expect("second job");
     storage
-        .complete_job(&second, &[second.content.clone()])
+        .complete_job(&second, std::slice::from_ref(&second.content))
         .expect("complete second");
 
     assert!(

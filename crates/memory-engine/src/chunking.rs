@@ -217,14 +217,13 @@ fn flush_units(chunks: &mut Vec<String>, pending: &mut Vec<&str>, separator: &st
     }
     let chunk = pending.join(separator).trim().to_owned();
     pending.clear();
-    if utf16_len(&chunk) < SHORT_CHUNK {
-        if let Some(previous) = chunks.last_mut() {
-            if utf16_len(previous) + utf16_len(separator) + utf16_len(&chunk) <= limit {
-                previous.push_str(separator);
-                previous.push_str(&chunk);
-                return;
-            }
-        }
+    if utf16_len(&chunk) < SHORT_CHUNK
+        && let Some(previous) = chunks.last_mut()
+        && utf16_len(previous) + utf16_len(separator) + utf16_len(&chunk) <= limit
+    {
+        previous.push_str(separator);
+        previous.push_str(&chunk);
+        return;
     }
     if !chunk.is_empty() {
         chunks.push(chunk);

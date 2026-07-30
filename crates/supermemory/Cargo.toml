@@ -11,12 +11,15 @@ path = "src/main.rs"
 
 [dependencies]
 aes-gcm.workspace = true
+anyhow.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 memory-engine = { path = "../memory-engine" }
 pbkdf2.workspace = true
+pglite-oxide.workspace = true
 rpassword.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 server = { path = "../server" }
 sha2.workspace = true
 storage = { path = "../storage" }

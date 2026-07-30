@@ -45,13 +45,11 @@ Run the checks from `compat/`. See [compatibility check instructions](../compat/
 
 ## Legacy migration
 
-The migration test decrypts a v0.0.5 `SMD1` snapshot, imports it into SQLite, and verifies `SME1` credential re-encryption without modifying the source.
+The migration test decrypts a v0.0.5 `SMD1` snapshot, opens it with the embedded PGlite engine, imports it into SQLite, and leaves the source unchanged. Startup requires no Node, npm, or migration sidecar.
 
 ```sh
 SUPERMEMORY_TEST_LEGACY=1 cargo test -p supermemory --test legacy --locked
 ```
-
-See [legacy migration instructions](../migration/README.md).
 
 ## SQLite vector search
 

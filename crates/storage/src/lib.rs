@@ -1439,7 +1439,7 @@ impl Storage {
             .map_err(StorageError::Read)
     }
 
-    /// Imports a stable JSONL export from the read-only legacy sidecar.
+    /// Imports a stable JSONL export from the read-only legacy database.
     ///
     /// Existing IDs are retained and duplicate rows make the operation idempotent.
     ///
@@ -1540,14 +1540,14 @@ impl Storage {
                 params![field(row, "document_id")?, integer_field(row, "position")?, field(row, "content")?, field(row, "id")?],
             ).map_err(StorageError::Write)?;
             report.chunks += changed;
-            if changed == 1 {
-                if let Some(vector) = vector_field(row, "embedding")? {
-                    let chunk_id = tx.last_insert_rowid();
-                    tx.execute(
-                        "INSERT INTO chunk_embeddings (chunk_id, model_id, dimensions, vector) VALUES (?1, ?2, ?3, ?4)",
-                        params![chunk_id, optional_field(row, "embedding_model").unwrap_or("legacy"), vector.len(), vector_bytes(&vector)],
-                    ).map_err(StorageError::Write)?;
-                }
+            if changed == 1
+                && let Some(vector) = vector_field(row, "embedding")?
+            {
+                let chunk_id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO chunk_embeddings (chunk_id, model_id, dimensions, vector) VALUES (?1, ?2, ?3, ?4)",
+                    params![chunk_id, optional_field(row, "embedding_model").unwrap_or("legacy"), vector.len(), vector_bytes(&vector)],
+                ).map_err(StorageError::Write)?;
             }
         }
         let mut pending_parents = Vec::new();

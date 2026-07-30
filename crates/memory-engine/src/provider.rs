@@ -307,7 +307,7 @@ impl MemoryProvider {
         } = config;
         let http_client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_mins(2))
             .build()
             .map_err(|error| ProviderError::Configuration(error.to_string()))?;
         let backend = match kind {

@@ -1,5 +1,5 @@
 #[test]
-fn legacy_snapshot_exports_with_matching_pglite_runtime() {
+fn legacy_snapshot_exports_with_embedded_pglite() {
     if std::env::var_os("SUPERMEMORY_TEST_LEGACY").is_none() {
         return;
     }
@@ -11,8 +11,7 @@ fn legacy_snapshot_exports_with_matching_pglite_runtime() {
         "supermemory-export-{}.jsonl",
         storage::generate_id().expect("id")
     ));
-    supermemory::legacy::export_snapshot(&legacy, &legacy.join("runtime/pglite"), &output)
-        .expect("legacy export");
+    supermemory::legacy::export_snapshot(&legacy, &output).expect("legacy export");
     let export = std::fs::read_to_string(&output).expect("export");
     assert!(
         export

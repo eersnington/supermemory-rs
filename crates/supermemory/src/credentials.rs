@@ -172,17 +172,15 @@ fn machine_ids(data_dir: &Path) -> Vec<String> {
             }
         }
     }
-    if ids.is_empty() {
-        if let Ok(output) = Command::new("/usr/sbin/ioreg")
+    if ids.is_empty()
+        && let Ok(output) = Command::new("/usr/sbin/ioreg")
             .args(["-rd1", "-c", "IOPlatformExpertDevice"])
             .output()
-        {
-            if output.status.success() {
-                let output = String::from_utf8_lossy(&output.stdout);
-                if let Some(uuid) = platform_uuid(&output) {
-                    push_unique(&mut ids, uuid);
-                }
-            }
+        && output.status.success()
+    {
+        let output = String::from_utf8_lossy(&output.stdout);
+        if let Some(uuid) = platform_uuid(&output) {
+            push_unique(&mut ids, uuid);
         }
     }
     if ids.is_empty() {

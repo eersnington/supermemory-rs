@@ -279,11 +279,7 @@ fn migrate_legacy_snapshot(
         "supermemory-legacy-export-{}.jsonl",
         storage::generate_id()?
     ));
-    legacy::export_snapshot(
-        legacy_data_dir,
-        &legacy_data_dir.join("runtime/pglite"),
-        &output,
-    )?;
+    legacy::export_snapshot(legacy_data_dir, &output)?;
     let import_result = storage.import_legacy_export(&output);
     let cleanup_result = std::fs::remove_file(&output);
     let report = import_result?;
