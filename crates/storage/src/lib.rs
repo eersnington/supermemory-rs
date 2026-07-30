@@ -11,7 +11,7 @@ use std::{
 use rusqlite::{
     Connection, OptionalExtension, TransactionBehavior, functions::FunctionFlags, params,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
@@ -73,9 +73,6 @@ pub struct ClaimedJob {
     pub document_id: String,
     pub content: String,
     pub revision: i64,
-    pub organization_id: String,
-    pub container_tag: String,
-    pub document_date: Option<String>,
 }
 
 /// A durable provider-extraction job claimed independently of document indexing.
@@ -134,7 +131,7 @@ pub struct SearchOptions {
 }
 
 /// Boolean metadata filter tree used by V3 and V4 search.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FilterExpression {
     And(Vec<FilterExpression>),
     Or(Vec<FilterExpression>),
@@ -142,7 +139,7 @@ pub enum FilterExpression {
 }
 
 /// One metadata comparison in a search filter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterCondition {
     pub key: String,
     pub value: String,
@@ -153,7 +150,7 @@ pub struct FilterCondition {
 }
 
 /// Comparison behavior for a metadata condition.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum FilterKind {
     Metadata,
     Numeric,
@@ -162,7 +159,7 @@ pub enum FilterKind {
 }
 
 /// Numeric comparison operator.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum NumericOperator {
     Greater,
     Less,
@@ -214,6 +211,15 @@ pub struct MemoryRecord {
     pub forget_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Selects optional context to batch-hydrate for ranked memory hits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryHydration {
+    /// Load parent, child, and related memory summaries.
+    pub relations: bool,
+    /// Load source-document summaries.
+    pub documents: bool,
 }
 
 /// Exact semantic memory search result.
@@ -434,19 +440,14 @@ impl Storage {
             .map_err(StorageError::Write)?;
         let job = tx
             .query_row(
-                "SELECT jobs.id, documents.id, documents.content, jobs.revision, documents.org_id, documents.container_tags, documents.metadata FROM jobs JOIN documents ON documents.id=jobs.document_id WHERE jobs.kind='document' AND jobs.status='queued' AND jobs.revision=documents.revision AND jobs.available_at <= CURRENT_TIMESTAMP ORDER BY jobs.created_at, jobs.rowid LIMIT 1",
+                "SELECT jobs.id, documents.id, documents.content, jobs.revision FROM jobs JOIN documents ON documents.id=jobs.document_id WHERE jobs.kind='document' AND jobs.status='queued' AND jobs.revision=documents.revision AND jobs.available_at <= CURRENT_TIMESTAMP ORDER BY jobs.created_at, jobs.rowid LIMIT 1",
                 [],
                 |row| {
-                    let tags: Vec<String> = parse_json(&row.get::<_, String>(5)?, 5)?;
-                    let metadata: Map<String, Value> = parse_json(&row.get::<_, String>(6)?, 6)?;
                     Ok(ClaimedJob {
                         id: row.get(0)?,
                         document_id: row.get(1)?,
                         content: row.get(2)?,
                         revision: row.get(3)?,
-                        organization_id: row.get(4)?,
-                        container_tag: tags.into_iter().next().unwrap_or_else(|| "sm_project_default".to_owned()),
-                        document_date: metadata.get("date").and_then(Value::as_str).map(str::to_owned),
                     })
                 },
             )
@@ -744,6 +745,20 @@ impl Storage {
         Ok(Some(job))
     }
 
+    /// Reports whether document or memory publication work is still active.
+    ///
+    /// # Errors
+    /// Returns an error when job state cannot be read.
+    pub fn has_active_processing_jobs(&self) -> Result<bool, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE status IN ('queued','extracting','chunking','embedding','indexing'))",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::Read)
+    }
+
     /// Returns current active memories used as provider extraction context.
     ///
     /// # Errors
@@ -777,19 +792,21 @@ impl Storage {
         job: &ClaimedMemoryJob,
         result: &str,
     ) -> Result<(), StorageError> {
-        let updated = self.connection.execute(
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        let updated = tx.execute(
             "UPDATE jobs SET extraction_result=?3, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status='extracting' AND EXISTS(SELECT 1 FROM documents WHERE id=jobs.document_id AND revision=jobs.revision)",
             params![job.id, job.revision, result],
         ).map_err(StorageError::Write)?;
         if updated == 1 {
-            Ok(())
-        } else {
-            Err(StorageError::StaleRevision {
-                document_id: job.document_id.clone(),
-                claimed: job.revision,
-                current: None,
-            })
+            return tx.commit().map_err(StorageError::Write);
         }
+        mark_memory_job_stale(&tx, job)?;
+        tx.commit().map_err(StorageError::Write)?;
+        Err(StorageError::StaleRevision {
+            document_id: job.document_id.clone(),
+            claimed: job.revision,
+            current: None,
+        })
     }
 
     /// Marks a memory job complete only while its claimed document revision is current.
@@ -816,7 +833,7 @@ impl Storage {
             return Ok(());
         }
         let jobs = tx.execute(
-            "UPDATE jobs SET status='done', last_error_kind=NULL, last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status='extracting'",
+            "UPDATE jobs SET status='done', extraction_result=NULL, last_error_kind=NULL, last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status='extracting'",
             params![job.id, job.revision],
         ).map_err(StorageError::Write)?;
         let documents = tx.execute(
@@ -845,12 +862,24 @@ impl Storage {
         retry_delay: Option<Duration>,
     ) -> Result<(), StorageError> {
         const MAX_ATTEMPTS: i64 = 4;
+        let tx = self.connection.transaction().map_err(StorageError::Write)?;
+        let current_revision = tx
+            .query_row(
+                "SELECT revision FROM documents WHERE id=?1",
+                [&job.document_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(StorageError::Read)?;
+        if current_revision != Some(job.revision) {
+            mark_memory_job_stale(&tx, job)?;
+            return tx.commit().map_err(StorageError::Write);
+        }
         let terminal = retry_delay.is_none() || job.attempts >= MAX_ATTEMPTS;
         let delay_seconds = retry_delay
             .map(|delay| delay.as_secs().max(1))
             .unwrap_or_default();
         let modifier = format!("+{delay_seconds} seconds");
-        let tx = self.connection.transaction().map_err(StorageError::Write)?;
         let status = if terminal { "failed" } else { "queued" };
         let updated = tx.execute(
             "UPDATE jobs SET status=?3, last_error_kind=?4, last_error=?5, available_at=datetime(CURRENT_TIMESTAMP, ?6), updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status='extracting'",
@@ -935,59 +964,44 @@ impl Storage {
             .as_deref()
             .unwrap_or(&self.local_org_id);
         let query_bytes = vector_bytes(query);
+        let container_tags = json(&options.container_tags)?;
+        let metadata_filter = options.filters.as_ref().map(json).transpose()?;
         let mut statement = self.connection.prepare(
-            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, cosine_similarity(chunk_embeddings.vector, ?1, ?2) AS score, document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.container_tags, documents.content FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?3 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?4 AND documents.status='done' AND (?5 IS NULL OR documents.id=?5 OR documents.custom_id=?5) AND cosine_similarity(chunk_embeddings.vector, ?1, ?2)>=?6 ORDER BY score DESC, documents.id, document_chunks.ordinal, document_chunks.stable_id",
+            "WITH filtered AS MATERIALIZED (SELECT document_chunks.stable_id, documents.id AS document_id, document_chunks.content AS chunk, chunk_embeddings.vector, document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.content AS document_content FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?3 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?4 AND documents.status='done' AND (?5='[]' OR EXISTS(SELECT 1 FROM json_each(documents.container_tags) stored JOIN json_each(?5) requested ON stored.value=requested.value)) AND (?6 IS NULL OR documents.id=?6 OR documents.custom_id=?6) AND (?7 IS NULL OR documents.filepath=?7 OR (substr(?7, -1)='/' AND substr(documents.filepath, 1, length(?7)-1)=substr(?7, 1, length(?7)-1))) AND (?8 IS NULL OR matches_metadata_filter(documents.metadata, ?8))), ranked AS MATERIALIZED (SELECT *, cosine_similarity(vector, ?1, ?2) AS score FROM filtered) SELECT stable_id, document_id, chunk, score, ordinal, custom_id, metadata, filepath, created_at, updated_at, document_content FROM ranked WHERE score>=?9 ORDER BY score DESC, document_id, ordinal, stable_id LIMIT ?10",
         ).map_err(StorageError::Read)?;
-        let rows = statement
+        statement
             .query_map(
                 params![
                     query_bytes,
                     dimensions,
                     model_id,
                     organization_id,
+                    container_tags,
                     options.document_id,
-                    threshold
+                    options.filepath,
+                    metadata_filter,
+                    threshold,
+                    limit
                 ],
                 |row| {
-                    Ok((
-                        SearchHit {
-                            id: row.get(0)?,
-                            document_id: row.get(1)?,
-                            chunk: row.get(2)?,
-                            score: row.get(3)?,
-                            position: row.get(4)?,
-                            custom_id: row.get(5)?,
-                            metadata: parse_json(&row.get::<_, String>(6)?, 6)?,
-                            filepath: row.get(7)?,
-                            created_at: row.get(8)?,
-                            updated_at: row.get(9)?,
-                            document_content: row.get(11)?,
-                        },
-                        row.get::<_, String>(10)?,
-                    ))
+                    Ok(SearchHit {
+                        id: row.get(0)?,
+                        document_id: row.get(1)?,
+                        chunk: row.get(2)?,
+                        score: row.get(3)?,
+                        position: row.get(4)?,
+                        custom_id: row.get(5)?,
+                        metadata: parse_json(&row.get::<_, String>(6)?, 6)?,
+                        filepath: row.get(7)?,
+                        created_at: row.get(8)?,
+                        updated_at: row.get(9)?,
+                        document_content: row.get(10)?,
+                    })
                 },
             )
-            .map_err(StorageError::Read)?;
-        let mut hits = Vec::new();
-        for row in rows {
-            let (hit, container_tags) = row.map_err(StorageError::Read)?;
-            let container_tags: Vec<String> = serde_json::from_str(&container_tags)
-                .map_err(StorageError::DeserializeSearchData)?;
-            if matches_search_options(
-                &hit.document_id,
-                hit.custom_id.as_deref(),
-                &container_tags,
-                hit.filepath.as_deref(),
-                &hit.metadata,
-                options,
-            ) {
-                hits.push(hit);
-                if hits.len() == limit {
-                    break;
-                }
-            }
-        }
-        Ok(hits)
+            .map_err(StorageError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Read)
     }
 
     /// Reconciles extracted memories, lineage, sources, and vectors in one transaction.
@@ -1064,18 +1078,18 @@ impl Storage {
             });
         }
         let mut temporary_ids = HashMap::new();
+        let mut exact_memories = active_memory_ids_by_content(&tx, &org_id, container_tag)?;
         let mut record_ids = Vec::new();
         for proposal in proposals {
-            if let Some(existing) =
-                find_exact_memory(&tx, &org_id, container_tag, &proposal.content)?
-            {
+            let normalized_content = normalized_memory(&proposal.content);
+            if let Some(existing_id) = exact_memories.get(&normalized_content).cloned() {
                 tx.execute(
                     "INSERT OR IGNORE INTO memory_sources (memory_id, document_id) VALUES (?1, ?2)",
-                    params![existing.id, document_id],
+                    params![existing_id, document_id],
                 )
                 .map_err(StorageError::Write)?;
-                temporary_ids.insert(proposal.temporary_id.clone(), existing.id.clone());
-                record_ids.push(existing.id);
+                temporary_ids.insert(proposal.temporary_id.clone(), existing_id.clone());
+                record_ids.push(existing_id);
                 continue;
             }
             let parents = resolve_memory_parents(
@@ -1132,6 +1146,7 @@ impl Storage {
             )
             .map_err(StorageError::Write)?;
             temporary_ids.insert(proposal.temporary_id.clone(), id.clone());
+            exact_memories.insert(normalized_content, id.clone());
             record_ids.push(id);
         }
         let records = record_ids
@@ -1140,7 +1155,7 @@ impl Storage {
             .collect::<Result<Vec<_>, _>>()?;
         if let Some(job_id) = completion_job_id {
             let jobs = tx.execute(
-                "UPDATE jobs SET status='done', last_error_kind=NULL, last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND document_id=?2 AND revision=?3 AND status='extracting'",
+                "UPDATE jobs SET status='done', extraction_result=NULL, last_error_kind=NULL, last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND document_id=?2 AND revision=?3 AND status='extracting'",
                 params![job_id, document_id, source_revision],
             ).map_err(StorageError::Write)?;
             let documents = tx.execute(
@@ -1351,6 +1366,10 @@ impl Storage {
             limit,
             threshold,
             include_forgotten,
+            MemoryHydration {
+                relations: true,
+                documents: true,
+            },
         )
     }
 
@@ -1368,11 +1387,12 @@ impl Storage {
         limit: usize,
         threshold: f32,
         include_forgotten: bool,
+        hydration: MemoryHydration,
     ) -> Result<Vec<MemorySearchHit>, StorageError> {
         validate_vector(query, query.len())?;
         let query_bytes = vector_bytes(query);
         let mut statement = self.connection.prepare(
-            "SELECT memories.id, memories.content, memories.metadata, memories.is_inferred, memories.is_static, memories.is_latest, memories.is_forgotten, memories.root_memory_id, memories.parent_memory_id, memories.version, memories.forget_after, memories.forget_reason, memories.created_at, memories.updated_at, cosine_similarity(memory_embeddings.vector, ?1, ?2) AS similarity FROM memory_embeddings JOIN memories ON memories.id=memory_embeddings.memory_id WHERE memories.org_id=?3 AND memories.container_tag=?4 AND memory_embeddings.model_id=?5 AND memory_embeddings.dimensions=?2 AND (memory_embeddings.active=1 OR ?6=1) AND (memories.is_latest=1 OR ?6=1) AND (memories.is_forgotten=0 OR ?6=1) AND (memories.forget_after IS NULL OR datetime(memories.forget_after)>CURRENT_TIMESTAMP OR ?6=1) AND cosine_similarity(memory_embeddings.vector, ?1, ?2)>=?7 ORDER BY similarity DESC, memories.id LIMIT ?8",
+            "WITH ranked AS MATERIALIZED (SELECT memories.id, memories.content, memories.metadata, memories.is_inferred, memories.is_static, memories.is_latest, memories.is_forgotten, memories.root_memory_id, memories.parent_memory_id, memories.version, memories.forget_after, memories.forget_reason, memories.created_at, memories.updated_at, cosine_similarity(memory_embeddings.vector, ?1, ?2) AS similarity FROM memory_embeddings JOIN memories ON memories.id=memory_embeddings.memory_id WHERE memories.org_id=?3 AND memories.container_tag=?4 AND memory_embeddings.model_id=?5 AND memory_embeddings.dimensions=?2 AND (memory_embeddings.active=1 OR ?6=1) AND (memories.is_latest=1 OR ?6=1) AND (memories.is_forgotten=0 OR ?6=1) AND (memories.forget_after IS NULL OR datetime(memories.forget_after)>CURRENT_TIMESTAMP OR ?6=1)) SELECT * FROM ranked WHERE similarity>=?7 ORDER BY similarity DESC, id LIMIT ?8",
         ).map_err(StorageError::Read)?;
         let rows = statement
             .query_map(
@@ -1401,7 +1421,7 @@ impl Storage {
         let mut hits = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(StorageError::Read)?;
-        hydrate_memory_hits(&self.connection, &mut hits)?;
+        hydrate_memory_hits(&self.connection, &mut hits, hydration)?;
         Ok(hits)
     }
 
@@ -1719,11 +1739,20 @@ fn apply_existing(
         if metadata_equivalent(&existing.document.metadata, &input.metadata) {
             return Ok(UpsertResult {
                 id,
-                status: "done".to_owned(),
+                status: status.to_owned(),
                 enqueued: false,
             });
         }
         let metadata = merge_metadata(&existing.document.metadata, &input.metadata);
+        if status == "indexing" {
+            update_full(tx, &id, input, hash, &metadata, "queued")?;
+            let enqueued = enqueue_unless_active(tx, &id)?;
+            return Ok(UpsertResult {
+                id,
+                status: "queued".to_owned(),
+                enqueued,
+            });
+        }
         tx.execute(
             "UPDATE documents SET metadata = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
             params![id, json(&metadata)?],
@@ -1731,7 +1760,7 @@ fn apply_existing(
         .map_err(StorageError::Write)?;
         return Ok(UpsertResult {
             id,
-            status: "done".to_owned(),
+            status: status.to_owned(),
             enqueued: false,
         });
     }
@@ -1777,7 +1806,24 @@ fn update_full(
         "UPDATE documents SET content=?2, content_hash=?3, custom_id=?4, status=?5, container_tags=?6, entity_context=?7, metadata=?8, task_type=?9, filepath=?10, filter_by_metadata=?11, dreaming=?12, revision=revision+1, updated_at=CURRENT_TIMESTAMP WHERE id=?1",
         params![id, input.content, hash, input.custom_id, status, json(&input.container_tags)?, input.entity_context, json(metadata)?, input.task_type, input.filepath, json(&input.filter_by_metadata)?, input.dreaming],
     ).map_err(StorageError::Write)?;
+    tx.execute(
+        "UPDATE jobs SET status='failed', last_error_kind='stale_revision', last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE document_id=?1 AND kind='memory' AND revision<>(SELECT revision FROM documents WHERE id=?1) AND status IN ('queued','extracting','chunking','embedding','indexing')",
+        [id],
+    )
+    .map_err(StorageError::Write)?;
     Ok(())
+}
+
+fn mark_memory_job_stale(
+    tx: &rusqlite::Transaction<'_>,
+    job: &ClaimedMemoryJob,
+) -> Result<(), StorageError> {
+    tx.execute(
+        "UPDATE jobs SET status='failed', last_error_kind='stale_revision', last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND revision=?2 AND status IN ('queued','extracting','chunking','embedding','indexing')",
+        params![job.id, job.revision],
+    )
+    .map(|_| ())
+    .map_err(StorageError::Write)
 }
 
 fn enqueue_unless_active(
@@ -2045,44 +2091,6 @@ fn vector_bytes(vector: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn matches_search_options(
-    document_id: &str,
-    custom_id: Option<&str>,
-    container_tags: &[String],
-    filepath: Option<&str>,
-    metadata: &Map<String, Value>,
-    options: &SearchOptions,
-) -> bool {
-    if options
-        .document_id
-        .as_deref()
-        .is_some_and(|wanted| wanted != document_id && Some(wanted) != custom_id)
-    {
-        return false;
-    }
-    if !options.container_tags.is_empty()
-        && !options
-            .container_tags
-            .iter()
-            .any(|wanted| container_tags.contains(wanted))
-    {
-        return false;
-    }
-    if options.filepath.as_deref().is_some_and(|wanted| {
-        if let Some(prefix) = wanted.strip_suffix('/') {
-            !filepath.is_some_and(|actual| actual.starts_with(prefix))
-        } else {
-            filepath != Some(wanted)
-        }
-    }) {
-        return false;
-    }
-    options
-        .filters
-        .as_ref()
-        .is_none_or(|filter| matches_filter(filter, metadata))
-}
-
 struct ResolvedParent {
     id: String,
     relation: String,
@@ -2124,26 +2132,27 @@ fn resolve_memory_parents(
     Ok(result)
 }
 
-fn find_exact_memory(
+fn active_memory_ids_by_content(
     connection: &Connection,
     org_id: &str,
     container_tag: &str,
-    content: &str,
-) -> Result<Option<MemoryRecord>, StorageError> {
-    let wanted = normalized_memory(content);
-    let mut statement = connection.prepare(
-        "SELECT id, content, metadata, is_inferred, is_static, is_latest, is_forgotten, root_memory_id, parent_memory_id, version, forget_after, forget_reason, created_at, updated_at FROM memories WHERE org_id=?1 AND container_tag=?2 AND is_latest=1 AND is_forgotten=0 ORDER BY rowid",
-    ).map_err(StorageError::Read)?;
-    let rows = statement
-        .query_map(params![org_id, container_tag], read_memory)
+) -> Result<HashMap<String, String>, StorageError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, content FROM memories WHERE org_id=?1 AND container_tag=?2 AND is_latest=1 AND is_forgotten=0 ORDER BY version DESC, updated_at DESC, id",
+        )
         .map_err(StorageError::Read)?;
+    let rows = statement
+        .query_map(params![org_id, container_tag], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(StorageError::Read)?;
+    let mut memories = HashMap::new();
     for row in rows {
-        let memory = row.map_err(StorageError::Read)?;
-        if normalized_memory(&memory.memory) == wanted {
-            return Ok(Some(memory));
-        }
+        let (id, content) = row.map_err(StorageError::Read)?;
+        memories.entry(normalized_memory(&content)).or_insert(id);
     }
-    Ok(None)
+    Ok(memories)
 }
 
 fn read_memory_by_id(connection: &Connection, id: &str) -> Result<MemoryRecord, StorageError> {
@@ -2179,56 +2188,68 @@ fn read_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
 fn hydrate_memory_hits(
     connection: &Connection,
     hits: &mut [MemorySearchHit],
+    hydration: MemoryHydration,
 ) -> Result<(), StorageError> {
-    if hits.is_empty() {
+    if hits.is_empty() || (!hydration.relations && !hydration.documents) {
         return Ok(());
     }
     let ids = hits
         .iter()
         .map(|hit| hit.record.id.clone())
         .collect::<Vec<_>>();
+    let positions = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.clone(), index))
+        .collect::<HashMap<_, _>>();
     let placeholders = std::iter::repeat_n("?", ids.len())
         .collect::<Vec<_>>()
         .join(",");
-    for (parents, owner_column, related_column) in [
-        (true, "child_id", "parent_id"),
-        (false, "parent_id", "child_id"),
-    ] {
-        let sql = format!(
-            "SELECT memory_relations.{owner_column}, memory_relations.relation, memories.version, memories.content, memories.metadata, memories.updated_at FROM memory_relations JOIN memories ON memories.id=memory_relations.{related_column} WHERE memory_relations.{owner_column} IN ({placeholders}) ORDER BY memories.version, memories.updated_at, memories.id"
-        );
-        let mut statement = connection.prepare(&sql).map_err(StorageError::Read)?;
-        let rows = statement
-            .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
-                let metadata: String = row.get(4)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    MemoryRelationHit {
-                        relation: row.get(1)?,
-                        version: row.get(2)?,
-                        memory: row.get(3)?,
-                        metadata: parse_json(&metadata, 4)?,
-                        updated_at: row.get(5)?,
-                    },
-                ))
-            })
-            .map_err(StorageError::Read)?;
-        for row in rows {
-            let (owner, relation) = row.map_err(StorageError::Read)?;
-            if let Some(hit) = hits.iter_mut().find(|hit| hit.record.id == owner) {
-                if matches!(relation.relation.as_str(), "extends" | "derives") {
-                    hit.related.push(relation.clone());
-                }
-                if parents {
-                    hit.parents.push(relation);
-                } else {
-                    hit.children.push(relation);
+    if hydration.relations {
+        for (parents, owner_column, related_column) in [
+            (true, "child_id", "parent_id"),
+            (false, "parent_id", "child_id"),
+        ] {
+            let sql = format!(
+                "SELECT owner_id, relation, version, content, metadata, updated_at FROM (SELECT memory_relations.{owner_column} AS owner_id, memory_relations.relation, memories.version, memories.content, memories.metadata, memories.updated_at, ROW_NUMBER() OVER (PARTITION BY memory_relations.{owner_column} ORDER BY memories.version, memories.updated_at, memories.id) AS relation_rank FROM memory_relations JOIN memories ON memories.id=memory_relations.{related_column} WHERE memory_relations.{owner_column} IN ({placeholders})) WHERE relation_rank<=2 ORDER BY version, updated_at"
+            );
+            let mut statement = connection.prepare(&sql).map_err(StorageError::Read)?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                    let metadata: String = row.get(4)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        MemoryRelationHit {
+                            relation: row.get(1)?,
+                            version: row.get(2)?,
+                            memory: row.get(3)?,
+                            metadata: parse_json(&metadata, 4)?,
+                            updated_at: row.get(5)?,
+                        },
+                    ))
+                })
+                .map_err(StorageError::Read)?;
+            for row in rows {
+                let (owner, relation) = row.map_err(StorageError::Read)?;
+                if let Some(index) = positions.get(&owner) {
+                    let hit = &mut hits[*index];
+                    if matches!(relation.relation.as_str(), "extends" | "derives") {
+                        hit.related.push(relation.clone());
+                    }
+                    if parents {
+                        hit.parents.push(relation);
+                    } else {
+                        hit.children.push(relation);
+                    }
                 }
             }
         }
     }
+    if !hydration.documents {
+        return Ok(());
+    }
     let sql = format!(
-        "SELECT memory_sources.memory_id, COALESCE(documents.custom_id, documents.id), documents.title, documents.document_type, documents.metadata, documents.summary, documents.created_at, documents.updated_at FROM memory_sources JOIN documents ON documents.id=memory_sources.document_id WHERE memory_sources.memory_id IN ({placeholders}) ORDER BY memory_sources.created_at, documents.id"
+        "SELECT memory_id, document_id, title, document_type, metadata, summary, created_at, updated_at FROM (SELECT memory_sources.memory_id, COALESCE(documents.custom_id, documents.id) AS document_id, documents.title, documents.document_type, documents.metadata, documents.summary, documents.created_at, documents.updated_at, ROW_NUMBER() OVER (PARTITION BY memory_sources.memory_id ORDER BY memory_sources.created_at, documents.id) AS source_rank FROM memory_sources JOIN documents ON documents.id=memory_sources.document_id WHERE memory_sources.memory_id IN ({placeholders})) WHERE source_rank=1"
     );
     let mut statement = connection.prepare(&sql).map_err(StorageError::Read)?;
     let rows = statement
@@ -2250,8 +2271,8 @@ fn hydrate_memory_hits(
         .map_err(StorageError::Read)?;
     for row in rows {
         let (owner, document) = row.map_err(StorageError::Read)?;
-        if let Some(hit) = hits.iter_mut().find(|hit| hit.record.id == owner) {
-            hit.documents.push(document);
+        if let Some(index) = positions.get(&owner) {
+            hits[*index].documents.push(document);
         }
     }
     Ok(())
@@ -2291,18 +2312,12 @@ fn deduplicate_memories(
 }
 
 fn normalized_memory(memory: &str) -> String {
-    let mut normalized = String::new();
-    let mut whitespace = false;
-    for character in memory.to_lowercase().chars() {
-        if character.is_alphanumeric() || character == '_' {
-            normalized.push(character);
-            whitespace = false;
-        } else if character.is_whitespace() && !whitespace && !normalized.is_empty() {
-            normalized.push(' ');
-            whitespace = true;
-        }
-    }
-    normalized.trim().to_owned()
+    memory
+        .to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn matches_filter(filter: &FilterExpression, metadata: &Map<String, Value>) -> bool {
@@ -2492,12 +2507,17 @@ fn initialize(connection: &mut Connection) -> Result<String, StorageError> {
     )
     .map_err(StorageError::Migrate)?;
     tx.execute(
-        "UPDATE documents SET status='queued', updated_at=CURRENT_TIMESTAMP WHERE id IN (SELECT document_id FROM jobs WHERE kind='document' AND status='queued') AND status IN ('extracting','chunking','embedding','indexing')",
+        "UPDATE jobs SET status='failed', last_error_kind='stale_revision', last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE kind='memory' AND status='queued' AND NOT EXISTS(SELECT 1 FROM documents WHERE documents.id=jobs.document_id AND documents.revision=jobs.revision)",
         [],
     )
     .map_err(StorageError::Migrate)?;
     tx.execute(
-        "UPDATE documents SET status='indexing', updated_at=CURRENT_TIMESTAMP WHERE id IN (SELECT document_id FROM jobs WHERE kind='memory' AND status='queued') AND status IN ('extracting','chunking','embedding','indexing')",
+        "UPDATE documents SET status='queued', updated_at=CURRENT_TIMESTAMP WHERE EXISTS(SELECT 1 FROM jobs WHERE jobs.document_id=documents.id AND jobs.revision=documents.revision AND jobs.kind='document' AND jobs.status='queued') AND status IN ('extracting','chunking','embedding','indexing')",
+        [],
+    )
+    .map_err(StorageError::Migrate)?;
+    tx.execute(
+        "UPDATE documents SET status='indexing', updated_at=CURRENT_TIMESTAMP WHERE EXISTS(SELECT 1 FROM jobs WHERE jobs.document_id=documents.id AND jobs.revision=documents.revision AND jobs.kind='memory' AND jobs.status='queued') AND status IN ('extracting','chunking','embedding','indexing')",
         [],
     )
     .map_err(StorageError::Migrate)?;
@@ -2757,6 +2777,22 @@ fn register_vector_functions(connection: &Connection) -> Result<(), StorageError
                 Ok(dot / norm)
             },
         )
+        .map_err(StorageError::Configure)?;
+    connection
+        .create_scalar_function(
+            "matches_metadata_filter",
+            2,
+            FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+            |context| {
+                let metadata =
+                    serde_json::from_str::<Map<String, Value>>(&context.get::<String>(0)?)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                let filter =
+                    serde_json::from_str::<FilterExpression>(&context.get::<String>(1)?)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                Ok(matches_filter(&filter, &metadata))
+            },
+        )
         .map_err(StorageError::Configure)
 }
 
@@ -2856,8 +2892,6 @@ pub enum StorageError {
     NonFiniteVector,
     #[error("embedding has invalid L2 norm {norm}; expected a normalized vector")]
     InvalidVectorNorm { norm: f32 },
-    #[error("stored embedding contains {actual} bytes, expected {expected}; rebuild this vector")]
-    MalformedStoredVector { expected: usize, actual: usize },
     #[error(
         "document {document_id} revision {claimed} is stale; current revision is {current:?}; no searchable data was changed"
     )]
@@ -2897,16 +2931,17 @@ impl StorageError {
                 error,
                 rusqlite::Error::SqliteFailure(sqlite_error, _)
                     if sqlite_error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FUNCTION
-            ) || matches!(
-                error.sqlite_error_code(),
-                Some(
-                    rusqlite::ErrorCode::DatabaseCorrupt
-                        | rusqlite::ErrorCode::NotADatabase
-                        | rusqlite::ErrorCode::SystemIoFailure
-                        | rusqlite::ErrorCode::DiskFull
-                        | rusqlite::ErrorCode::CannotOpen
+            ) || matches!(error, rusqlite::Error::FromSqlConversionFailure(_, _, _))
+                || matches!(
+                    error.sqlite_error_code(),
+                    Some(
+                        rusqlite::ErrorCode::DatabaseCorrupt
+                            | rusqlite::ErrorCode::NotADatabase
+                            | rusqlite::ErrorCode::SystemIoFailure
+                            | rusqlite::ErrorCode::DiskFull
+                            | rusqlite::ErrorCode::CannotOpen
+                    )
                 )
-            )
         }
         match self {
             Self::Open(_)
@@ -2914,7 +2949,6 @@ impl StorageError {
             | Self::Migrate(_)
             | Self::MalformedSchema { .. }
             | Self::DeserializeSearchData(_)
-            | Self::MalformedStoredVector { .. }
             | Self::Read(rusqlite::Error::UserFunctionError(_)) => true,
             Self::Write(error) | Self::Read(error) => fatal_sqlite(error),
             _ => false,

@@ -541,10 +541,11 @@ fn normalize_candidate(candidate: RawMemoryCandidate) -> Result<MemoryCandidate,
 
 fn normalized_memory(memory: &str) -> String {
     memory
-        .chars()
-        .flat_map(char::to_lowercase)
-        .filter(|character| character.is_alphanumeric())
-        .collect()
+        .to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn extraction_prompt(
@@ -694,7 +695,8 @@ mod tests {
         let response: RawExtractionResponse = serde_json::from_str(
             r#"[
                 {"tmpId":"tmp_1","memory":"The user prefers SQLite."},
-                {"tmpId":"tmp_2","memory":"the user prefers sqlite"}
+                {"tmpId":"tmp_2","memory":"the user prefers sqlite"},
+                {"tmpId":"tmp_3","memory":"The user prefers sql itemization"}
             ]"#,
         )
         .expect("array output");
@@ -703,7 +705,7 @@ mod tests {
             normalize_candidates(response)
                 .expect("valid extraction")
                 .len(),
-            1
+            2
         );
     }
 

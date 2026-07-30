@@ -1,5 +1,5 @@
 use serde_json::{Map, json};
-use storage::{MemoryParent, MemoryProposal, Storage, UpsertDocument};
+use storage::{MemoryHydration, MemoryParent, MemoryProposal, Storage, UpsertDocument};
 
 fn document() -> UpsertDocument {
     UpsertDocument {
@@ -72,6 +72,40 @@ fn reconciliation_builds_version_lineage_and_invalidates_update_parent() {
         .expect("profile");
     assert_eq!(profile.len(), 1);
     assert_eq!(profile[0].id, memories[1].id);
+
+    let organization = storage.local_organization_id().to_owned();
+    let shallow = storage
+        .search_memories_for(
+            &organization,
+            &[0.8, 0.6],
+            "fixture-model",
+            "sm_project_default",
+            10,
+            0.0,
+            false,
+            MemoryHydration::default(),
+        )
+        .expect("shallow search");
+    assert!(shallow[0].parents.is_empty());
+    assert!(shallow[0].documents.is_empty());
+
+    let hydrated = storage
+        .search_memories_for(
+            &organization,
+            &[0.8, 0.6],
+            "fixture-model",
+            "sm_project_default",
+            10,
+            0.0,
+            false,
+            MemoryHydration {
+                relations: true,
+                documents: true,
+            },
+        )
+        .expect("hydrated search");
+    assert_eq!(hydrated[0].parents.len(), 1);
+    assert_eq!(hydrated[0].documents.len(), 1);
 }
 
 #[test]
@@ -98,11 +132,13 @@ fn exact_duplicate_reuses_memory_and_adds_source_idempotently() {
             2,
         )
         .expect("first");
+    let mut equivalent = proposal;
+    equivalent.content = "A_stable fact".to_owned();
     let second = storage
         .reconcile_memories(
             &document.id,
             "sm_project_default",
-            &[proposal],
+            &[equivalent],
             "fixture-model",
             2,
         )

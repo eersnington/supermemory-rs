@@ -1,5 +1,8 @@
-use serde_json::Map;
-use storage::{EmbeddedChunk, MemoryProposal, Storage, StorageError, UpsertDocument, generate_id};
+use serde_json::{Map, json};
+use storage::{
+    EmbeddedChunk, FilterCondition, FilterExpression, FilterKind, MemoryProposal, NumericOperator,
+    SearchOptions, Storage, StorageError, UpsertDocument, generate_id,
+};
 
 fn input(content: &str) -> UpsertDocument {
     UpsertDocument {
@@ -154,6 +157,107 @@ fn normalized_vectors_are_published_and_ranked_exactly() {
 }
 
 #[test]
+fn semantic_filters_run_before_ranking_and_limiting() {
+    let mut storage = Storage::in_memory().expect("storage");
+    for (content, tags, filepath, topic, vector) in [
+        (
+            "matching filtered chunk",
+            vec!["first".into(), "wanted".into()],
+            "folder/match.txt",
+            "target",
+            [1.0, 0.0],
+        ),
+        (
+            "higher scoring but filtered chunk",
+            vec!["first".into()],
+            "other/nope.txt",
+            "other",
+            [1.0, 0.0],
+        ),
+    ] {
+        let mut value = input(content);
+        value.container_tags = tags;
+        value.filepath = Some(filepath.into());
+        value.metadata.insert("topic".into(), json!(topic));
+        storage.upsert_document(value).expect("document");
+        let job = storage.claim_job().expect("claim").expect("job");
+        storage
+            .complete_embedded_job(
+                &job,
+                &[EmbeddedChunk {
+                    content: &job.content,
+                    vector: &vector,
+                }],
+                "fixture-model",
+                2,
+            )
+            .expect("publish");
+    }
+
+    let hits = storage
+        .search_semantic(
+            &[1.0, 0.0],
+            "fixture-model",
+            1,
+            0.0,
+            &SearchOptions {
+                container_tags: vec!["wanted".into()],
+                filepath: Some("folder/".into()),
+                filters: Some(FilterExpression::Condition(FilterCondition {
+                    key: "topic".into(),
+                    value: "target".into(),
+                    kind: FilterKind::Metadata,
+                    numeric_operator: NumericOperator::Equal,
+                    negate: false,
+                    ignore_case: false,
+                })),
+                ..SearchOptions::default()
+            },
+        )
+        .expect("filtered semantic search");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].chunk, "matching filtered chunk");
+}
+
+#[test]
+fn active_processing_jobs_cover_document_and_memory_publication() {
+    let mut storage = Storage::in_memory().expect("storage");
+    storage
+        .upsert_document(input("queue drain source"))
+        .expect("document");
+    assert!(
+        storage
+            .has_active_processing_jobs()
+            .expect("active document")
+    );
+
+    let document_job = storage.claim_job().expect("claim").expect("document job");
+    let mut vector = vec![0.0; 768];
+    vector[0] = 1.0;
+    storage
+        .complete_embedded_job_with_memory_extraction(
+            &document_job,
+            &[EmbeddedChunk {
+                content: &document_job.content,
+                vector: &vector,
+            }],
+            "fixture-model",
+            768,
+        )
+        .expect("schedule extraction");
+    assert!(storage.has_active_processing_jobs().expect("active memory"));
+
+    let memory_job = storage
+        .claim_memory_job()
+        .expect("claim memory")
+        .expect("memory job");
+    storage
+        .complete_memory_job(&memory_job)
+        .expect("complete memory");
+    assert!(!storage.has_active_processing_jobs().expect("drained queue"));
+}
+
+#[test]
 fn interrupted_memory_job_reuses_cached_extraction_after_restart() {
     let path = std::env::temp_dir().join(format!(
         "supermemory-memory-recovery-{}.db",
@@ -222,17 +326,29 @@ fn memory_extraction_does_not_block_a_new_document_revision() {
         )
         .expect("schedule extraction");
 
-    value.content = "replacement extraction source".into();
-    let update = storage.upsert_document(value).expect("update");
+    let memory_job = storage
+        .claim_memory_job()
+        .expect("claim memory")
+        .expect("memory job");
+    let unchanged = storage.upsert_document(value.clone()).expect("same upsert");
+    assert!(!unchanged.enqueued);
+    assert_eq!(unchanged.status, "indexing");
+
+    value.metadata.insert("date".into(), json!("2026-07-30"));
+    let update = storage.upsert_document(value).expect("metadata update");
     assert!(update.enqueued);
     assert_eq!(update.status, "queued");
+    assert!(matches!(
+        storage.cache_memory_extraction(&memory_job, "[]"),
+        Err(StorageError::StaleRevision { .. })
+    ));
     assert_eq!(
         storage
             .claim_job()
             .expect("claim replacement")
             .expect("job")
             .content,
-        "replacement extraction source"
+        "first extraction source"
     );
 }
 

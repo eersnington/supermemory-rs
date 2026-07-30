@@ -31,6 +31,9 @@ pub type SharedStorage = Arc<Mutex<Storage>>;
 
 type SharedHealth = Arc<ServiceHealth>;
 
+const MEMORY_WORKER_CONCURRENCY: usize = 10;
+const SEARCH_CONNECTIONS: usize = 5;
+
 #[derive(Clone, Copy)]
 struct FatalApiFailure;
 
@@ -99,20 +102,43 @@ fn router_with_health(
     port: u16,
     health: SharedHealth,
 ) -> Router {
-    let (local_org_id, mut api_keys, search_connections) = storage.lock().map_or_else(
-        |_| (String::new(), Vec::new(), Vec::new()),
-        |storage| {
+    let (local_org_id, mut api_keys, search_connections) = match storage.lock() {
+        Err(_) => {
+            health.degrade();
+            (String::new(), Vec::new(), Vec::new())
+        }
+        Ok(storage) => {
             let local = storage.local_organization_id().to_owned();
-            let imported = storage
-                .api_key_identities()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(hash, org)| (hash, org.unwrap_or_else(|| local.clone())))
-                .collect();
-            let readers = (0..4).filter_map(|_| storage.fork().ok()).collect();
+            let imported = match storage.api_key_identities() {
+                Ok(identities) => identities
+                    .into_iter()
+                    .map(|(hash, org)| (hash, org.unwrap_or_else(|| local.clone())))
+                    .collect(),
+                Err(error) => {
+                    if error.is_fatal() {
+                        health.degrade();
+                    }
+                    tracing::error!(%error, "failed to load API key identities");
+                    Vec::new()
+                }
+            };
+            let mut readers = Vec::with_capacity(SEARCH_CONNECTIONS);
+            for _ in 0..SEARCH_CONNECTIONS {
+                match storage.fork() {
+                    Ok(reader) => readers.push(reader),
+                    Err(storage::StorageError::CannotForkInMemory) => break,
+                    Err(error) => {
+                        if error.is_fatal() {
+                            health.degrade();
+                        }
+                        tracing::error!(%error, "failed to open SQLite search connection");
+                        break;
+                    }
+                }
+            }
             (local, imported, readers)
-        },
-    );
+        }
+    };
     if let Some(key) = api_key.as_ref() {
         api_keys.push((Sha256::digest(key).into(), local_org_id.clone()));
     }
@@ -296,17 +322,25 @@ pub async fn serve_with_services_ready(
         provider.as_ref().map(Arc::clone),
         Arc::clone(&health),
     ));
-    let memory_worker = provider
+    let memory_workers = provider
         .as_ref()
         .zip(embeddings.as_ref())
         .map(|(provider, embeddings)| {
-            tokio::spawn(memory_worker_loop(
-                Arc::clone(&storage),
-                Arc::clone(embeddings),
-                Arc::clone(provider),
-                Arc::clone(&health),
-            ))
-        });
+            let queue_dirty = Arc::new(AtomicBool::new(false));
+            (0..MEMORY_WORKER_CONCURRENCY)
+                .map(|index| {
+                    tokio::spawn(memory_worker_loop(
+                        Arc::clone(&storage),
+                        Arc::clone(embeddings),
+                        Arc::clone(provider),
+                        Arc::clone(&health),
+                        Arc::clone(&queue_dirty),
+                        index == 0,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let result = axum::serve(
         listener,
         router_with_health(api_key, storage, embeddings, address.port(), health)
@@ -316,7 +350,7 @@ pub async fn serve_with_services_ready(
     .await
     .map_err(ServerError::Serve);
     worker.abort();
-    if let Some(worker) = memory_worker {
+    for worker in memory_workers {
         worker.abort();
     }
     result
@@ -546,6 +580,40 @@ struct V3ChunkResult {
     position: usize,
 }
 
+/// Runs one read operation on a pooled `SQLite` reader, falling back to the writer in memory.
+async fn run_search<T, F>(state: &AppState, run: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&Storage) -> Result<T, ApiError> + Send + 'static,
+{
+    let storage = Arc::clone(&state.storage);
+    let connections = Arc::clone(&state.search_connections);
+    let permit = Arc::clone(&state.search_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::StorageUnavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let connection = connections
+            .lock()
+            .map_err(|_| ApiError::StorageUnavailable)?
+            .pop();
+        if let Some(connection) = connection {
+            let result = run(&connection);
+            connections
+                .lock()
+                .map_err(|_| ApiError::StorageUnavailable)?
+                .push(connection);
+            result
+        } else {
+            let writer = storage.lock().map_err(|_| ApiError::StorageUnavailable)?;
+            run(&writer)
+        }
+    })
+    .await
+    .map_err(ApiError::DatabaseExecutor)?
+}
+
 async fn v3_search(
     State(state): State<AppState>,
     Extension(organization): Extension<OrganizationId>,
@@ -591,50 +659,25 @@ async fn v3_search(
         filepath: request.filepath,
         filters,
     };
-    let storage = Arc::clone(&state.storage);
-    let connections = Arc::clone(&state.search_connections);
-    let permit = Arc::clone(&state.search_permits)
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::StorageUnavailable)?;
     let chunk_threshold = request.chunk_threshold;
-    let hits = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let run = |storage: &Storage| {
-            query_vector
-                .as_ref()
-                .map_or_else(
-                    || storage.search_for(&organization.0, &query, candidate_limit),
-                    |vector| {
-                        storage.search_semantic(
-                            vector.as_slice(),
-                            "Xenova/bge-base-en-v1.5:q8:mean:normalized",
-                            candidate_limit,
-                            chunk_threshold,
-                            &options,
-                        )
-                    },
-                )
-                .map_err(ApiError::Storage)
-        };
-        let connection = connections
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
-            .pop();
-        if let Some(connection) = connection {
-            let result = run(&connection);
-            connections
-                .lock()
-                .map_err(|_| ApiError::StorageUnavailable)?
-                .push(connection);
-            result
-        } else {
-            let writer = storage.lock().map_err(|_| ApiError::StorageUnavailable)?;
-            run(&writer)
-        }
+    let hits = run_search(&state, move |storage| {
+        query_vector
+            .as_ref()
+            .map_or_else(
+                || storage.search_for(&organization.0, &query, candidate_limit),
+                |vector| {
+                    storage.search_semantic(
+                        vector.as_slice(),
+                        "Xenova/bge-base-en-v1.5:q8:mean:normalized",
+                        candidate_limit,
+                        chunk_threshold,
+                        &options,
+                    )
+                },
+            )
+            .map_err(ApiError::Storage)
     })
-    .await
-    .map_err(ApiError::DatabaseExecutor)??;
+    .await?;
     let results = group_v3_results(
         hits,
         request.limit,
@@ -809,11 +852,7 @@ impl SearchResult {
     }
 
     fn fit_context_budget(&mut self, remaining: &mut usize) -> Option<usize> {
-        let serialized_len = |result: &Self| {
-            serde_json::to_vec(result)
-                .map(|json| json.len())
-                .unwrap_or(usize::MAX)
-        };
+        let serialized_len = |result: &Self| serialized_len(result).unwrap_or(usize::MAX);
         let mut size = serialized_len(self);
         if size > *remaining {
             match self {
@@ -846,8 +885,8 @@ impl SearchResult {
                 Self::Memory(result) => &mut result.memory,
                 Self::Chunk(result) => &mut result.chunk,
             };
-            let overhead = size.saturating_sub(text.len());
-            truncate_utf8(text, remaining.saturating_sub(overhead));
+            let overhead = size.saturating_sub(json_string_len(text));
+            truncate_json_string(text, remaining.saturating_sub(overhead));
             size = serialized_len(self);
         }
         if size > *remaining {
@@ -958,7 +997,6 @@ async fn search(
     } else {
         None
     };
-    let storage = Arc::clone(&state.storage);
     let limit = request.limit;
     let threshold = request.threshold;
     let include_forgotten = request.include.forgotten_memories;
@@ -979,76 +1017,56 @@ async fn search(
         filters,
     };
     let candidate_limit = limit.saturating_mul(if request.aggregate { 5 } else { 3 });
-    let connections = Arc::clone(&state.search_connections);
-    let permit = Arc::clone(&state.search_permits)
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::StorageUnavailable)?;
-    let (memory_hits, chunk_hits) = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let run = |storage: &Storage| {
-            if let Some(vector) = query_vector.as_ref() {
-                let memories = if memory_mode {
-                    storage
-                        .search_memories_for(
-                            &organization.0,
-                            vector.as_slice(),
-                            "Xenova/bge-base-en-v1.5:q8:mean:normalized",
-                            options
-                                .container_tags
-                                .first()
-                                .map_or("sm_project_default", String::as_str),
-                            candidate_limit,
-                            threshold,
-                            include_forgotten,
-                        )
-                        .map_err(ApiError::Storage)?
-                } else {
-                    Vec::new()
-                };
-                let chunks = if document_mode {
-                    storage
-                        .search_semantic(
-                            vector.as_slice(),
-                            "Xenova/bge-base-en-v1.5:q8:mean:normalized",
-                            candidate_limit,
-                            threshold,
-                            &options,
-                        )
-                        .map_err(ApiError::Storage)?
-                } else {
-                    Vec::new()
-                };
-                Ok((memories, chunks))
+    let (memory_hits, chunk_hits) = run_search(&state, move |storage| {
+        if let Some(vector) = query_vector.as_ref() {
+            let memories = if memory_mode {
+                storage
+                    .search_memories_for(
+                        &organization.0,
+                        vector.as_slice(),
+                        "Xenova/bge-base-en-v1.5:q8:mean:normalized",
+                        options
+                            .container_tags
+                            .first()
+                            .map_or("sm_project_default", String::as_str),
+                        candidate_limit,
+                        threshold,
+                        include_forgotten,
+                        storage::MemoryHydration {
+                            relations: include_related,
+                            documents: include_documents,
+                        },
+                    )
+                    .map_err(ApiError::Storage)?
             } else {
-                let chunks = if document_mode {
-                    storage
-                        .search_for(&organization.0, &query, candidate_limit)
-                        .map_err(ApiError::Storage)?
-                } else {
-                    Vec::new()
-                };
-                Ok((Vec::new(), chunks))
-            }
-        };
-        let connection = connections
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
-            .pop();
-        if let Some(connection) = connection {
-            let result = run(&connection);
-            connections
-                .lock()
-                .map_err(|_| ApiError::StorageUnavailable)?
-                .push(connection);
-            result
+                Vec::new()
+            };
+            let chunks = if document_mode {
+                storage
+                    .search_semantic(
+                        vector.as_slice(),
+                        "Xenova/bge-base-en-v1.5:q8:mean:normalized",
+                        candidate_limit,
+                        threshold,
+                        &options,
+                    )
+                    .map_err(ApiError::Storage)?
+            } else {
+                Vec::new()
+            };
+            Ok((memories, chunks))
         } else {
-            let writer = storage.lock().map_err(|_| ApiError::StorageUnavailable)?;
-            run(&writer)
+            let chunks = if document_mode {
+                storage
+                    .search_for(&organization.0, &query, candidate_limit)
+                    .map_err(ApiError::Storage)?
+            } else {
+                Vec::new()
+            };
+            Ok((Vec::new(), chunks))
         }
     })
-    .await
-    .map_err(ApiError::DatabaseExecutor)??;
+    .await?;
     let memory_boost = if search_mode == SearchMode::Hybrid {
         1.15
     } else {
@@ -1068,22 +1086,13 @@ async fn search(
         .chain(
             chunk_hits
                 .into_iter()
-                .map(|hit| SearchResult::Chunk(chunk_search_result(hit, include_documents))),
+                .map(|hit| SearchResult::Chunk(chunk_search_result(hit))),
         )
         .collect();
     results.retain(|result| result.similarity() >= f64::from(threshold));
     results.sort_by(|left, right| right.similarity().total_cmp(&left.similarity()));
     results.truncate(limit);
-    let mut remaining_context_bytes = 4_000;
-    results = results
-        .into_iter()
-        .enumerate()
-        .filter_map(|(rank, mut result)| {
-            let context_bytes = result.fit_context_budget(&mut remaining_context_bytes)?;
-            tracing::debug!(rank, context_bytes, "search result context size");
-            Some(result)
-        })
-        .collect();
+    results = fit_search_context(results);
     let total = results.len();
     Ok(Json(SearchResponse {
         results,
@@ -1092,17 +1101,60 @@ async fn search(
     }))
 }
 
-fn truncate_utf8(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
+#[derive(Default)]
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0 += buffer.len();
+        Ok(buffer.len())
     }
-    let end = value
-        .char_indices()
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= max_bytes)
-        .last()
-        .unwrap_or_default();
-    value.truncate(end);
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_len(value: &impl Serialize) -> Result<usize, serde_json::Error> {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
+fn fit_search_context(results: Vec<SearchResult>) -> Vec<SearchResult> {
+    let mut remaining = 4_000;
+    results
+        .into_iter()
+        .enumerate()
+        .filter_map(|(rank, mut result)| {
+            let context_bytes = result.fit_context_budget(&mut remaining)?;
+            tracing::debug!(rank, context_bytes, "search result context size");
+            Some(result)
+        })
+        .collect()
+}
+
+fn json_string_len(value: &str) -> usize {
+    2 + value.chars().map(json_char_len).sum::<usize>()
+}
+
+fn json_char_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{0008}' | '\t' | '\n' | '\u{000C}' | '\r' => 2,
+        '\u{0000}'..='\u{001F}' => 6,
+        character => character.len_utf8(),
+    }
+}
+
+fn truncate_json_string(value: &mut String, max_serialized_bytes: usize) {
+    let mut serialized_bytes = 2;
+    for (index, character) in value.char_indices() {
+        serialized_bytes += json_char_len(character);
+        if serialized_bytes > max_serialized_bytes {
+            value.truncate(index);
+            return;
+        }
+    }
 }
 
 fn memory_search_result(
@@ -1163,7 +1215,7 @@ fn memory_search_result(
     }
 }
 
-fn chunk_search_result(hit: storage::SearchHit, _include_documents: bool) -> ChunkSearchResult {
+fn chunk_search_result(hit: storage::SearchHit) -> ChunkSearchResult {
     let title = hit
         .metadata
         .get("title")
@@ -1506,13 +1558,10 @@ async fn profile_search(
             total: 0,
         });
     };
-    let storage = Arc::clone(&state.storage);
     let container_tag = container_tag.to_owned();
     let organization_id = organization_id.to_owned();
-    let hits = tokio::task::spawn_blocking(move || {
+    let hits = run_search(state, move |storage| {
         storage
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
             .search_memories_for(
                 &organization_id,
                 vector.as_slice(),
@@ -1521,15 +1570,16 @@ async fn profile_search(
                 15,
                 threshold,
                 false,
+                storage::MemoryHydration::default(),
             )
             .map_err(ApiError::Storage)
     })
-    .await
-    .map_err(ApiError::DatabaseExecutor)??;
-    let results = hits
-        .into_iter()
-        .map(|hit| SearchResult::Memory(memory_search_result(hit, 1.0, false, false, false)))
-        .collect::<Vec<_>>();
+    .await?;
+    let results = fit_search_context(
+        hits.into_iter()
+            .map(|hit| SearchResult::Memory(memory_search_result(hit, 1.0, false, false, false)))
+            .collect(),
+    );
     let total = results.len();
     Ok(SearchResponse {
         results,
@@ -1832,10 +1882,6 @@ async fn persist_job_failure(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "durable extraction cache, embedding, and publication transitions remain explicit"
-)]
 async fn process_next_memory_job(
     storage: SharedStorage,
     embeddings: Arc<memory_engine::EmbeddingModel>,
@@ -1857,75 +1903,7 @@ async fn process_next_memory_job(
         return Ok(false);
     };
 
-    let candidates = if let Some(cached) = job.extraction_result.as_deref() {
-        match serde_json::from_str(cached) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                persist_memory_retry(
-                    Arc::clone(&storage),
-                    job,
-                    "invalid_output",
-                    None,
-                    error.to_string(),
-                )
-                .await?;
-                return Err(WorkerError::CachedExtraction(error));
-            }
-        }
-    } else {
-        let existing = tokio::task::spawn_blocking({
-            let storage = Arc::clone(&storage);
-            let organization = job.organization_id.clone();
-            let container_tag = job.container_tag.clone();
-            move || {
-                storage
-                    .lock()
-                    .map_err(|_| WorkerError::StorageUnavailable)?
-                    .existing_memories_for_extraction(&organization, &container_tag)
-                    .map_err(WorkerError::Storage)
-            }
-        })
-        .await
-        .map_err(WorkerError::Executor)??;
-        let context = existing
-            .into_iter()
-            .map(|memory| (memory.id, memory.content))
-            .collect::<Vec<_>>();
-        let candidates = match provider
-            .extract_once(&job.content, job.document_date.as_deref(), &context)
-            .await
-        {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                let failure = error.failure();
-                let retry_delay = extraction_retry_delay(failure, job.attempts);
-                persist_memory_retry(
-                    Arc::clone(&storage),
-                    job,
-                    extraction_failure_name(failure),
-                    retry_delay,
-                    error.to_string(),
-                )
-                .await?;
-                return Err(WorkerError::Provider(error));
-            }
-        };
-        let cached = serde_json::to_string(&candidates).map_err(WorkerError::CachedExtraction)?;
-        tokio::task::spawn_blocking({
-            let storage = Arc::clone(&storage);
-            let job = job.clone();
-            move || {
-                storage
-                    .lock()
-                    .map_err(|_| WorkerError::StorageUnavailable)?
-                    .cache_memory_extraction(&job, &cached)
-                    .map_err(WorkerError::Storage)
-            }
-        })
-        .await
-        .map_err(WorkerError::Executor)??;
-        candidates
-    };
+    let candidates = memory_candidates(&storage, provider.as_ref(), &job).await?;
 
     let completed_in_reconciliation = if candidates.is_empty() {
         false
@@ -1983,6 +1961,91 @@ async fn process_next_memory_job(
     Ok(true)
 }
 
+async fn memory_candidates(
+    storage: &SharedStorage,
+    provider: &memory_engine::MemoryProvider,
+    job: &storage::ClaimedMemoryJob,
+) -> Result<Vec<memory_engine::MemoryCandidate>, WorkerError> {
+    if let Some(cached) = job.extraction_result.as_deref() {
+        return match serde_json::from_str(cached) {
+            Ok(candidates) => Ok(candidates),
+            Err(error) => {
+                persist_memory_retry(
+                    Arc::clone(storage),
+                    job.clone(),
+                    "invalid_output",
+                    None,
+                    error.to_string(),
+                )
+                .await?;
+                Err(WorkerError::CachedExtraction(error))
+            }
+        };
+    }
+
+    let existing = finish_memory_storage_stage(
+        storage,
+        job,
+        "context",
+        tokio::task::spawn_blocking({
+            let storage = Arc::clone(storage);
+            let organization = job.organization_id.clone();
+            let container_tag = job.container_tag.clone();
+            move || {
+                storage
+                    .lock()
+                    .map_err(|_| WorkerError::StorageUnavailable)?
+                    .existing_memories_for_extraction(&organization, &container_tag)
+                    .map_err(WorkerError::Storage)
+            }
+        })
+        .await,
+    )
+    .await?;
+    let context = existing
+        .into_iter()
+        .map(|memory| (memory.id, memory.content))
+        .collect::<Vec<_>>();
+    let candidates = match provider
+        .extract_once(&job.content, job.document_date.as_deref(), &context)
+        .await
+    {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            let failure = error.failure();
+            persist_memory_retry(
+                Arc::clone(storage),
+                job.clone(),
+                extraction_failure_name(failure),
+                extraction_retry_delay(failure, job.attempts),
+                error.to_string(),
+            )
+            .await?;
+            return Err(WorkerError::Provider(error));
+        }
+    };
+    let cached = serde_json::to_string(&candidates).map_err(WorkerError::CachedExtraction)?;
+    finish_memory_storage_stage(
+        storage,
+        job,
+        "cache",
+        tokio::task::spawn_blocking({
+            let storage = Arc::clone(storage);
+            let job = job.clone();
+            move || {
+                storage
+                    .lock()
+                    .map_err(|_| WorkerError::StorageUnavailable)?
+                    .cache_memory_extraction(&job, &cached)
+                    .map_err(WorkerError::Storage)
+            }
+        })
+        .await,
+    )
+    .await?;
+    Ok(candidates)
+}
+
 fn extraction_retry_delay(
     failure: memory_engine::ExtractionFailure,
     attempt: i64,
@@ -2011,6 +2074,35 @@ const fn extraction_failure_name(failure: memory_engine::ExtractionFailure) -> &
     }
 }
 
+/// Requeues a claimed memory job when an auxiliary storage stage fails transiently.
+async fn finish_memory_storage_stage<T>(
+    storage: &SharedStorage,
+    job: &storage::ClaimedMemoryJob,
+    failure_kind: &'static str,
+    result: Result<Result<T, WorkerError>, tokio::task::JoinError>,
+) -> Result<T, WorkerError> {
+    let error = match result {
+        Ok(Ok(value)) => return Ok(value),
+        Ok(Err(error)) => error,
+        Err(error) => WorkerError::Executor(error),
+    };
+    let stale = matches!(
+        error,
+        WorkerError::Storage(storage::StorageError::StaleRevision { .. })
+    );
+    if !stale && !error.is_fatal() {
+        persist_memory_retry(
+            Arc::clone(storage),
+            job.clone(),
+            failure_kind,
+            Some(Duration::from_secs(1)),
+            error.to_string(),
+        )
+        .await?;
+    }
+    Err(error)
+}
+
 async fn persist_memory_retry(
     storage: SharedStorage,
     job: storage::ClaimedMemoryJob,
@@ -2035,8 +2127,13 @@ async fn memory_worker_loop(
     embeddings: Arc<memory_engine::EmbeddingModel>,
     provider: Arc<memory_engine::MemoryProvider>,
     health: SharedHealth,
+    queue_dirty: Arc<AtomicBool>,
+    warms_drained_queue: bool,
 ) {
     loop {
+        if health.is_degraded() {
+            break;
+        }
         match process_next_memory_job(
             Arc::clone(&storage),
             Arc::clone(&embeddings),
@@ -2044,8 +2141,17 @@ async fn memory_worker_loop(
         )
         .await
         {
-            Ok(true) => {}
-            Ok(false) => sleep(Duration::from_millis(100)).await,
+            Ok(true) => queue_dirty.store(true, Ordering::Release),
+            Ok(false) => {
+                if warms_drained_queue
+                    && queue_dirty.load(Ordering::Acquire)
+                    && indexing_queue_is_idle(Arc::clone(&storage)).await
+                    && queue_dirty.swap(false, Ordering::AcqRel)
+                {
+                    warm_embedding_model(Arc::clone(&embeddings)).await;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
             Err(error) if error.is_fatal() => {
                 health.degrade();
                 tracing::error!(%error, "memory worker stopped; service degraded");
@@ -2059,6 +2165,27 @@ async fn memory_worker_loop(
     }
 }
 
+async fn indexing_queue_is_idle(storage: SharedStorage) -> bool {
+    tokio::task::spawn_blocking(move || {
+        storage
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?
+            .has_active_processing_jobs()
+            .map(|active| !active)
+            .map_err(WorkerError::Storage)
+    })
+    .await
+    .is_ok_and(|result| result.unwrap_or(false))
+}
+
+async fn warm_embedding_model(embeddings: Arc<memory_engine::EmbeddingModel>) {
+    let values = vec!["search warmup".to_owned()];
+    let result = tokio::task::spawn_blocking(move || embeddings.embed(&values)).await;
+    if !matches!(result, Ok(Ok(_))) {
+        tracing::warn!("failed to warm embedding model after indexing queue drained");
+    }
+}
+
 async fn worker_loop(
     storage: SharedStorage,
     embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
@@ -2066,6 +2193,9 @@ async fn worker_loop(
     health: SharedHealth,
 ) {
     loop {
+        if health.is_degraded() {
+            break;
+        }
         match process_next_job_with_services(
             Arc::clone(&storage),
             embeddings.as_ref().map(Arc::clone),
@@ -2341,5 +2471,18 @@ impl WorkerError {
         matches!(self, Self::StorageUnavailable)
             || matches!(self, Self::Storage(error) if error.is_fatal())
             || matches!(self, Self::Executor(error) if error.is_panic())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{json_string_len, truncate_json_string};
+
+    #[test]
+    fn context_truncation_accounts_for_json_escaping() {
+        let mut value = "\"\n".repeat(1_000);
+        truncate_json_string(&mut value, 20);
+        assert!(json_string_len(&value) <= 20);
+        assert!(!value.is_empty());
     }
 }
