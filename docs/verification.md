@@ -1,103 +1,70 @@
-# Verify compatibility and performance
+# Verification
 
-This page records checks that have run against the release binary. The strongest result is a matched five-question LoCoMo comparison with `supermemory-server` v0.0.5. Passing these checks does not establish full parity.
+The release binary passes the tested SDK flows, legacy migration, local embedding fixture, and LoCoMo workload. Full compatibility with `supermemory-server` v0.0.5 is not established.
 
-## Review verified coverage
+## Coverage
 
-The release binary passes the tested client flows, legacy migration, local embedding fixture, and matched MemoryBench workload. Known application programming interface and retrieval gaps remain.
+| Area | Evidence |
+| --- | --- |
+| JavaScript SDK | `supermemory` 4.0.0 smoke flow |
+| Python SDK | `supermemory` 3.51.0 smoke flow |
+| Tools | Seven `@supermemory/tools` 2.1.1 definitions |
+| Legacy migration | Encrypted v0.0.5 snapshot |
+| Embeddings | Local `bge-base-en-v1.5` fixture |
+| MemoryBench | Five-question LoCoMo run |
 
-| Area | Status | Evidence |
-| --- | --- | --- |
-| JavaScript client | Passed | `supermemory` 4.0.0 smoke flow |
-| Python client | Passed | `supermemory` 3.51.0 smoke flow |
-| Tool definitions | Passed | Seven `@supermemory/tools` 2.1.1 definitions |
-| Legacy migration | Passed | Real encrypted v0.0.5 snapshot |
-| Matched MemoryBench run | Passed | Same questions, episodes, models, and fresh data |
-| Full parity | Not established | Gaps listed below |
+## LoCoMo results
 
-## Compare matched MemoryBench results
+The July 30, 2026 run used MemoryBench commit `118209a746d97d0d85e5a7234267f0b6962857e9`, 95 episodes, local BGE embeddings, and Gemini 2.5 Flash. The `supermemory-server` result used an earlier 127-episode run, so that comparison is directional.
 
-The official MemoryBench runner tested both servers on July 19, 2026. Each run used fresh data, the same 127 LoCoMo episodes, and the same five question IDs. Both runs used the existing local `bge-base-en-v1.5` embedding model, Gemini memory extraction, and Gemini 2.5 Flash for answers and judging.
+| Measurement | Turso/Postgres | Current SQLite | `supermemory-server` v0.0.5 |
+| --- | ---: | ---: | ---: |
+| Accuracy | 100% | 80% | 100% |
+| Hit@10 | 100% | 100% | 80% |
+| MRR | 0.900 | 0.700 | 0.640 |
+| NDCG | 0.856 | 0.737 | 0.632 |
+| Indexing, mean | 57m 9s | 5m 21s | 5m 49s |
+| Search, mean | 367 ms | 54 ms | 111 ms |
+| Search, p95 | 397 ms | 73 ms | 158 ms |
+| Context, mean | 822 tokens | 316 tokens | 11,122 tokens |
+| Ready RSS | Not measured | 214 MiB | 1,544 MiB |
+| Workload RSS, mean | Not measured | 286 MiB | 1,322 MiB |
+| Workload RSS, peak | Not measured | 445 MiB | 1,781 MiB |
+| Populated restart RSS | Not measured | 213 MiB | 1,017 MiB |
 
-Memory sampling ran once per second from server readiness through evaluation. The v0.0.5 measurements include `supermemory-server` and its detached Rivet engine.
+Ten extraction workers brought indexing below the `supermemory-server` result. Current SQLite also searched faster and used 4 to 7 times less memory. Accuracy ranged from 80% to 100% across two runs with the same code, so this sample does not establish a stable quality difference.
 
-| Measurement | Rust | v0.0.5 | Relative result |
-| --- | ---: | ---: | --- |
-| Answer accuracy | 80% (4/5) | 100% (5/5) | v0.0.5: +20 percentage points |
-| Retrieval Hit@10 | 80% | 80% | Equal |
-| Mean reciprocal rank (MRR) | 0.700 | 0.640 | Rust: 1.09x higher |
-| Normalized discounted cumulative gain (NDCG) | 0.726 | 0.632 | Rust: 1.15x higher |
-| Ingestion acceptance, mean | 47 ms | 1,900 ms | Rust: 40.4x faster |
-| Cold indexing, mean | 419,121 ms | 349,442 ms | Rust: 1.20x slower |
-| Search, mean | 32 ms | 111 ms | Rust: 3.47x faster |
-| Search, p95 | 47 ms | 158 ms | Rust: 3.36x faster |
-| Answer context, mean | 7,297 tokens | 11,122 tokens | v0.0.5: 1.52x as many |
-| Ready resident set size (RSS) | 218,640 KiB | 1,581,312 KiB | Rust: 7.23x lower |
-| Workload RSS, mean | 337,907 KiB | 1,353,826 KiB | Rust: 4.01x lower |
-| Workload RSS, peak | 412,352 KiB | 1,824,096 KiB | Rust: 4.42x lower |
-| Populated restart RSS | 188,384 KiB | 1,041,314 KiB | Rust: 5.53x lower |
+Answer and judge latency are excluded because they measure external Gemini requests.
 
-Rust used less memory and returned search results faster, but its cold indexing took 20% longer. v0.0.5 answered one additional question correctly, while both implementations achieved the same Hit@10.
+## Client compatibility
 
-Do not use answer and judge latency to compare server performance because those phases include external Gemini requests. Five questions can expose compatibility and resource differences, but they cannot establish a stable quality ranking.
+The JavaScript and Python SDK checks cover add, status polling, V3 search, V4 document search, and profile. All seven AI SDK and OpenAI tool definitions also construct against the local URL.
 
-### Reset the v0.0.5 Rivet engine
+Run the checks from `compat/`. See [compatibility check instructions](../compat/README.md).
 
-v0.0.5 can leave its Rivet engine listening on `127.0.0.1:6420` after the server exits. A new server may reuse that stale process and leave accepted documents queued. Stop the orphaned Rivet process before running v0.0.5 with a fresh data directory.
+## Legacy migration
 
-This failure occurred during verification. After the stale engine stopped, a one-document probe moved from `queued` to `indexing` to `done` in 6s, and the matched benchmark completed.
-
-## Check client compatibility
-
-The release binary passed these local client checks on July 19, 2026:
-
-- `supermemory` JavaScript software development kit (SDK) 4.0.0: add, status polling, V3 search, V4 document search, and profile
-- `supermemory` Python SDK 3.51.0: the same request sequence
-- `@supermemory/tools` 2.1.1: all seven artificial intelligence (AI) SDK and OpenAI tool definitions constructed against the local URL
-
-Run the scripts from `compat/`. Read the [compatibility check instructions](../compat/README.md) for their scope and dependencies.
-
-## Check legacy migration
-
-The migration test decrypts a real v0.0.5 `SMD1` snapshot and opens it with the matching PGlite WebAssembly runtime and filesystem bundle. It exports deterministic JSON Lines, imports them into a fresh SQLite database, and verifies `SME1` credential re-encryption. The test does not modify the source snapshot.
-
-Run the migration check with:
+The migration test decrypts a v0.0.5 `SMD1` snapshot, imports it into SQLite, and verifies `SME1` credential re-encryption without modifying the source.
 
 ```sh
 SUPERMEMORY_TEST_LEGACY=1 cargo test -p supermemory --test legacy --locked
 ```
 
-Read the [legacy migration instructions](../migration/README.md) for the exporter dependency and startup path.
+See [legacy migration instructions](../migration/README.md).
 
-## Run the application programming interface smoke test
+## SQLite vector search
 
-`compat/api-smoke.mjs` is a manual development check for application programming interface (API) throughput and latency. It is not a controlled comparison and does not run in continuous integration.
+SQLite ranks normalized embedding blobs with a registered `cosine_similarity` function. Filtering runs before ranking, and only selected rows are hydrated.
 
-One release run processed 50 short documents and sent 100 requests to each measured endpoint:
+`sqlite-vec` 0.1.9 was not used because registration requires unsafe Rust and its `vec0` tables would duplicate the existing embedding tables.
 
-| Measurement | Result |
-| --- | ---: |
-| Ingestion acceptance | 1,889.99 documents/s |
-| Processing throughput | 59.60 documents/s |
-| Search p95 | 2.99 ms |
-| Profile p95 | 0.21 ms |
-| Steady RSS after the workload | 185,152 KiB |
-
-Use the matched MemoryBench results for cross-server conclusions.
-
-## SQLite vector search decision
-
-The SQLite branch ranks normalized embedding blobs with a deterministic `cosine_similarity` function registered on every connection. Filtering and ranking happen in SQLite, and only the selected rows are hydrated.
-
-`sqlite-vec` 0.1.9 was considered first. Its Rust setup registers the extension through `sqlite3_auto_extension`, which requires an unsafe call. This workspace forbids unsafe code. Its `vec0` tables would also duplicate the existing chunk and memory embedding tables. The registered exact function keeps the current schema and gives us a reference path for a later `sqlite-vec` integration if its safe Rust API matures.
-
-## Track remaining parity gaps
-
-The following behavior still differs from or lacks full verification against v0.0.5:
+## Remaining gaps
 
 - Temporal query parsing and provider-backed query rewriting
 - V3 adjacent-chunk context and Workers AI reranking
-- Batch `forget-matching` and direct memory creation and update routes
+- Batch forgetting and direct memory mutation routes
 - Dynamic profile diversification and summary caching
-- URL, PDF, image, audio, and multipart file extraction
-- Full JavaScript and Python SDK route inventories
+- URL, PDF, image, audio, and multipart extraction
+- Full JavaScript and Python SDK route coverage
+
+v0.0.5 may leave Rivet on `127.0.0.1:6420` after shutdown. Stop that process before a clean comparison run.
