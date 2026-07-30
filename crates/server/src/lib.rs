@@ -835,19 +835,19 @@ impl SearchResult {
             size = serialized_len(self);
         }
         if size > *remaining {
+            match self {
+                Self::Memory(result) => result.metadata = None,
+                Self::Chunk(result) => result.metadata = None,
+            }
+            size = serialized_len(self);
+        }
+        if size > *remaining {
             let text = match self {
                 Self::Memory(result) => &mut result.memory,
                 Self::Chunk(result) => &mut result.chunk,
             };
             let overhead = size.saturating_sub(text.len());
             truncate_utf8(text, remaining.saturating_sub(overhead));
-            size = serialized_len(self);
-        }
-        if size > *remaining {
-            match self {
-                Self::Memory(result) => result.metadata = None,
-                Self::Chunk(result) => result.metadata = None,
-            }
             size = serialized_len(self);
         }
         if size > *remaining {

@@ -202,6 +202,41 @@ fn interrupted_memory_job_reuses_cached_extraction_after_restart() {
 }
 
 #[test]
+fn memory_extraction_does_not_block_a_new_document_revision() {
+    let mut storage = Storage::in_memory().expect("storage");
+    let mut value = input("first extraction source");
+    value.custom_id = Some("revision-during-extraction".into());
+    storage.upsert_document(value.clone()).expect("create");
+    let document_job = storage.claim_job().expect("claim").expect("document job");
+    let mut vector = vec![0.0; 768];
+    vector[0] = 1.0;
+    storage
+        .complete_embedded_job_with_memory_extraction(
+            &document_job,
+            &[EmbeddedChunk {
+                content: &document_job.content,
+                vector: &vector,
+            }],
+            "fixture-model",
+            768,
+        )
+        .expect("schedule extraction");
+
+    value.content = "replacement extraction source".into();
+    let update = storage.upsert_document(value).expect("update");
+    assert!(update.enqueued);
+    assert_eq!(update.status, "queued");
+    assert_eq!(
+        storage
+            .claim_job()
+            .expect("claim replacement")
+            .expect("job")
+            .content,
+        "replacement extraction source"
+    );
+}
+
+#[test]
 fn permanent_memory_failure_is_terminal() {
     let mut storage = Storage::in_memory().expect("storage");
     let document = storage

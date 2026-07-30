@@ -36,6 +36,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         6,
         include_str!("../../../migrations/0006_memory_job_state.sql"),
     ),
+    (
+        7,
+        include_str!("../../../migrations/0007_revision_scoped_active_jobs.sql"),
+    ),
 ];
 const BASE58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const LOCAL_SLUG: &str = "local";
@@ -931,10 +935,8 @@ impl Storage {
             .as_deref()
             .unwrap_or(&self.local_org_id);
         let query_bytes = vector_bytes(query);
-        let container_tag = options.container_tags.first().map(String::as_str);
-        let candidate_limit = limit.saturating_mul(10).max(100);
         let mut statement = self.connection.prepare(
-            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, cosine_similarity(chunk_embeddings.vector, ?1, ?2) AS score, document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.container_tags, documents.content FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?3 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?4 AND documents.status='done' AND (?5 IS NULL OR EXISTS(SELECT 1 FROM json_each(documents.container_tags) WHERE value=?5)) AND (?6 IS NULL OR documents.id=?6 OR documents.custom_id=?6) AND (?7 IS NULL OR documents.filepath=?7) AND cosine_similarity(chunk_embeddings.vector, ?1, ?2)>=?8 ORDER BY score DESC, documents.id, document_chunks.ordinal, document_chunks.stable_id LIMIT ?9",
+            "SELECT document_chunks.stable_id, documents.id, document_chunks.content, cosine_similarity(chunk_embeddings.vector, ?1, ?2) AS score, document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.container_tags, documents.content FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?3 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?4 AND documents.status='done' AND (?5 IS NULL OR documents.id=?5 OR documents.custom_id=?5) AND cosine_similarity(chunk_embeddings.vector, ?1, ?2)>=?6 ORDER BY score DESC, documents.id, document_chunks.ordinal, document_chunks.stable_id",
         ).map_err(StorageError::Read)?;
         let rows = statement
             .query_map(
@@ -943,11 +945,8 @@ impl Storage {
                     dimensions,
                     model_id,
                     organization_id,
-                    container_tag,
                     options.document_id,
-                    options.filepath,
-                    threshold,
-                    candidate_limit
+                    threshold
                 ],
                 |row| {
                     Ok((
@@ -1684,10 +1683,13 @@ fn apply_existing(
 ) -> Result<UpsertResult, StorageError> {
     let id = existing.document.id.clone();
     let status = existing.document.status.as_str();
-    let active = matches!(
-        status,
-        "unknown" | "queued" | "extracting" | "chunking" | "embedding" | "indexing"
-    );
+    let active: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE document_id=?1 AND revision=(SELECT revision FROM documents WHERE id=?1) AND kind='document' AND status IN ('queued','extracting','chunking','embedding','indexing'))",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::Read)?;
     if active {
         return Ok(UpsertResult {
             id,
@@ -1783,7 +1785,7 @@ fn enqueue_unless_active(
     document_id: &str,
 ) -> Result<bool, StorageError> {
     let active: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM jobs WHERE document_id=?1 AND status IN ('queued','extracting','chunking','embedding','indexing'))",
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE document_id=?1 AND revision=(SELECT revision FROM documents WHERE id=?1) AND kind='document' AND status IN ('queued','extracting','chunking','embedding','indexing'))",
         [document_id], |row| row.get(0),
     ).map_err(StorageError::Read)?;
     if active {
@@ -2725,16 +2727,34 @@ fn register_vector_functions(connection: &Connection) -> Result<(), StorageError
                         .into(),
                     ));
                 }
-                let score = left
-                    .chunks_exact(4)
-                    .zip(right.chunks_exact(4))
-                    .map(|(left, right)| {
-                        let left = f32::from_le_bytes([left[0], left[1], left[2], left[3]]);
-                        let right = f32::from_le_bytes([right[0], right[1], right[2], right[3]]);
-                        f64::from(left) * f64::from(right)
-                    })
-                    .sum::<f64>();
-                Ok(score)
+                let (dot, left_norm, right_norm) =
+                    left.chunks_exact(4).zip(right.chunks_exact(4)).try_fold(
+                        (0.0, 0.0, 0.0),
+                        |(dot, left_norm, right_norm), (left, right)| {
+                            let left =
+                                f64::from(f32::from_le_bytes([left[0], left[1], left[2], left[3]]));
+                            let right = f64::from(f32::from_le_bytes([
+                                right[0], right[1], right[2], right[3],
+                            ]));
+                            if !left.is_finite() || !right.is_finite() {
+                                return Err(rusqlite::Error::UserFunctionError(
+                                    "vector contains a non-finite component".into(),
+                                ));
+                            }
+                            Ok((
+                                dot + left * right,
+                                left_norm + left * left,
+                                right_norm + right * right,
+                            ))
+                        },
+                    )?;
+                let norm = left_norm.sqrt() * right_norm.sqrt();
+                if norm <= f64::EPSILON {
+                    return Err(rusqlite::Error::UserFunctionError(
+                        "vector has zero norm".into(),
+                    ));
+                }
+                Ok(dot / norm)
             },
         )
         .map_err(StorageError::Configure)
@@ -2874,6 +2894,10 @@ impl StorageError {
     pub fn is_fatal(&self) -> bool {
         fn fatal_sqlite(error: &rusqlite::Error) -> bool {
             matches!(
+                error,
+                rusqlite::Error::SqliteFailure(sqlite_error, _)
+                    if sqlite_error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FUNCTION
+            ) || matches!(
                 error.sqlite_error_code(),
                 Some(
                     rusqlite::ErrorCode::DatabaseCorrupt
@@ -2890,7 +2914,8 @@ impl StorageError {
             | Self::Migrate(_)
             | Self::MalformedSchema { .. }
             | Self::DeserializeSearchData(_)
-            | Self::MalformedStoredVector { .. } => true,
+            | Self::MalformedStoredVector { .. }
+            | Self::Read(rusqlite::Error::UserFunctionError(_)) => true,
             Self::Write(error) | Self::Read(error) => fatal_sqlite(error),
             _ => false,
         }

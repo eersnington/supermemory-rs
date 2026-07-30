@@ -30,7 +30,7 @@ See the [semantic porting guidelines](docs/semantic-porting.md) for the compatib
 
 ## Requirements
 
-- Rust 1.85 or newer
+- Rust 1.88 or newer
 - The BGE tokenizer and ONNX model under `~/.supermemory/models/Xenova/bge-base-en-v1.5`
 - The ONNX Runtime library used by Supermemory under `~/.supermemory/runtime/ort-native/`
 
