@@ -183,3 +183,50 @@ fn internal_id_lookup_precedes_matching_custom_id() {
         "internal"
     );
 }
+
+#[test]
+fn listing_chunks_and_deletion_respect_document_identity() {
+    let mut storage = Storage::in_memory().expect("storage");
+    let org_id = storage.local_organization_id().to_owned();
+    let mut value = input("one two three");
+    value.custom_id = Some("lifecycle".into());
+    let created = storage.upsert_document(value).expect("create");
+    let job = storage.claim_job().expect("claim").expect("queued job");
+    storage
+        .complete_job(&job, &["one two".into(), "three".into()])
+        .expect("publish chunks");
+
+    let documents = storage
+        .list_documents_for(&org_id, 10, 0, Some("a"))
+        .expect("list");
+    assert_eq!(
+        documents
+            .iter()
+            .map(|document| &document.id)
+            .collect::<Vec<_>>(),
+        vec![&created.id]
+    );
+    let chunks = storage
+        .document_chunks_for(&org_id, "lifecycle")
+        .expect("chunks")
+        .expect("document");
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>(),
+        ["one two", "three"]
+    );
+
+    assert!(
+        storage
+            .delete_document_for(&org_id, "lifecycle")
+            .expect("delete")
+    );
+    assert!(
+        storage
+            .document_chunks_for(&org_id, "lifecycle")
+            .expect("lookup")
+            .is_none()
+    );
+}

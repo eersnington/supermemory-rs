@@ -1,6 +1,6 @@
 # Semantic porting guidelines
 
-This project is a Rust port of `supermemory-server` v0.0.5. It is not a new memory engine inspired by Supermemory.
+This project is a Rust port of `supermemory-server` v0.0.6. It is not a new memory engine inspired by Supermemory.
 
 The implementation may replace Bun, Hono, PGlite, Drizzle, Rivet, and other generic runtime machinery. It must preserve Supermemory's externally visible behavior and application-specific decisions.
 
@@ -8,9 +8,9 @@ The implementation may replace Bun, Hono, PGlite, Drizzle, Rivet, and other gene
 
 Use these sources in order:
 
-1. Behavior observed from the v0.0.5 binary.
+1. Behavior observed from the v0.0.6 binary.
 2. Implementation recovered from the binary's embedded Bun bundle.
-3. The v0.0.5 self-hosting documentation.
+3. The v0.0.6 self-hosting documentation.
 
 When they disagree, the binary wins. Record the disagreement in the test that covers it.
 
@@ -66,7 +66,7 @@ Keep recovered evidence out of production interfaces. Tests should exercise crat
 A feature is compatible only when all applicable checks pass:
 
 - Existing Supermemory SDK calls require no application changes other than the server URL.
-- Requests, responses, status codes, and errors match v0.0.5.
+- Requests, responses, status codes, and errors match v0.0.6.
 - Persisted jobs survive interruption and resume with equivalent behavior.
 - The same model configuration produces equivalent chunks, memories, profiles, and search results within defined numeric tolerances.
 - Existing local data can be migrated without losing documents, memories, relationships, files, or credentials.
@@ -98,6 +98,6 @@ Every performance change needs measurements against the same corpus and model co
 
 ## Definition of done
 
-Do not describe the project or a subsystem as a drop-in replacement while known v0.0.5 behavior is missing or unverified. State the implemented compatibility surface precisely.
+Do not describe the project or a subsystem as a drop-in replacement while known v0.0.6 behavior is missing or unverified. State the implemented compatibility surface precisely.
 
 The full replacement is done when the process, API, behavior, and migration contracts are covered by executable tests and the quality and performance gates pass.

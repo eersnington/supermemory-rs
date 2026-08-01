@@ -79,9 +79,15 @@ async fn landing_page_exposes_local_examples_without_caching_the_key() {
             .to_vec(),
     )
     .expect("HTML");
-    assert!(html.contains("supermemory<span>-RS</span>"));
+    assert!(html.contains("supermemory<span class=\"rs\">-RS</span>"));
+    assert!(
+        html.contains(
+            "Supermemory</span><span class=\"rs-gradient\">-RS</span> is live"
+        )
+    );
+    assert!(html.contains("--rs:#ff8700"));
     assert!(html.contains("Bearer secret"));
-    assert!(html.contains("/v4/reference"));
+    assert!(html.contains("https://github.com/eersnington/supermemory-rs"));
 }
 
 #[tokio::test]

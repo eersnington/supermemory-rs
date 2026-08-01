@@ -1,0 +1,743 @@
+{
+  "v3-documents-create": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "id": "<id>",
+      "status": "queued"
+    }
+  },
+  "v3-documents-create-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "message": "is missing",
+          "path": [
+            "content"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v3-documents-batch": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "failed": 0,
+      "results": [
+        {
+          "id": "<id>",
+          "status": "queued"
+        },
+        {
+          "id": "<id>",
+          "status": "queued"
+        }
+      ],
+      "success": 2
+    }
+  },
+  "v3-documents-batch-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {
+        "documents": [
+          {}
+        ]
+      },
+      "error": [
+        {
+          "code": "invalid_union",
+          "errors": [
+            [
+              {
+                "code": "invalid_type",
+                "expected": "string",
+                "message": "Invalid input: expected string, received undefined",
+                "path": [
+                  0,
+                  "content"
+                ]
+              }
+            ],
+            [
+              {
+                "code": "invalid_type",
+                "expected": "string",
+                "message": "Invalid input: expected string, received object",
+                "path": [
+                  0
+                ]
+              }
+            ]
+          ],
+          "message": "Invalid input",
+          "path": [
+            "documents"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v3-documents-get": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "connectionId": null,
+      "containerTags": [
+        "parity-v006"
+      ],
+      "content": "A compatibility fixture about the harbor kingfisher.",
+      "createdAt": "<createdAt>",
+      "customId": "parity-v006-document",
+      "dreamingStatus": "done",
+      "filepath": null,
+      "id": "<id>",
+      "metadata": {
+        "fixture": "v0.0.6"
+      },
+      "ogImage": null,
+      "raw": null,
+      "source": "api",
+      "status": "queued",
+      "summary": null,
+      "taskType": "memory",
+      "title": null,
+      "type": "text",
+      "updatedAt": "<updatedAt>",
+      "url": "<url>",
+      "userId": "<userId>"
+    }
+  },
+  "v3-documents-get-missing": {
+    "status": 404,
+    "contentType": "application/json",
+    "body": {
+      "error": "Document not found"
+    }
+  },
+  "v3-documents-update": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "id": "<id>",
+      "status": "queued"
+    }
+  },
+  "v3-documents-update-invalid": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "id": "<id>",
+      "status": "queued"
+    }
+  },
+  "v3-documents-list": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "memories": [
+        {
+          "connectionId": null,
+          "containerTags": [
+            "parity-v006"
+          ],
+          "createdAt": "<createdAt>",
+          "customId": "parity-v006-document",
+          "filepath": null,
+          "id": "<id>",
+          "metadata": {
+            "fixture": "v0.0.6"
+          },
+          "status": "queued",
+          "summary": null,
+          "title": null,
+          "type": "text",
+          "updatedAt": "<updatedAt>",
+          "url": "<url>"
+        },
+        {
+          "connectionId": null,
+          "containerTags": [
+            "parity-v006"
+          ],
+          "createdAt": "<createdAt>",
+          "customId": "parity-v006-batch",
+          "filepath": null,
+          "id": "<id>",
+          "metadata": {
+            "fixture": "v0.0.6"
+          },
+          "status": "queued",
+          "summary": null,
+          "title": null,
+          "type": "text",
+          "updatedAt": "<updatedAt>",
+          "url": "<url>"
+        }
+      ],
+      "pagination": {
+        "currentPage": 1,
+        "limit": 10,
+        "totalItems": 2,
+        "totalPages": 1
+      }
+    }
+  },
+  "v3-documents-list-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {
+        "limit": -1
+      },
+      "error": [
+        {
+          "code": "custom",
+          "message": "Limit must be at least 1",
+          "path": [
+            "limit"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v3-documents-processing": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "documents": [
+        {
+          "connectionId": null,
+          "containerTags": [
+            "parity-v006"
+          ],
+          "createdAt": "<createdAt>",
+          "customId": "parity-v006-document",
+          "id": "<id>",
+          "metadata": {
+            "fixture": "v0.0.6"
+          },
+          "status": "queued",
+          "summary": null,
+          "title": null,
+          "type": "text",
+          "updatedAt": "<updatedAt>"
+        },
+        {
+          "connectionId": null,
+          "containerTags": [
+            "parity-v006"
+          ],
+          "createdAt": "<createdAt>",
+          "customId": "parity-v006-batch",
+          "id": "<id>",
+          "metadata": {
+            "fixture": "v0.0.6"
+          },
+          "status": "queued",
+          "summary": null,
+          "title": null,
+          "type": "text",
+          "updatedAt": "<updatedAt>"
+        }
+      ],
+      "totalCount": 2
+    }
+  },
+  "v3-documents-chunks": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "chunks": [],
+      "documentId": "<documentId>",
+      "total": 0
+    }
+  },
+  "v3-documents-file-url": {
+    "status": 404,
+    "contentType": "application/json",
+    "body": {
+      "error": "Document has no associated file"
+    }
+  },
+  "v3-documents-file-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "nonoptional",
+          "message": "Invalid input: expected nonoptional, received undefined",
+          "path": [
+            "file"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v3-documents-bulk-delete-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "code": "custom",
+          "message": "Either 'ids' or 'containerTags' must be provided",
+          "path": []
+        }
+      ],
+      "success": false
+    }
+  },
+  "v3-search": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "results": [],
+      "timing": "<timing>",
+      "total": 0
+    }
+  },
+  "v3-search-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "q"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v3-settings-get": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "chunkSize": 1075,
+      "excludeItems": null,
+      "filterPrompt": null,
+      "githubClientId": null,
+      "githubClientSecret": null,
+      "githubCustomKeyEnabled": false,
+      "googleDriveClientId": null,
+      "googleDriveClientSecret": null,
+      "googleDriveCustomKeyEnabled": false,
+      "id": "<id>",
+      "includeItems": null,
+      "notionClientId": null,
+      "notionClientSecret": null,
+      "notionCustomKeyEnabled": false,
+      "onedriveClientId": null,
+      "onedriveClientSecret": null,
+      "onedriveCustomKeyEnabled": false,
+      "orgId": "<orgId>",
+      "profileBuckets": [],
+      "shouldLLMFilter": false,
+      "updatedAt": "<updatedAt>"
+    }
+  },
+  "v3-settings-update-invalid": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "orgId": "<orgId>",
+      "orgSlug": "local",
+      "updated": {
+        "chunkSize": 1075,
+        "excludeItems": null,
+        "filterPrompt": null,
+        "githubClientId": null,
+        "githubClientSecret": null,
+        "githubCustomKeyEnabled": false,
+        "googleDriveClientId": null,
+        "googleDriveClientSecret": null,
+        "googleDriveCustomKeyEnabled": false,
+        "includeItems": null,
+        "notionClientId": null,
+        "notionClientSecret": null,
+        "notionCustomKeyEnabled": false,
+        "onedriveClientId": null,
+        "onedriveClientSecret": null,
+        "onedriveCustomKeyEnabled": false,
+        "profileBuckets": [],
+        "shouldLLMFilter": false
+      }
+    }
+  },
+  "v3-settings-reset": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "confirmation"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v3-settings-suggest-buckets-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "error": "No organization context configured. Set up an organizational context first so suggestions can be tailored to your use-case."
+    }
+  },
+  "v3-container-tag-get-missing": {
+    "status": 404,
+    "contentType": "application/json",
+    "body": {
+      "error": "Container tag not found"
+    }
+  },
+  "v3-container-tag-update-invalid": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "containerTag": "parity-v006",
+      "entityContext": null,
+      "memoryFilesystemPaths": null,
+      "name": "Space parity-v006",
+      "profileBuckets": [],
+      "updatedAt": "<updatedAt>"
+    }
+  },
+  "v3-container-tag-delete-missing": {
+    "status": 404,
+    "contentType": "application/json",
+    "body": {
+      "error": "Container tag not found"
+    }
+  },
+  "v3-container-tag-merge-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "message": "is missing",
+          "path": [
+            "containerTags"
+          ]
+        },
+        {
+          "message": "is missing",
+          "path": [
+            "targetContainerTag"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v3-container-tag-merge-get-missing": {
+    "status": 404,
+    "contentType": "application/json",
+    "body": {
+      "error": "Merge job not found"
+    }
+  },
+  "v4-memories-create-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "array",
+          "message": "Invalid input: expected array, received undefined",
+          "path": [
+            "memories"
+          ]
+        },
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "containerTag"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v4-memories-update-missing": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {
+        "id": "<id>"
+      },
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "containerTag"
+          ]
+        },
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "newContent"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v4-memories-delete-missing": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {
+        "id": "<id>"
+      },
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "containerTag"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v4-memories-list": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {
+        "containerTag": "parity-v006",
+        "limit": 10
+      },
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "array",
+          "message": "Invalid input: expected array, received undefined",
+          "path": [
+            "containerTags"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v4-memories-list-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "array",
+          "message": "Invalid input: expected array, received undefined",
+          "path": [
+            "containerTags"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v4-memories-forget-matching-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "query"
+          ]
+        },
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "containerTag"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v4-profile": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "profile": {
+        "buckets": {
+          "preferences": []
+        },
+        "dynamic": [],
+        "static": []
+      }
+    }
+  },
+  "v4-profile-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "containerTag"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v4-profile-buckets": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "buckets": [
+        {
+          "description": "Explicit first-person preferences only — things the person directly stated they prefer, like, or dislike (e.g. 'prefers X over Y', 'dislikes Z', 'always uses W'). Must be a direct stated choice, not an observation or inference. Exclude: personality traits, communication styles, behavioral patterns, opinions about products or other people, and anything described as a characteristic rather than a stated preference.",
+          "key": "preferences"
+        }
+      ]
+    }
+  },
+  "v4-profile-buckets-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "containerTag"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v4-search": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "results": [],
+      "timing": "<timing>",
+      "total": 0
+    }
+  },
+  "v4-search-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "q"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v4-conversations-invalid": {
+    "status": 400,
+    "contentType": "application/json",
+    "body": {
+      "data": {},
+      "error": [
+        {
+          "code": "invalid_type",
+          "expected": "string",
+          "message": "Invalid input: expected string, received undefined",
+          "path": [
+            "conversationId"
+          ]
+        },
+        {
+          "code": "invalid_type",
+          "expected": "array",
+          "message": "Invalid input: expected array, received undefined",
+          "path": [
+            "messages"
+          ]
+        }
+      ],
+      "success": false
+    }
+  },
+  "v3-documents-bulk-delete": {
+    "status": 200,
+    "contentType": "application/json",
+    "body": {
+      "_cleanup": {
+        "associatedMemories": [],
+        "containerTags": [
+          "parity-v006"
+        ],
+        "documentIds": [
+          "GCYG8a34RJ1MJE9gcwVMnL"
+        ]
+      },
+      "deletedCount": 1,
+      "success": true
+    }
+  },
+  "v3-documents-delete-missing": {
+    "status": 404,
+    "contentType": "application/json",
+    "body": {
+      "error": "Document not found"
+    }
+  }
+}

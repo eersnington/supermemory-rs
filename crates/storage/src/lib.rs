@@ -40,6 +40,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         7,
         include_str!("../../../migrations/0007_revision_scoped_active_jobs.sql"),
     ),
+    (
+        8,
+        include_str!("../../../migrations/0008_v006_persistence.sql"),
+    ),
 ];
 const BASE58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const LOCAL_SLUG: &str = "local";
@@ -420,6 +424,8 @@ mod memories;
 mod memory_jobs;
 mod migrations;
 mod search;
+
+pub use documents::DocumentChunk;
 
 fn apply_existing(
     tx: &rusqlite::Transaction<'_>,
@@ -1404,6 +1410,94 @@ fn validate_current_schema(connection: &Connection) -> Result<(), StorageError> 
         connection,
         "legacy_imports",
         &["source_hash", "imported_at", "report"],
+    )?;
+    validate_columns(
+        connection,
+        "organization_settings",
+        &[
+            "org_id",
+            "chunk_size",
+            "should_llm_filter",
+            "filter_prompt",
+            "include_items",
+            "exclude_items",
+            "profile_buckets",
+            "created_at",
+            "updated_at",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "file_blobs",
+        &[
+            "id",
+            "org_id",
+            "sha256",
+            "content_type",
+            "filename",
+            "byte_length",
+            "bytes",
+            "created_at",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "content_sources",
+        &[
+            "document_id",
+            "kind",
+            "source_url",
+            "file_blob_id",
+            "content_type",
+            "extraction_status",
+            "extracted_content",
+            "extracted_metadata",
+            "error_kind",
+            "error_message",
+            "created_at",
+            "updated_at",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "download_tokens",
+        &[
+            "token_hash",
+            "org_id",
+            "file_blob_id",
+            "expires_at",
+            "consumed_at",
+            "created_at",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "container_tag_merge_jobs",
+        &[
+            "id",
+            "org_id",
+            "source_tags",
+            "target_tag",
+            "status",
+            "error_message",
+            "created_at",
+            "updated_at",
+        ],
+    )?;
+    validate_columns(
+        connection,
+        "memory_forget_batches",
+        &[
+            "id",
+            "org_id",
+            "container_tag",
+            "query",
+            "dry_run",
+            "candidate_count",
+            "forgotten_count",
+            "created_at",
+            "completed_at",
+        ],
     )
 }
 

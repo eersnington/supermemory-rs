@@ -4,11 +4,11 @@
 
 ---
 
-A low-memory Rust reimplementation of [Supermemory Local](https://github.com/supermemoryai/supermemory), based on `supermemory-server` [v0.0.5 release](https://github.com/supermemoryai/supermemory/releases/tag/server-v0.0.5).
+A low-memory Rust reimplementation of [Supermemory Local](https://github.com/supermemoryai/supermemory), based on `supermemory-server` [v0.0.6 release](https://github.com/supermemoryai/supermemory/releases/tag/server-v0.0.6).
 
 The goal is to run the same local Supermemory service with a much smaller memory footprint. Instead of Bun, Hono, PGlite, Drizzle, Rivet, and Transformers.js, this port uses Tokio, Axum, SQLite, rusqlite, and ONNX Runtime in a single process. Supermemory's API and memory behavior should remain the same; the runtime underneath it is what changes.
 
-> ⚠️ Note: This is still a work in progress. The implemented routes work with the Supermemory SDKs, but some v0.0.5 behavior is not available yet.
+> ⚠️ Note: This is still a work in progress. The implemented routes work with the Supermemory SDKs, but some v0.0.6 behavior is not available yet.
 
 ## Why this exists
 
