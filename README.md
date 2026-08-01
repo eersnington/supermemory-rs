@@ -46,11 +46,17 @@ The model and runtime paths can be changed with `--model` and `--ort-library`, o
 ## Install and run
 
 ```sh
-cargo install --path crates/supermemory --locked
+just install
 supermemory-rs
 ```
 
-This installs the executable at `~/.cargo/bin/supermemory-rs`. Run the install command again after updating the source.
+Or install directly with Cargo:
+
+```sh
+cargo install --path crates/supermemory --locked
+```
+
+Both commands install the executable at `~/.cargo/bin/supermemory-rs`. Run the install command again after updating the source.
 
 To run directly from the checkout during development:
 
