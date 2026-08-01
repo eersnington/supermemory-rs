@@ -332,12 +332,12 @@ fn memory_extraction_does_not_block_a_new_document_revision() {
         .expect("memory job");
     let unchanged = storage.upsert_document(value.clone()).expect("same upsert");
     assert!(!unchanged.enqueued);
-    assert_eq!(unchanged.status, "indexing");
+    assert_eq!(unchanged.status, storage::DocumentState::Indexing);
 
     value.metadata.insert("date".into(), json!("2026-07-30"));
     let update = storage.upsert_document(value).expect("metadata update");
     assert!(update.enqueued);
-    assert_eq!(update.status, "queued");
+    assert_eq!(update.status, storage::DocumentState::Queued);
     assert!(matches!(
         storage.cache_memory_extraction(&memory_job, "[]"),
         Err(StorageError::StaleRevision { .. })
@@ -386,7 +386,7 @@ fn permanent_memory_failure_is_terminal() {
             .expect("document")
             .expect("stored document")
             .status,
-        "failed"
+        storage::DocumentState::Failed
     );
     assert!(storage.claim_memory_job().expect("claim again").is_none());
 }

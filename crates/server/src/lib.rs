@@ -1,6 +1,18 @@
 //! HTTP boundary and durable worker lifecycle with sticky fatal health degradation.
 
+mod auth;
 mod context_budget;
+mod health;
+mod ui;
+mod routes {
+    pub(super) mod documents;
+}
+
+use auth::authenticate;
+use routes::documents::{create_document, get_document};
+use ui::{api_reference, landing_page, openapi};
+
+use health::ServiceHealth;
 
 use std::{
     net::SocketAddr,
@@ -38,19 +50,6 @@ const SEARCH_CONNECTIONS: usize = 5;
 
 #[derive(Clone, Copy)]
 struct FatalApiFailure;
-
-#[derive(Default)]
-struct ServiceHealth(AtomicBool);
-
-impl ServiceHealth {
-    fn is_degraded(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-
-    fn degrade(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
 
 #[derive(Clone)]
 struct AppState {
@@ -106,7 +105,7 @@ fn router_with_health(
 ) -> Router {
     let (local_org_id, mut api_keys, search_connections) = match storage.lock() {
         Err(_) => {
-            health.degrade();
+            health.degrade_permanently();
             (String::new(), Vec::new(), Vec::new())
         }
         Ok(storage) => {
@@ -118,7 +117,7 @@ fn router_with_health(
                     .collect(),
                 Err(error) => {
                     if error.is_fatal() {
-                        health.degrade();
+                        health.degrade_permanently();
                     }
                     tracing::error!(%error, "failed to load API key identities");
                     Vec::new()
@@ -131,7 +130,7 @@ fn router_with_health(
                     Err(storage::StorageError::CannotForkInMemory) => break,
                     Err(error) => {
                         if error.is_fatal() {
-                            health.degrade();
+                            health.degrade_permanently();
                         }
                         tracing::error!(%error, "failed to open SQLite search connection");
                         break;
@@ -179,77 +178,6 @@ fn router_with_health(
             degrade_after_internal_error,
         ))
         .with_state(state)
-}
-
-async fn landing_page(State(state): State<AppState>) -> Response {
-    let api_key = state.api_key.as_deref().unwrap_or("sm_your_local_api_key");
-    let escaped_key = escape_html(api_key);
-    let port = state.port;
-    let html = format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>supermemory · local</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <style>
-    :root{{--bg:#080a0c;--panel:#101317;--line:#242a31;--text:#eef3f6;--muted:#929ba5;--cyan:#55ddeb;--orange:#f79332}}
-    *{{box-sizing:border-box}} body{{margin:0;background:radial-gradient(circle at 20% 0%,#10242a 0,transparent 34%),var(--bg);color:var(--text);font-family:Inter,sans-serif}}
-    main{{max-width:1060px;margin:auto;padding:72px 28px}} .brand{{font:700 clamp(42px,8vw,88px)/.9 'Space Grotesk';letter-spacing:-.065em}} .brand span{{color:var(--orange)}}
-    .eyebrow{{color:var(--cyan);font:500 13px 'JetBrains Mono';text-transform:uppercase;letter-spacing:.16em;margin-bottom:20px}} h1{{font:600 clamp(32px,5vw,58px)/1.05 'Space Grotesk';max-width:760px;margin:42px 0 18px}}
-    .lede{{max-width:700px;color:var(--muted);font-size:18px;line-height:1.7}} .status{{display:flex;gap:10px;align-items:center;color:#90efb1;margin:32px 0 50px;font:500 14px 'JetBrains Mono'}} .dot{{width:8px;height:8px;border-radius:50%;background:#62e893;box-shadow:0 0 18px #62e893}}
-    .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}} .card{{background:color-mix(in srgb,var(--panel) 94%,transparent);border:1px solid var(--line);border-radius:14px;padding:24px}}
-    .card h2{{font:600 19px 'Space Grotesk';margin:0 0 8px}} .card p{{color:var(--muted);line-height:1.55;margin:0 0 18px}} pre{{position:relative;overflow:auto;background:#080a0d;border:1px solid #20262d;border-radius:9px;padding:18px 48px 18px 16px;color:#b9f5ef;font:13px/1.65 'JetBrains Mono'}}
-    button{{position:absolute;right:8px;top:8px;border:1px solid #303842;background:#171c21;color:#c9d1d9;border-radius:6px;padding:6px 8px;cursor:pointer}} a{{color:var(--cyan);text-decoration:none}} nav{{display:flex;gap:24px;flex-wrap:wrap;margin-top:38px;padding-top:28px;border-top:1px solid var(--line)}}
-  </style>
-</head>
-<body><main>
-  <div class="eyebrow">local · self-hosted · running on this machine</div>
-  <div class="brand">supermemory<span>-RS</span></div>
-  <h1>Your memory infrastructure, running locally.</h1>
-  <p class="lede">Add documents and search your local Supermemory-compatible server. Your local API key is ready to use in SDKs and command-line requests.</p>
-  <div class="status"><i class="dot"></i> listening on http://localhost:{port}</div>
-  <section class="grid">
-    <article class="card"><h2>Add a memory</h2><p>Send text to the document ingestion endpoint.</p><pre><button class="copy-btn">copy</button><code>curl -X POST http://localhost:{port}/v3/documents \
-  -H 'Authorization: Bearer {escaped_key}' \
-  -H 'Content-Type: application/json' \
-  -d '{{"content":"Remember this locally"}}'</code></pre></article>
-    <article class="card"><h2>Search</h2><p>Search completed documents through the V4 endpoint.</p><pre><button class="copy-btn">copy</button><code>curl -X POST http://localhost:{port}/v4/search \
-  -H 'Authorization: Bearer {escaped_key}' \
-  -H 'Content-Type: application/json' \
-  -d '{{"q":"remember","searchMode":"documents"}}'</code></pre></article>
-    <article class="card"><h2>Local API key</h2><p>Use this key for SDKs or non-loopback clients.</p><pre><button class="copy-btn">copy</button><code>{escaped_key}</code></pre></article>
-  </section>
-  <nav><a href="/v4/reference">API reference</a><a href="/v4/openapi">OpenAPI document</a><a href="https://supermemory.ai/docs/self-hosting/overview">Self-hosting docs</a><a href="https://github.com/supermemoryai/supermemory">GitHub</a></nav>
-</main><script>document.querySelectorAll('.copy-btn').forEach((button)=>button.addEventListener('click',async()=>{{const text=button.parentElement.querySelector('code').textContent;await navigator.clipboard.writeText(text);button.textContent='copied';setTimeout(()=>button.textContent='copy',1200)}}));</script></body></html>"#
-    );
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    (headers, Html(html)).into_response()
-}
-
-async fn api_reference() -> Html<&'static str> {
-    Html(
-        r#"<!doctype html><html><head><title>supermemory API reference</title><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><script id="api-reference" data-url="/v4/openapi"></script><script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script></body></html>"#,
-    )
-}
-
-async fn openapi(State(state): State<AppState>) -> Json<Value> {
-    let server_url = format!("http://localhost:{}", state.port);
-    Json(serde_json::json!({
-        "openapi": "3.1.0",
-        "info": { "title": "supermemory local API", "version": "0.0.5-rs" },
-        "servers": [{ "url": server_url }],
-        "paths": {
-            "/health": { "get": { "responses": { "200": { "description": "Healthy" } } } },
-            "/v3/documents": { "post": { "summary": "Add a document", "responses": { "200": { "description": "Queued document" } } } },
-            "/v3/documents/{id}": { "get": { "summary": "Get a document", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Document" }, "404": { "description": "Not found" } } } },
-            "/v4/search": { "post": { "summary": "Search local documents", "responses": { "200": { "description": "Search results" } } } }
-        }
-    }))
 }
 
 fn escape_html(value: &str) -> String {
@@ -380,6 +308,20 @@ async fn degrade_after_internal_error(
 
 async fn health_handler(State(state): State<AppState>) -> Response {
     if state.health.is_degraded() {
+        let storage = Arc::clone(&state.storage);
+        let probe = tokio::task::spawn_blocking(move || {
+            storage
+                .lock()
+                .ok()
+                .and_then(|storage| storage.migration_version().ok())
+                .is_some()
+        })
+        .await;
+        if matches!(probe, Ok(true)) {
+            state.health.recover();
+        }
+    }
+    if state.health.is_degraded() {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(Health { status: "degraded" }),
@@ -443,73 +385,6 @@ impl Dreaming {
 }
 fn default_dreaming() -> Dreaming {
     Dreaming::Dynamic
-}
-
-async fn create_document(
-    State(state): State<AppState>,
-    Extension(organization): Extension<OrganizationId>,
-    Json(request): Json<CreateDocumentRequest>,
-) -> Result<Json<DocumentResult>, ApiError> {
-    validate_request(&request)?;
-    let content = storage::sanitize_content(&request.content);
-    if content.is_empty() {
-        return Err(ApiError::Validation(
-            "content must not be empty after sanitization",
-        ));
-    }
-    let tags = request.container_tag.clone().map_or_else(
-        || {
-            request
-                .container_tags
-                .clone()
-                .unwrap_or_else(|| vec!["sm_project_default".to_owned()])
-        },
-        |tag| vec![tag],
-    );
-    let document = UpsertDocument {
-        content,
-        custom_id: request.custom_id,
-        container_tags: tags,
-        entity_context: request.entity_context,
-        metadata: request.metadata,
-        task_type: request.task_type.as_str().to_owned(),
-        filepath: request.filepath,
-        filter_by_metadata: request.filter_by_metadata,
-        dreaming: request.dreaming.as_str().to_owned(),
-    };
-    let storage = Arc::clone(&state.storage);
-    let result = tokio::task::spawn_blocking(move || {
-        storage
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
-            .upsert_document_for(&organization.0, document)
-            .map_err(ApiError::Storage)
-    })
-    .await
-    .map_err(ApiError::DatabaseExecutor)??;
-    Ok(Json(DocumentResult {
-        id: result.id,
-        status: result.status,
-    }))
-}
-
-async fn get_document(
-    State(state): State<AppState>,
-    Extension(organization): Extension<OrganizationId>,
-    Path(id): Path<String>,
-) -> Result<Json<storage::Document>, ApiError> {
-    let storage = Arc::clone(&state.storage);
-    tokio::task::spawn_blocking(move || {
-        storage
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
-            .find_document_for(&organization.0, &id)
-            .map_err(ApiError::Storage)
-    })
-    .await
-    .map_err(ApiError::DatabaseExecutor)??
-    .map(Json)
-    .ok_or(ApiError::NotFound)
 }
 
 #[derive(Deserialize)]
@@ -1573,6 +1448,10 @@ pub async fn process_next_job_with_embeddings(
 ///
 /// # Errors
 /// Returns an error if durable document publication fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "durable work is deliberately visible in one worker function"
+)]
 pub async fn process_next_job_with_services(
     storage: SharedStorage,
     embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
@@ -1594,7 +1473,12 @@ pub async fn process_next_job_with_services(
         return Ok(false);
     };
 
-    mark_job_stage(Arc::clone(&storage), job.clone(), "chunking").await?;
+    mark_job_stage(
+        Arc::clone(&storage),
+        job.clone(),
+        storage::DocumentState::Chunking,
+    )
+    .await?;
     let chunks = match memory_engine::chunk_text(&job.content, None) {
         Ok(chunks) => chunks,
         Err(error) => {
@@ -1616,7 +1500,12 @@ pub async fn process_next_job_with_services(
         return Ok(true);
     }
     if let Some(embeddings) = embeddings {
-        mark_job_stage(Arc::clone(&storage), job.clone(), "embedding").await?;
+        mark_job_stage(
+            Arc::clone(&storage),
+            job.clone(),
+            storage::DocumentState::Embedding,
+        )
+        .await?;
         let values = chunks.clone();
         let document_embeddings = Arc::clone(&embeddings);
         let vectors = match tokio::task::spawn_blocking(move || document_embeddings.embed(&values))
@@ -1630,7 +1519,12 @@ pub async fn process_next_job_with_services(
                 return Err(WorkerError::Embedding(error));
             }
         };
-        mark_job_stage(Arc::clone(&storage), job.clone(), "indexing").await?;
+        mark_job_stage(
+            Arc::clone(&storage),
+            job.clone(),
+            storage::DocumentState::Indexing,
+        )
+        .await?;
         let publication_storage = Arc::clone(&storage);
         let publication_job = job.clone();
         tokio::task::spawn_blocking(move || {
@@ -1682,7 +1576,7 @@ pub async fn process_next_job_with_services(
 async fn mark_job_stage(
     storage: SharedStorage,
     job: storage::ClaimedJob,
-    stage: &'static str,
+    stage: storage::DocumentState,
 ) -> Result<(), WorkerError> {
     tokio::task::spawn_blocking(move || {
         storage
@@ -2165,40 +2059,6 @@ fn validate_metadata(values: &Map<String, Value>) -> Result<(), ApiError> {
         Err(ApiError::Validation(
             "metadata values must be strings, numbers, booleans, or arrays of strings",
         ))
-    }
-}
-
-async fn authenticate(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    mut request: Request,
-    next: Next,
-) -> Result<Response, AuthError> {
-    let supplied = request
-        .headers()
-        .get(http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    let organization = supplied.and_then(|key| {
-        let supplied_hash: [u8; 32] = Sha256::digest(key).into();
-        state
-            .api_keys
-            .iter()
-            .find(|(expected, _)| bool::from(supplied_hash.ct_eq(expected)))
-            .map(|(_, organization)| organization.clone())
-    });
-    let has_session_material = request.headers().contains_key(http::header::COOKIE);
-    let organization = organization.or_else(|| {
-        (supplied.is_none() && !has_session_material && peer.ip().is_loopback())
-            .then(|| state.local_org_id.clone())
-    });
-    if let Some(organization) = organization {
-        request
-            .extensions_mut()
-            .insert(OrganizationId(organization));
-        Ok(next.run(request).await)
-    } else {
-        Err(AuthError)
     }
 }
 

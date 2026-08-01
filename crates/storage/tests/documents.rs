@@ -86,7 +86,7 @@ fn custom_id_requires_exact_tag_array_and_active_returns_existing() {
         storage.upsert_document(first.clone()).expect("active"),
         UpsertResult {
             id: created.id.clone(),
-            status: "queued".into(),
+            status: storage::DocumentState::Queued,
             enqueued: false
         }
     );
@@ -112,7 +112,7 @@ fn done_branches_compare_filtered_ordered_metadata_and_merge_shallowly() {
             .upsert_document(first.clone())
             .expect("equivalent")
             .status,
-        "done"
+        storage::DocumentState::Done
     );
     first.metadata.insert("b".into(), json!(2));
     assert!(
