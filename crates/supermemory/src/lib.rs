@@ -1,6 +1,7 @@
 //! Application configuration and startup.
 
 pub mod credentials;
+#[cfg(feature = "legacy-import")]
 pub mod legacy;
 pub mod model_config;
 
@@ -17,6 +18,7 @@ use std::{
 };
 
 use clap::Parser;
+#[cfg(feature = "legacy-import")]
 use sha2::{Digest, Sha256};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use thiserror::Error;
@@ -135,9 +137,12 @@ async fn start(config: Config) -> Result<(), StartupError> {
         "local SQLite storage",
         &config.database.display().to_string(),
     );
-    let mut storage = tokio::task::spawn_blocking(move || storage::Storage::open(database))
+    let storage = tokio::task::spawn_blocking(move || storage::Storage::open(database))
         .await
         .map_err(StartupError::DatabaseExecutor)??;
+    #[cfg(feature = "legacy-import")]
+    let mut storage = storage;
+    #[cfg(feature = "legacy-import")]
     migrate_legacy_snapshot(&mut storage, &legacy_data_dir)?;
     let organization_id = storage.local_organization_id().to_owned();
     let storage = std::sync::Arc::new(std::sync::Mutex::new(storage));
@@ -257,6 +262,7 @@ fn provider_selection(input: &str) -> Option<(Option<&'static str>, &'static str
     }
 }
 
+#[cfg(feature = "legacy-import")]
 fn migrate_legacy_snapshot(
     storage: &mut storage::Storage,
     legacy_data_dir: &Path,
@@ -594,14 +600,17 @@ pub enum StartupError {
     ProviderPrompt(#[source] std::io::Error),
     #[error("provider setup input closed before a choice was made; no credentials were written")]
     ProviderPromptClosed,
+    #[cfg(feature = "legacy-import")]
     #[error(transparent)]
     LegacyExport(#[from] legacy::LegacyExportError),
+    #[cfg(feature = "legacy-import")]
     #[error("failed to read legacy snapshot {path}; source data was not changed: {source}")]
     ReadLegacySnapshot {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+    #[cfg(feature = "legacy-import")]
     #[error("failed to remove temporary legacy export {path}: {source}")]
     RemoveLegacyExport {
         path: PathBuf,

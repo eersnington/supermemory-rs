@@ -7,7 +7,9 @@ mod provider;
 pub use chunking::{
     ChunkingError, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, chunk_text, normalize_extracted_text,
 };
-pub use embedding::{BGE_DIMENSIONS, EmbeddingError, EmbeddingModel, EmbeddingVector};
+pub use embedding::{
+    BGE_DIMENSIONS, BGE_MODEL_ID, EmbeddingError, EmbeddingModel, EmbeddingVector,
+};
 pub use provider::{
     ExtractionFailure, ExtractionOutcome, ExtractionUsage, MemoryCandidate, MemoryProvider,
     ParentRelation, ProviderConfig, ProviderError, ProviderKind, ProviderModels, RelationKind,

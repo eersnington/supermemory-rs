@@ -14,6 +14,8 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 /// Output width of `Xenova/bge-base-en-v1.5`.
 pub const BGE_DIMENSIONS: usize = 768;
+/// Stable identifier stored alongside embeddings produced by the local model.
+pub const BGE_MODEL_ID: &str = "Xenova/bge-base-en-v1.5:q8:mean:normalized";
 const MAX_TOKENS: usize = 512;
 const MAX_UTF16_UNITS: usize = 8_000;
 
