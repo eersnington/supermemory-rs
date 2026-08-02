@@ -1,6 +1,6 @@
 use super::{
-    ChunkCandidate, ChunkHydration, HashMap, MemoryHydration, MemorySearchHit, SearchHit,
-    SearchOptions, Storage, StorageError, hydrate_memory_hits, json, params, parse_json,
+    ChunkCandidate, ChunkHydration, HashMap, MemoryHydration, MemorySearchHit, MemoryVisibility,
+    SearchHit, SearchOptions, Storage, StorageError, hydrate_memory_hits, json, params, parse_json,
     read_memory, validate_vector, vector_bytes,
 };
 
@@ -70,7 +70,7 @@ impl Storage {
         let container_tags = json(&options.container_tags)?;
         let metadata_filter = options.filters.as_ref().map(json).transpose()?;
         let mut statement = self.connection.prepare(
-            "WITH filtered AS MATERIALIZED (SELECT document_chunks.stable_id, documents.id AS document_id, document_chunks.content AS chunk, chunk_embeddings.vector, document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.content AS document_content FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?3 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?4 AND documents.status='done' AND (?5='[]' OR EXISTS(SELECT 1 FROM json_each(documents.container_tags) stored JOIN json_each(?5) requested ON stored.value=requested.value)) AND (?6 IS NULL OR documents.id=?6 OR documents.custom_id=?6) AND (?7 IS NULL OR documents.filepath=?7 OR (substr(?7, -1)='/' AND substr(documents.filepath, 1, length(?7)-1)=substr(?7, 1, length(?7)-1))) AND (?8 IS NULL OR matches_metadata_filter(documents.metadata, ?8))), ranked AS MATERIALIZED (SELECT *, cosine_similarity(vector, ?1, ?2) AS score FROM filtered) SELECT stable_id, document_id, chunk, score, ordinal, custom_id, metadata, filepath, created_at, updated_at, document_content FROM ranked WHERE score>=?9 ORDER BY score DESC, document_id, ordinal, stable_id LIMIT ?10",
+            "WITH filtered AS MATERIALIZED (SELECT document_chunks.stable_id, documents.id AS document_id, document_chunks.content AS chunk, chunk_embeddings.vector, document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, documents.content AS document_content FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?3 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?4 AND documents.status='done' AND (?5='[]' OR EXISTS(SELECT 1 FROM json_each(documents.container_tags) stored JOIN json_each(?5) requested ON stored.value=requested.value)) AND (?6 IS NULL OR documents.id=?6 OR documents.custom_id=?6) AND (?7 IS NULL OR documents.filepath=?7 OR (substr(?7, -1)='/' AND substr(documents.filepath, 1, length(?7)-1)=substr(?7, 1, length(?7)-1))) AND (?8 IS NULL OR matches_metadata_filter(documents.metadata, ?8))), ranked AS MATERIALIZED (SELECT *, vector_dot(vector, ?1, ?2) AS score FROM filtered) SELECT stable_id, document_id, chunk, score, ordinal, custom_id, metadata, filepath, created_at, updated_at, document_content FROM ranked WHERE score>=?9 ORDER BY score DESC, document_id, ordinal, stable_id LIMIT ?10",
         ).map_err(StorageError::Read)?;
         statement
             .query_map(
@@ -127,7 +127,12 @@ impl Storage {
             container_tag,
             limit,
             threshold,
-            include_forgotten,
+            MemoryVisibility {
+                include_forgotten,
+                include_expired: include_forgotten,
+                include_superseded: include_forgotten,
+                include_inactive_embeddings: include_forgotten,
+            },
             MemoryHydration {
                 relations: true,
                 documents: true,
@@ -148,13 +153,13 @@ impl Storage {
         container_tag: &str,
         limit: usize,
         threshold: f32,
-        include_forgotten: bool,
+        visibility: MemoryVisibility,
         hydration: MemoryHydration,
     ) -> Result<Vec<MemorySearchHit>, StorageError> {
         validate_vector(query, query.len())?;
         let query_bytes = vector_bytes(query);
         let mut statement = self.connection.prepare(
-            "WITH ranked AS MATERIALIZED (SELECT memories.id, memories.content, memories.metadata, memories.is_inferred, memories.is_static, memories.is_latest, memories.is_forgotten, memories.root_memory_id, memories.parent_memory_id, memories.version, memories.forget_after, memories.forget_reason, memories.created_at, memories.updated_at, cosine_similarity(memory_embeddings.vector, ?1, ?2) AS similarity FROM memory_embeddings JOIN memories ON memories.id=memory_embeddings.memory_id WHERE memories.org_id=?3 AND memories.container_tag=?4 AND memory_embeddings.model_id=?5 AND memory_embeddings.dimensions=?2 AND (memory_embeddings.active=1 OR ?6=1) AND (memories.is_latest=1 OR ?6=1) AND (memories.is_forgotten=0 OR ?6=1) AND (memories.forget_after IS NULL OR datetime(memories.forget_after)>CURRENT_TIMESTAMP OR ?6=1)) SELECT * FROM ranked WHERE similarity>=?7 ORDER BY similarity DESC, id LIMIT ?8",
+            "WITH ranked AS MATERIALIZED (SELECT memories.id, memories.content, memories.metadata, memories.is_inferred, memories.is_static, memories.is_latest, memories.is_forgotten, memories.root_memory_id, memories.parent_memory_id, memories.version, memories.forget_after, memories.forget_reason, memories.created_at, memories.updated_at, vector_dot(memory_embeddings.vector, ?1, ?2) AS similarity FROM memory_embeddings JOIN memories ON memories.id=memory_embeddings.memory_id WHERE memories.org_id=?3 AND memories.container_tag=?4 AND memory_embeddings.model_id=?5 AND memory_embeddings.dimensions=?2 AND (memory_embeddings.active=1 OR ?6=1) AND (memories.is_latest=1 OR ?7=1) AND (memories.is_forgotten=0 OR ?8=1) AND (memories.forget_after IS NULL OR datetime(memories.forget_after)>CURRENT_TIMESTAMP OR ?9=1)) SELECT * FROM ranked WHERE similarity>=?10 ORDER BY similarity DESC, id LIMIT ?11",
         ).map_err(StorageError::Read)?;
         let rows = statement
             .query_map(
@@ -164,7 +169,10 @@ impl Storage {
                     org_id,
                     container_tag,
                     model_id,
-                    include_forgotten,
+                    visibility.include_inactive_embeddings,
+                    visibility.include_superseded,
+                    visibility.include_forgotten,
+                    visibility.include_expired,
                     threshold,
                     limit
                 ],
@@ -207,7 +215,7 @@ impl Storage {
         let container_tags = json(&options.container_tags)?;
         let metadata_filter = options.filters.as_ref().map(json).transpose()?;
         let mut statement = self.connection.prepare(
-            "SELECT document_chunks.id, document_chunks.stable_id, documents.id, document_chunks.ordinal, cosine_similarity(chunk_embeddings.vector, ?1, ?2) AS score FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?3 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?4 AND documents.status='done' AND (?5='[]' OR EXISTS(SELECT 1 FROM json_each(documents.container_tags) stored JOIN json_each(?5) requested ON stored.value=requested.value)) AND (?6 IS NULL OR documents.id=?6 OR documents.custom_id=?6) AND (?7 IS NULL OR documents.filepath=?7 OR (substr(?7, -1)='/' AND substr(documents.filepath, 1, length(?7)-1)=substr(?7, 1, length(?7)-1))) AND (?8 IS NULL OR matches_metadata_filter(documents.metadata, ?8)) AND cosine_similarity(chunk_embeddings.vector, ?1, ?2)>=?9 ORDER BY score DESC, documents.id, document_chunks.ordinal, document_chunks.stable_id LIMIT ?10",
+            "SELECT document_chunks.id, document_chunks.stable_id, documents.id, document_chunks.ordinal, vector_dot(chunk_embeddings.vector, ?1, ?2) AS score FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?3 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?4 AND documents.status='done' AND (?5='[]' OR EXISTS(SELECT 1 FROM json_each(documents.container_tags) stored JOIN json_each(?5) requested ON stored.value=requested.value)) AND (?6 IS NULL OR documents.id=?6 OR documents.custom_id=?6) AND (?7 IS NULL OR documents.filepath=?7 OR (substr(?7, -1)='/' AND substr(documents.filepath, 1, length(?7)-1)=substr(?7, 1, length(?7)-1))) AND (?8 IS NULL OR matches_metadata_filter(documents.metadata, ?8)) AND vector_dot(chunk_embeddings.vector, ?1, ?2)>=?9 ORDER BY score DESC, documents.id, document_chunks.ordinal, document_chunks.stable_id LIMIT ?10",
         ).map_err(StorageError::Read)?;
         statement
             .query_map(

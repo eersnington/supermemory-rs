@@ -72,7 +72,10 @@ impl SearchEngine {
                                 .map_or("sm_project_default", String::as_str),
                             candidate_limit,
                             threshold,
-                            query.include_forgotten,
+                            storage::MemoryVisibility {
+                                include_forgotten: query.include_forgotten,
+                                ..storage::MemoryVisibility::default()
+                            },
                             storage::MemoryHydration {
                                 relations: query.include_related,
                                 documents: query.include_documents,

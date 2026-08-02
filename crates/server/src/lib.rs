@@ -1262,7 +1262,7 @@ async fn profile_search(
                 &container_tag,
                 15,
                 threshold,
-                false,
+                storage::MemoryVisibility::default(),
                 storage::MemoryHydration::default(),
             )
             .map_err(ApiError::Storage)

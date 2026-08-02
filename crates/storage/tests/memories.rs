@@ -82,7 +82,7 @@ fn reconciliation_builds_version_lineage_and_invalidates_update_parent() {
             "sm_project_default",
             10,
             0.0,
-            false,
+            storage::MemoryVisibility::default(),
             MemoryHydration::default(),
         )
         .expect("shallow search");
@@ -97,7 +97,7 @@ fn reconciliation_builds_version_lineage_and_invalidates_update_parent() {
             "sm_project_default",
             10,
             0.0,
-            false,
+            storage::MemoryVisibility::default(),
             MemoryHydration {
                 relations: true,
                 documents: true,

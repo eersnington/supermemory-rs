@@ -350,6 +350,15 @@ pub struct MemoryHydration {
     pub documents: bool,
 }
 
+/// Independent visibility controls for historical memory states.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryVisibility {
+    pub include_forgotten: bool,
+    pub include_expired: bool,
+    pub include_superseded: bool,
+    pub include_inactive_embeddings: bool,
+}
+
 /// Exact semantic memory search result.
 #[derive(Debug, Clone)]
 pub struct MemorySearchHit {
@@ -441,6 +450,8 @@ mod memories;
 mod memory_jobs;
 mod migrations;
 mod search;
+#[cfg(test)]
+mod vector_function_tests;
 
 pub use documents::DocumentChunk;
 
@@ -1620,6 +1631,43 @@ fn register_vector_functions(connection: &Connection) -> Result<(), StorageError
                     ));
                 }
                 Ok(dot / norm)
+            },
+        )
+        .map_err(StorageError::Configure)?;
+    connection
+        .create_scalar_function(
+            "vector_dot",
+            3,
+            FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+            |context| {
+                let left = context.get_raw(0).as_blob()?;
+                let right = context.get_raw(1).as_blob()?;
+                let dimensions = usize::try_from(context.get::<i64>(2)?)
+                    .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                let expected = dimensions.saturating_mul(std::mem::size_of::<f32>());
+                if left.len() != expected || right.len() != expected {
+                    return Err(rusqlite::Error::UserFunctionError(
+                        format!(
+                            "vector byte length mismatch: expected {expected}, found {} and {}",
+                            left.len(),
+                            right.len()
+                        )
+                        .into(),
+                    ));
+                }
+                left.chunks_exact(4).zip(right.chunks_exact(4)).try_fold(
+                    0.0_f32,
+                    |dot, (left, right)| {
+                        let left = f32::from_le_bytes([left[0], left[1], left[2], left[3]]);
+                        let right = f32::from_le_bytes([right[0], right[1], right[2], right[3]]);
+                        if !left.is_finite() || !right.is_finite() {
+                            return Err(rusqlite::Error::UserFunctionError(
+                                "vector contains a non-finite component".into(),
+                            ));
+                        }
+                        Ok(dot + left * right)
+                    },
+                )
             },
         )
         .map_err(StorageError::Configure)?;
