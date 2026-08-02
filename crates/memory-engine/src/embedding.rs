@@ -10,7 +10,9 @@ use ort::{
     value::TensorRef,
 };
 use thiserror::Error;
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tokenizers::{
+    Encoding, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, pad_encodings,
+};
 
 /// Output width of `Xenova/bge-base-en-v1.5`.
 pub const BGE_DIMENSIONS: usize = 768;
@@ -70,6 +72,13 @@ impl EmbeddingVector {
 pub struct EmbeddingModel {
     tokenizer: Tokenizer,
     session: Mutex<Session>,
+}
+
+/// Tokenized input retained by the scheduler until it is included in an ONNX batch.
+pub struct PreparedEmbeddingInput {
+    pub(crate) text: String,
+    pub(crate) token_count: usize,
+    encoding: Option<Encoding>,
 }
 
 impl EmbeddingModel {
@@ -143,14 +152,55 @@ impl EmbeddingModel {
         if values.is_empty() {
             return Ok(Vec::new());
         }
-        let truncated: Vec<String> = values
+        let mut prepared = values
             .iter()
-            .map(|value| truncate_utf16(value, MAX_UTF16_UNITS))
-            .collect();
-        let encodings = self
+            .map(|value| self.prepare(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.embed_prepared(&mut prepared)
+    }
+
+    /// Tokenizes one input once so scheduling can use its actual sequence length.
+    ///
+    /// # Errors
+    /// Returns an error if the tokenizer rejects the input.
+    pub fn prepare(&self, value: &str) -> Result<PreparedEmbeddingInput, EmbeddingError> {
+        let text = truncate_utf16(value, MAX_UTF16_UNITS);
+        let encoding = self
             .tokenizer
-            .encode_batch(truncated, true)
+            .encode(text.clone(), true)
             .map_err(EmbeddingError::Tokenize)?;
+        Ok(PreparedEmbeddingInput {
+            text,
+            token_count: encoding.len(),
+            encoding: Some(encoding),
+        })
+    }
+
+    /// Runs ONNX inference for inputs prepared by [`Self::prepare`].
+    ///
+    /// # Errors
+    /// Returns an error if a prepared input is reused or inference fails.
+    pub fn embed_prepared(
+        &self,
+        values: &mut [PreparedEmbeddingInput],
+    ) -> Result<Vec<EmbeddingVector>, EmbeddingError> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut encodings = values
+            .iter_mut()
+            .map(|value| {
+                value
+                    .encoding
+                    .take()
+                    .ok_or(EmbeddingError::PreparedInputConsumed)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let padding = self
+            .tokenizer
+            .get_padding()
+            .ok_or(EmbeddingError::PaddingUnavailable)?;
+        pad_encodings(&mut encodings, padding).map_err(EmbeddingError::Tokenize)?;
         let sequence = encodings[0].len();
         let batch = encodings.len();
         let ids: Vec<i64> = encodings
@@ -297,4 +347,8 @@ pub enum EmbeddingError {
     InvalidNorm { norm: f32 },
     #[error("embedding tokenizer produced no attended tokens")]
     EmptyTokenSequence,
+    #[error("embedding input was submitted for inference more than once")]
+    PreparedInputConsumed,
+    #[error("embedding tokenizer padding is not configured")]
+    PaddingUnavailable,
 }

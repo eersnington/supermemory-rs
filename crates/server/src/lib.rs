@@ -19,12 +19,9 @@ use ui::{api_reference, landing_page, openapi};
 
 use health::ServiceHealth;
 pub use runtime::ServerRuntime;
+use runtime::{StorageReaderError, StorageReaders};
 
-use std::{
-    net::SocketAddr,
-    num::NonZeroUsize,
-    sync::{Arc, Mutex},
-};
+use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -41,7 +38,6 @@ use storage::{Storage, UpsertDocument};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 
 type SharedHealth = Arc<ServiceHealth>;
 
@@ -54,8 +50,7 @@ struct AppState {
     api_key: Option<String>,
     port: u16,
     writer: writer::StorageWriter,
-    search_connections: Arc<Mutex<Vec<Storage>>>,
-    search_permits: Arc<Semaphore>,
+    readers: StorageReaders,
     embedding_executor: Option<memory_engine::EmbeddingExecutor>,
     local_org_id: String,
     health: SharedHealth,
@@ -103,19 +98,12 @@ fn router_with_runtime_health(
     if let Some(key) = api_key.as_ref() {
         api_keys.push((Sha256::digest(key).into(), local_org_id.clone()));
     }
-    let search_connections = runtime.search_connections();
-    let search_permits = Arc::new(Semaphore::new(
-        search_connections
-            .lock()
-            .map_or(1, |readers| readers.len().max(1)),
-    ));
     let state = AppState {
         writer: runtime.writer(),
         api_keys: Arc::new(api_keys),
         api_key,
         port,
-        search_connections,
-        search_permits,
+        readers: runtime.readers(),
         embedding_executor: runtime.embeddings(),
         local_org_id,
         health,
@@ -228,6 +216,7 @@ pub async fn serve_with_services_ready(
                 tokio::spawn(
                     memory_extraction_coordinator::MemoryExtractionCoordinator::new(
                         runtime.writer(),
+                        runtime.readers(),
                         executor.clone(),
                         Arc::clone(provider),
                     )
@@ -421,35 +410,16 @@ where
     T: Send + 'static,
     F: FnOnce(&Storage) -> Result<T, ApiError> + Send + 'static,
 {
-    let writer = state.writer.clone();
-    let connections = Arc::clone(&state.search_connections);
-    let permit = Arc::clone(&state.search_permits)
-        .acquire_owned()
+    state
+        .readers
+        .execute(run)
         .await
-        .map_err(|_| ApiError::StorageUnavailable)?;
-    let connection = connections
-        .lock()
-        .map_err(|_| ApiError::StorageUnavailable)?
-        .pop();
-    if let Some(connection) = connection {
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let result = run(&connection);
-            connections
-                .lock()
-                .map_err(|_| ApiError::StorageUnavailable)?
-                .push(connection);
-            result
-        })
-        .await
-        .map_err(ApiError::DatabaseExecutor)?
-    } else {
-        let _permit = permit;
-        writer
-            .execute(move |storage| run(storage))
-            .await
-            .map_err(|_| ApiError::StorageUnavailable)?
-    }
+        .map_err(|error| match error {
+            StorageReaderError::Executor(error) => ApiError::DatabaseExecutor(error),
+            StorageReaderError::Unavailable | StorageReaderError::Closed => {
+                ApiError::StorageUnavailable
+            }
+        })?
 }
 
 async fn v3_search(

@@ -121,11 +121,8 @@ impl IndexingCoordinator {
         };
         self.stage(job.clone(), storage::DocumentState::Embedding)
             .await?;
-        // Move chunks into the executor rather than cloning a whole document's
-        // chunk list. Re-chunking immutable job content after inference keeps the
-        // writer payload owned without hidden scheduler state.
-        let vectors = match embeddings
-            .embed(memory_engine::EmbeddingPriority::Document, chunks)
+        let embedded = match embeddings
+            .embed_owned(memory_engine::EmbeddingPriority::Document, chunks)
             .await
         {
             Ok(vectors) => vectors,
@@ -134,19 +131,16 @@ impl IndexingCoordinator {
                 return Err(WorkerError::EmbeddingExecutor(error));
             }
         };
-        let chunks =
-            memory_engine::chunk_text(&job.content, None).map_err(WorkerError::Chunking)?;
         self.stage(job.clone(), storage::DocumentState::Indexing)
             .await?;
         let extraction = self.provider.is_some();
         self.writer
             .execute(move |storage| {
-                let embedded = chunks
+                let embedded = embedded
                     .iter()
-                    .zip(&vectors)
-                    .map(|(content, vector)| storage::EmbeddedChunk {
-                        content,
-                        vector: vector.as_slice(),
+                    .map(|chunk| storage::EmbeddedChunk {
+                        content: &chunk.text,
+                        vector: chunk.vector.as_slice(),
                     })
                     .collect::<Vec<_>>();
                 if extraction {

@@ -10,8 +10,11 @@ pub use chunking::{
 };
 pub use embedding::{
     BGE_DIMENSIONS, BGE_MODEL_ID, EmbeddingError, EmbeddingModel, EmbeddingVector,
+    PreparedEmbeddingInput,
 };
-pub use embedding_executor::{EmbeddingExecutor, EmbeddingExecutorError, EmbeddingPriority};
+pub use embedding_executor::{
+    EmbeddedText, EmbeddingExecutor, EmbeddingExecutorError, EmbeddingPriority,
+};
 pub use provider::{
     ExtractionFailure, ExtractionOutcome, ExtractionUsage, MemoryCandidate, MemoryProvider,
     ParentRelation, ProviderConfig, ProviderError, ProviderKind, ProviderModels, RelationKind,

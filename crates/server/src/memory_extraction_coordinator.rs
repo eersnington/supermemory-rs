@@ -3,14 +3,19 @@
 use std::{sync::Arc, time::Duration};
 
 use serde_json::{Map, Value};
+use tokio::{task::JoinSet, time::interval};
 
-use super::{WorkerError, health::ServiceHealth, writer::StorageWriter};
+use super::{WorkerError, health::ServiceHealth, runtime::StorageReaders, writer::StorageWriter};
+
+const PROVIDER_CONCURRENCY: usize = 8;
+const DURABILITY_RESCAN: Duration = Duration::from_secs(5);
 
 /// Coordinates claim, provider extraction, cached recovery, embedding, and atomic
 /// reconciliation for one durable extraction job.
 #[derive(Clone)]
 pub(super) struct MemoryExtractionCoordinator {
     writer: StorageWriter,
+    readers: StorageReaders,
     embeddings: memory_engine::EmbeddingExecutor,
     provider: Arc<memory_engine::MemoryProvider>,
 }
@@ -18,29 +23,23 @@ pub(super) struct MemoryExtractionCoordinator {
 impl MemoryExtractionCoordinator {
     pub(super) fn new(
         writer: StorageWriter,
+        readers: StorageReaders,
         embeddings: memory_engine::EmbeddingExecutor,
         provider: Arc<memory_engine::MemoryProvider>,
     ) -> Self {
         Self {
             writer,
+            readers,
             embeddings,
             provider,
         }
     }
 
-    /// Claims at most one job; the coordinator's notification loop supplies
-    /// backpressure instead of speculative empty claims from many workers.
-    pub(super) async fn process_available(&self) -> Result<bool, WorkerError> {
-        let job = self
-            .writer
-            .claim_memory_job()
-            .await
-            .map_err(|_| WorkerError::StorageUnavailable)?
-            .map_err(WorkerError::Storage)?;
-        let Some(job) = job else { return Ok(false) };
+    async fn process(&self, job: storage::ClaimedMemoryJob) -> Result<(), WorkerError> {
         let candidates = self.extract(&job).await?;
         if candidates.is_empty() {
-            return self.complete(job).await;
+            self.complete(job).await?;
+            return Ok(());
         }
         let values = candidates
             .iter()
@@ -64,9 +63,9 @@ impl MemoryExtractionCoordinator {
             }
         };
         match self.reconcile(&job, candidates, vectors).await {
-            Ok(()) => Ok(true),
+            Ok(()) => Ok(()),
             Err(WorkerError::Storage(storage::StorageError::StaleRevision { .. })) => {
-                self.complete(job).await
+                self.complete(job).await.map(|_| ())
             }
             Err(error) if error.is_fatal() => Err(error),
             Err(error) => {
@@ -86,24 +85,76 @@ impl MemoryExtractionCoordinator {
     /// or recovered jobs. There is intentionally no short polling interval.
     pub(super) async fn run(self, health: Arc<ServiceHealth>) {
         let notify = self.writer.memory_available();
-        let mut rescan = tokio::time::interval(Duration::from_secs(5));
+        let mut rescan = interval(DURABILITY_RESCAN);
+        let mut jobs = JoinSet::new();
+        let mut concurrency = PROVIDER_CONCURRENCY;
         loop {
             if health.is_degraded() {
                 break;
             }
-            match self.process_available().await {
-                Ok(true) => {}
-                Ok(false) => {
-                    tokio::select! { () = notify.notified() => {}, _ = rescan.tick() => {} }
+            while jobs.len() < concurrency {
+                let job = match self
+                    .writer
+                    .claim_memory_job()
+                    .await
+                    .map_err(|_| WorkerError::StorageUnavailable)
+                    .and_then(|result| result.map_err(WorkerError::Storage))
+                {
+                    Ok(Some(job)) => job,
+                    Ok(None) => break,
+                    Err(error) if error.is_fatal() => {
+                        health.degrade();
+                        tracing::error!(%error, "memory extraction coordinator stopped; service degraded");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not claim memory extraction job");
+                        break;
+                    }
+                };
+                let coordinator = self.clone();
+                jobs.spawn(async move { coordinator.process(job).await });
+            }
+
+            if jobs.is_empty() {
+                tokio::select! {
+                    () = notify.notified() => {},
+                    _ = rescan.tick() => {
+                        // Restore capacity gradually after transient provider throttling.
+                        concurrency = (concurrency + 1).min(PROVIDER_CONCURRENCY);
+                    }
                 }
-                Err(error) if error.is_fatal() => {
-                    health.degrade();
-                    tracing::error!(%error, "memory extraction coordinator stopped; service degraded");
-                    break;
+                continue;
+            }
+
+            tokio::select! {
+                result = jobs.join_next() => {
+                    let Some(result) = result else { continue };
+                    match result {
+                        Ok(Ok(())) => {},
+                        Ok(Err(error)) if error.is_fatal() => {
+                            health.degrade();
+                            tracing::error!(%error, "memory extraction coordinator stopped; service degraded");
+                            return;
+                        }
+                        Ok(Err(error)) => {
+                            if matches!(&error, WorkerError::Provider(provider) if provider.failure() == memory_engine::ExtractionFailure::RateLimited) {
+                                concurrency = (concurrency / 2).max(1);
+                                tracing::warn!(%error, concurrency, "provider rate limited extraction; reducing concurrency");
+                            } else {
+                                tracing::warn!(%error, "memory extraction job failed");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "memory extraction task stopped unexpectedly");
+                            health.degrade();
+                            return;
+                        }
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "memory extraction job failed");
-                    tokio::select! { () = notify.notified() => {}, _ = rescan.tick() => {} }
+                () = notify.notified() => {},
+                _ = rescan.tick() => {
+                    concurrency = (concurrency + 1).min(PROVIDER_CONCURRENCY);
                 }
             }
         }
@@ -119,7 +170,7 @@ impl MemoryExtractionCoordinator {
         let organization = job.organization_id.clone();
         let container = job.container_tag.clone();
         let existing = self
-            .writer
+            .readers
             .execute(move |storage| {
                 storage
                     .existing_memories_for_extraction(&organization, &container)

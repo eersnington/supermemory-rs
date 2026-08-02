@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{EmbeddingError, EmbeddingModel, EmbeddingVector};
+use crate::{EmbeddingError, EmbeddingModel, EmbeddingVector, PreparedEmbeddingInput};
 
 /// Scheduling class for embedding work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,16 +18,25 @@ pub enum EmbeddingPriority {
 }
 
 struct Request {
-    values: Vec<String>,
+    values: Vec<PreparedEmbeddingInput>,
+    item_count: usize,
     estimated_tokens: usize,
     max_item_tokens: usize,
     enqueued_at: Instant,
-    reply: oneshot::Sender<Result<Vec<EmbeddingVector>, EmbeddingExecutorError>>,
+    reply: oneshot::Sender<Result<Vec<EmbeddedText>, EmbeddingExecutorError>>,
+}
+
+/// One source text paired with its embedding after executor-owned inference.
+#[derive(Debug)]
+pub struct EmbeddedText {
+    pub text: String,
+    pub vector: EmbeddingVector,
 }
 
 /// Bounded executor that prevents callers from accumulating blocking inference tasks.
 #[derive(Clone)]
 pub struct EmbeddingExecutor {
+    model: Arc<EmbeddingModel>,
     query: mpsc::Sender<Request>,
     bulk: mpsc::Sender<Request>,
     max_items: usize,
@@ -51,8 +60,15 @@ impl EmbeddingExecutor {
     ) -> Self {
         let (query_tx, query_rx) = mpsc::channel(queue_capacity);
         let (bulk_tx, bulk_rx) = mpsc::channel(queue_capacity);
-        tokio::spawn(run(model, query_rx, bulk_rx, max_items, max_padded_tokens));
+        tokio::spawn(run(
+            Arc::clone(&model),
+            query_rx,
+            bulk_rx,
+            max_items,
+            max_padded_tokens,
+        ));
         Self {
+            model,
             query: query_tx,
             bulk: bulk_tx,
             max_items,
@@ -72,9 +88,35 @@ impl EmbeddingExecutor {
         priority: EmbeddingPriority,
         values: Vec<String>,
     ) -> Result<Vec<EmbeddingVector>, EmbeddingExecutorError> {
+        Ok(self
+            .embed_owned(priority, values)
+            .await?
+            .into_iter()
+            .map(|item| item.vector)
+            .collect())
+    }
+
+    /// Embeds owned text and returns each original input with its vector. This
+    /// lets publication reuse document chunks without recomputing boundaries.
+    ///
+    /// # Errors
+    /// Returns an error if tokenization, batch admission, or inference fails.
+    pub async fn embed_owned(
+        &self,
+        priority: EmbeddingPriority,
+        values: Vec<String>,
+    ) -> Result<Vec<EmbeddedText>, EmbeddingExecutorError> {
+        let values = values
+            .into_iter()
+            .map(|value| {
+                self.model
+                    .prepare(&value)
+                    .map_err(EmbeddingExecutorError::Embedding)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let lengths = values
             .iter()
-            .map(|value| estimated_tokens(value))
+            .map(|value| value.token_count)
             .collect::<Vec<_>>();
         let batches = microbatch_lengths(&lengths, self.max_items, self.max_padded_tokens)?;
         let mut output = Vec::with_capacity(values.len());
@@ -93,17 +135,17 @@ impl EmbeddingExecutor {
     async fn submit(
         &self,
         priority: EmbeddingPriority,
-        values: Vec<String>,
-    ) -> Result<Vec<EmbeddingVector>, EmbeddingExecutorError> {
+        values: Vec<PreparedEmbeddingInput>,
+    ) -> Result<Vec<EmbeddedText>, EmbeddingExecutorError> {
         let (reply, response) = oneshot::channel();
-        let total_estimated_tokens: usize =
-            values.iter().map(|value| estimated_tokens(value)).sum();
+        let total_estimated_tokens: usize = values.iter().map(|value| value.token_count).sum();
         let max_item_tokens = values
             .iter()
-            .map(|value| estimated_tokens(value))
+            .map(|value| value.token_count)
             .max()
             .unwrap_or(1);
         let request = Request {
+            item_count: values.len(),
             values,
             estimated_tokens: total_estimated_tokens,
             max_item_tokens,
@@ -153,12 +195,6 @@ fn microbatch_lengths(
         batches.push(items);
     }
     Ok(batches)
-}
-
-// BGE tokenization is bounded at 512 tokens; this conservative estimate is used only
-// for scheduling, while the model remains the tokenizer of record.
-fn estimated_tokens(value: &str) -> usize {
-    value.encode_utf16().count().div_ceil(4).clamp(1, 512)
 }
 
 #[expect(
@@ -220,15 +256,20 @@ async fn run(
         let mut items = requests[0].1.values.len();
         let mut longest = requests[0].1.max_item_tokens;
         while items < max_items {
-            let next = query
-                .try_recv()
-                .ok()
-                .map(|request| (EmbeddingPriority::Query, request))
-                .or_else(|| {
-                    bulk.try_recv()
-                        .ok()
-                        .map(|request| (EmbeddingPriority::Document, request))
-                });
+            // Never merge interactive queries with bulk work: a single long
+            // document chunk would otherwise determine a query's padded shape.
+            let next = match priority {
+                EmbeddingPriority::Query => query
+                    .try_recv()
+                    .ok()
+                    .map(|request| (EmbeddingPriority::Query, request)),
+                EmbeddingPriority::Document
+                | EmbeddingPriority::Memory
+                | EmbeddingPriority::Warmup => bulk
+                    .try_recv()
+                    .ok()
+                    .map(|request| (EmbeddingPriority::Document, request)),
+            };
             let Some(next) = next else { break };
             let padded_tokens = (items + next.1.values.len()) * longest.max(next.1.max_item_tokens);
             if items + next.1.values.len() > max_items || padded_tokens > max_padded_tokens {
@@ -246,18 +287,20 @@ async fn run(
             .map(|(_, request)| request.enqueued_at.elapsed())
             .max()
             .unwrap_or_default();
-        let values = requests
-            .iter()
-            .flat_map(|(_, request)| request.values.iter().cloned())
+        let mut values = requests
+            .iter_mut()
+            .flat_map(|(_, request)| std::mem::take(&mut request.values))
             .collect::<Vec<_>>();
         let started = Instant::now();
         let result = tokio::task::spawn_blocking({
             let model = Arc::clone(&model);
-            move || model.embed(&values)
+            move || {
+                let result = model.embed_prepared(&mut values);
+                (values, result)
+            }
         })
         .await
-        .map_err(|_| EmbeddingExecutorError::Closed)
-        .and_then(|result| result.map_err(EmbeddingExecutorError::Embedding));
+        .map_err(|_| EmbeddingExecutorError::Closed);
         tracing::info!(
             ?priority,
             requests = requests.len(),
@@ -272,11 +315,28 @@ async fn run(
             "embedding_batch"
         );
         match result {
-            Ok(mut vectors) => {
+            Ok((mut values, Ok(mut vectors))) => {
                 for (_, request) in requests {
-                    let count = request.values.len();
-                    let vectors = vectors.drain(..count).collect();
-                    let _ = request.reply.send(Ok(vectors));
+                    let count = request.item_count;
+                    let vectors = vectors.drain(..count);
+                    let embedded = values
+                        .drain(..count)
+                        .zip(vectors)
+                        .map(|(input, vector)| EmbeddedText {
+                            text: input.text,
+                            vector,
+                        })
+                        .collect();
+                    let _ = request.reply.send(Ok(embedded));
+                }
+            }
+            Ok((_, Err(error))) => {
+                let error = EmbeddingExecutorError::Embedding(error);
+                let message = error.to_string();
+                for (_, request) in requests {
+                    let _ = request.reply.send(Err(EmbeddingExecutorError::BatchFailed {
+                        message: message.clone(),
+                    }));
                 }
             }
             Err(error) => {

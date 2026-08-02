@@ -250,6 +250,8 @@ impl SearchEngine {
         let vector = self.embed_query(query.text.clone()).await?;
         let memory_mode = query.mode != SearchMode::Documents;
         let document_mode = query.mode != SearchMode::Memories;
+        let lexical_mode =
+            vector.is_none() || query.mode == SearchMode::Hybrid || lexical_intent(&query.text);
         let candidate_limit = query.limit.get().saturating_mul(5).clamp(20, 500);
         let organization = organization.to_owned();
         let text = query.text.clone();
@@ -286,7 +288,7 @@ impl SearchEngine {
                 } else {
                     Vec::new()
                 };
-                let lexical_memories = if memory_mode {
+                let lexical_memories = if memory_mode && lexical_mode {
                     storage
                         .search_memory_lexical_candidates(
                             &organization,
@@ -317,7 +319,7 @@ impl SearchEngine {
                 } else {
                     Vec::new()
                 };
-                let lexical_chunks = if document_mode {
+                let lexical_chunks = if document_mode && lexical_mode {
                     storage
                         .search_chunk_lexical_candidates(&text, candidate_limit, &options)
                         .map_err(ApiError::Storage)?
@@ -410,6 +412,16 @@ impl SearchEngine {
             results: search_projection::fit_search_context(results),
         })
     }
+}
+
+/// Lexical ranking is valuable for identifiers and exact facts, but needlessly
+/// duplicates work for ordinary natural-language semantic questions.
+fn lexical_intent(query: &str) -> bool {
+    query.chars().any(|character| {
+        character.is_ascii_digit()
+            || matches!(character, '"' | '\'' | '_' | '-' | '/' | '@' | '#')
+            || character.is_ascii_uppercase()
+    })
 }
 
 fn group_v3_results(

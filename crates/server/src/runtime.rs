@@ -1,6 +1,7 @@
 //! Process-scoped ownership of database connections and embedding inference.
 
 use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
 
 use crate::writer::StorageWriter;
 
@@ -15,7 +16,66 @@ pub struct ServerRuntime {
     embeddings: Option<memory_engine::EmbeddingExecutor>,
     local_org_id: String,
     api_key_identities: Vec<storage::ApiKeyIdentity>,
-    search_connections: Arc<Mutex<Vec<storage::Storage>>>,
+    readers: StorageReaders,
+}
+
+/// Bounded read-only `SQLite` access shared by HTTP search and background context reads.
+#[derive(Clone)]
+pub(crate) struct StorageReaders {
+    writer: StorageWriter,
+    connections: Arc<Mutex<Vec<storage::Storage>>>,
+    permits: Arc<Semaphore>,
+}
+
+impl StorageReaders {
+    pub(crate) async fn execute<T, E>(
+        &self,
+        operation: impl FnOnce(&storage::Storage) -> Result<T, E> + Send + 'static,
+    ) -> Result<Result<T, E>, StorageReaderError>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| StorageReaderError::Closed)?;
+        let connection = self
+            .connections
+            .lock()
+            .map_err(|_| StorageReaderError::Unavailable)?
+            .pop();
+        if let Some(connection) = connection {
+            let connections = Arc::clone(&self.connections);
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let result = operation(&connection);
+                connections
+                    .lock()
+                    .map_err(|_| StorageReaderError::Unavailable)?
+                    .push(connection);
+                Ok(result)
+            })
+            .await
+            .map_err(StorageReaderError::Executor)?
+        } else {
+            let _permit = permit;
+            self.writer
+                .execute(move |storage| operation(storage))
+                .await
+                .map_err(|_| StorageReaderError::Closed)
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StorageReaderError {
+    #[error("SQLite reader pool is unavailable")]
+    Unavailable,
+    #[error("SQLite reader task stopped before completing the operation: {0}")]
+    Executor(#[source] tokio::task::JoinError),
+    #[error("SQLite reader pool has stopped")]
+    Closed,
 }
 
 impl ServerRuntime {
@@ -40,13 +100,19 @@ impl ServerRuntime {
                 }
             }
         }
+        let writer = StorageWriter::start(storage, 128);
+        let readers = StorageReaders {
+            writer: writer.clone(),
+            permits: Arc::new(Semaphore::new(readers.len().max(1))),
+            connections: Arc::new(Mutex::new(readers)),
+        };
         Self {
-            writer: StorageWriter::start(storage, 128),
+            writer,
             embeddings: model
                 .map(|model| memory_engine::EmbeddingExecutor::with_limits(model, 64, 32, 8_192)),
             local_org_id,
             api_key_identities,
-            search_connections: Arc::new(Mutex::new(readers)),
+            readers,
         }
     }
     pub(crate) fn writer(&self) -> StorageWriter {
@@ -61,7 +127,7 @@ impl ServerRuntime {
     pub(crate) fn api_key_identities(&self) -> &[storage::ApiKeyIdentity] {
         &self.api_key_identities
     }
-    pub(crate) fn search_connections(&self) -> Arc<Mutex<Vec<storage::Storage>>> {
-        Arc::clone(&self.search_connections)
+    pub(crate) fn readers(&self) -> StorageReaders {
+        self.readers.clone()
     }
 }
