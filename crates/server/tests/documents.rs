@@ -1,8 +1,4 @@
-use std::{
-    net::SocketAddr,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     body::{Body, to_bytes},
@@ -10,17 +6,16 @@ use axum::{
     response::Response,
 };
 use memory_engine::EmbeddingModel;
-use serde_json::{Value, json};
-use server::{
-    SharedStorage, process_next_job, process_next_job_with_embeddings, router,
-    router_with_embeddings,
-};
-use storage::Storage;
+use serde_json::{Map, Value, json};
+use server::{IndexingWorker, ServerRuntime, router, router_with_runtime};
+use storage::{MemoryProposal, Storage, UpsertDocument};
 use tower::ServiceExt;
 
 fn app() -> axum::Router {
-    let storage: SharedStorage = Arc::new(Mutex::new(Storage::in_memory().expect("storage")));
-    router(Some("secret".to_owned()), storage)
+    router(
+        Some("secret".to_owned()),
+        Storage::in_memory().expect("storage"),
+    )
 }
 
 fn with_peer(mut request: Request<Body>, peer: SocketAddr) -> Request<Body> {
@@ -156,8 +151,7 @@ async fn localhost_without_authentication_material_uses_local_identity() {
 
 #[tokio::test]
 async fn server_without_api_key_remains_loopback_only() {
-    let storage: SharedStorage = Arc::new(Mutex::new(Storage::in_memory().expect("storage")));
-    let app = router(None, storage);
+    let app = router(None, Storage::in_memory().expect("storage"));
     let local = Request::post("/v3/documents")
         .header("content-type", "application/json")
         .body(Body::from(r#"{"content":"local"}"#))
@@ -286,8 +280,8 @@ async fn get_returns_contract_not_found_body() {
 
 #[tokio::test]
 async fn submitted_document_is_processed_and_searchable() {
-    let storage: SharedStorage = Arc::new(Mutex::new(Storage::in_memory().expect("storage")));
-    let app = router(Some("secret".to_owned()), Arc::clone(&storage));
+    let runtime = ServerRuntime::new(Storage::in_memory().expect("storage"), None);
+    let app = router_with_runtime(Some("secret".to_owned()), 6767, &runtime);
     let create = remote(
         Request::post("/v3/documents")
             .header("authorization", "Bearer secret")
@@ -300,7 +294,12 @@ async fn submitted_document_is_processed_and_searchable() {
     let created = body(app.clone().oneshot(create).await.expect("create response")).await;
     let id = created["id"].as_str().expect("document id");
 
-    assert!(process_next_job(storage).await.expect("worker"));
+    assert!(
+        IndexingWorker::with_runtime(&runtime)
+            .process_available()
+            .await
+            .expect("worker")
+    );
 
     let search = remote(
         Request::post("/v4/search")
@@ -321,7 +320,11 @@ async fn submitted_document_is_processed_and_searchable() {
 }
 
 #[tokio::test]
-async fn submitted_document_is_embedded_and_semantically_searchable() {
+#[expect(
+    clippy::too_many_lines,
+    reason = "one model-backed integration test verifies documents and profile search share a runtime"
+)]
+async fn document_and_profile_searches_share_runtime_semantic_inference() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
@@ -336,12 +339,49 @@ async fn submitted_document_is_embedded_and_semantically_searchable() {
     let embeddings = Arc::new(
         EmbeddingModel::load(&model_path, &runtime_path).expect("existing model should load"),
     );
-    let storage: SharedStorage = Arc::new(Mutex::new(Storage::in_memory().expect("storage")));
-    let app = router_with_embeddings(
-        Some("secret".to_owned()),
-        Arc::clone(&storage),
-        Arc::clone(&embeddings),
-    );
+    let mut storage = Storage::in_memory().expect("storage");
+    let profile_fact = "I prefer tea to coffee.".to_owned();
+    let profile_document = storage
+        .upsert_document(UpsertDocument {
+            content: profile_fact.clone(),
+            custom_id: None,
+            container_tags: vec!["sm_project_default".to_owned()],
+            entity_context: None,
+            metadata: Map::new(),
+            task_type: "memory".to_owned(),
+            filepath: None,
+            filter_by_metadata: Map::new(),
+            dreaming: "dynamic".to_owned(),
+        })
+        .expect("profile document");
+    let profile_vector = embeddings
+        .embed(std::slice::from_ref(&profile_fact))
+        .expect("profile embedding")
+        .pop()
+        .expect("one profile vector");
+    let profile_dimensions = profile_vector.as_slice().len();
+    storage
+        .reconcile_memories(
+            &profile_document.id,
+            "sm_project_default",
+            &[MemoryProposal {
+                temporary_id: "profile-preference".to_owned(),
+                content: profile_fact.clone(),
+                is_inferred: false,
+                is_static: true,
+                metadata: Map::new(),
+                parents: Vec::new(),
+                forget_after: None,
+                forget_reason: None,
+                vector: profile_vector.as_slice().to_vec(),
+            }],
+            memory_engine::BGE_MODEL_ID,
+            profile_dimensions,
+        )
+        .expect("profile memory");
+    let runtime = ServerRuntime::new(storage, Some(Arc::clone(&embeddings)));
+    let app = router_with_runtime(Some("secret".to_owned()), 6767, &runtime);
+    let worker = IndexingWorker::with_runtime(&runtime);
     for content in [
         "The sky is blue on a clear day.",
         "A database transaction preserves atomicity.",
@@ -362,11 +402,7 @@ async fn submitted_document_is_embedded_and_semantically_searchable() {
                 .expect("request"),
         );
         app.clone().oneshot(create).await.expect("create response");
-        assert!(
-            process_next_job_with_embeddings(Arc::clone(&storage), Some(Arc::clone(&embeddings)))
-                .await
-                .expect("semantic worker")
-        );
+        assert!(worker.process_available().await.expect("semantic worker"));
     }
 
     let v3_search = remote(
@@ -399,10 +435,33 @@ async fn submitted_document_is_embedded_and_semantically_searchable() {
             ))
             .expect("request"),
     );
-    let searched = body(app.oneshot(search).await.expect("search response")).await;
+    let searched = body(app.clone().oneshot(search).await.expect("search response")).await;
     assert_eq!(
         searched["results"][0]["chunk"],
         "The sky is blue on a clear day."
+    );
+
+    // The profile endpoint has no model of its own: its query must travel through
+    // the runtime executor, rank narrow memory candidates, hydrate the selection,
+    // and return the persisted fact without truncating it.
+    let profile = remote(
+        Request::post("/v4/profile")
+            .header("authorization", "Bearer secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "q": "What drink do I prefer?",
+                    "containerTag": "sm_project_default",
+                    "threshold": 0
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+    );
+    let profile = body(app.oneshot(profile).await.expect("profile response")).await;
+    assert_eq!(
+        profile["searchResults"]["results"][0]["memory"],
+        profile_fact
     );
 }
 

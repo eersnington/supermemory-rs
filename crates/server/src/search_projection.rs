@@ -129,6 +129,21 @@ mod tests {
     }
 
     #[test]
+    fn budgeting_does_not_leave_a_prefix_of_a_rejected_fact() {
+        let fact = "complete fact that must not become a prefix ".repeat(100);
+        let results = fit_search_context(vec![memory(fact.clone()), memory("later".to_owned())]);
+
+        assert!(results.iter().all(|result| matches!(
+            result,
+            SearchResult::Memory(result) if result.memory == fact || result.memory == "later"
+        )));
+        assert!(!results.iter().any(|result| matches!(
+            result,
+            SearchResult::Memory(result) if result.memory.starts_with("complete fact") && result.memory != fact
+        )));
+    }
+
+    #[test]
     fn budgeting_considers_later_facts_after_an_oversized_fact() {
         let results =
             fit_search_context(vec![memory("a".repeat(2_100)), memory("kept".to_owned())]);

@@ -30,13 +30,6 @@ impl ServiceHealth {
         }
     }
 
-    /// Records a startup/schema failure that cannot be recovered by probing.
-    pub(crate) fn degrade_permanently(&self) {
-        if let Ok(mut state) = self.0.lock() {
-            *state = HealthState::Degraded { permanent: true };
-        }
-    }
-
     /// Clears a transient failure after a successful durable operation.
     pub(crate) fn recover(&self) {
         if let Ok(mut state) = self.0.lock()
@@ -58,13 +51,5 @@ mod tests {
         assert!(health.is_degraded());
         health.recover();
         assert!(!health.is_degraded());
-    }
-
-    #[test]
-    fn permanent_failure_does_not_recover_after_probe() {
-        let health = ServiceHealth::default();
-        health.degrade_permanently();
-        health.recover();
-        assert!(health.is_degraded());
     }
 }

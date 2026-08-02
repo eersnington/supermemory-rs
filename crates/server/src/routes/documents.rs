@@ -1,6 +1,6 @@
 use crate::{
-    ApiError, AppState, Arc, CreateDocumentRequest, DocumentResult, Extension, Json,
-    OrganizationId, Path, State, UpsertDocument, validate_request,
+    ApiError, AppState, CreateDocumentRequest, DocumentResult, Extension, Json, OrganizationId,
+    Path, State, UpsertDocument, validate_request,
 };
 
 pub(crate) async fn create_document(
@@ -35,16 +35,13 @@ pub(crate) async fn create_document(
         filter_by_metadata: request.filter_by_metadata,
         dreaming: request.dreaming.as_str().to_owned(),
     };
-    let storage = Arc::clone(&state.storage);
-    let result = tokio::task::spawn_blocking(move || {
-        storage
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
-            .upsert_document_for(&organization.0, document)
-            .map_err(ApiError::Storage)
-    })
-    .await
-    .map_err(ApiError::DatabaseExecutor)??;
+    let organization = organization.0;
+    let result = state
+        .writer
+        .upsert_document(organization, document)
+        .await
+        .map_err(|_| ApiError::StorageUnavailable)?
+        .map_err(ApiError::Storage)?;
     Ok(Json(DocumentResult {
         id: result.id,
         status: result.status.as_str().to_owned(),
@@ -56,16 +53,15 @@ pub(crate) async fn get_document(
     Extension(organization): Extension<OrganizationId>,
     Path(id): Path<String>,
 ) -> Result<Json<storage::Document>, ApiError> {
-    let storage = Arc::clone(&state.storage);
-    tokio::task::spawn_blocking(move || {
-        storage
-            .lock()
-            .map_err(|_| ApiError::StorageUnavailable)?
-            .find_document_for(&organization.0, &id)
-            .map_err(ApiError::Storage)
-    })
-    .await
-    .map_err(ApiError::DatabaseExecutor)??
-    .map(Json)
-    .ok_or(ApiError::NotFound)
+    state
+        .writer
+        .execute(move |storage| {
+            storage
+                .find_document_for(&organization.0, &id)
+                .map_err(ApiError::Storage)
+        })
+        .await
+        .map_err(|_| ApiError::StorageUnavailable)??
+        .map(Json)
+        .ok_or(ApiError::NotFound)
 }

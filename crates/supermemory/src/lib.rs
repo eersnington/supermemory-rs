@@ -145,7 +145,6 @@ async fn start(config: Config) -> Result<(), StartupError> {
     #[cfg(feature = "legacy-import")]
     migrate_legacy_snapshot(&mut storage, &legacy_data_dir)?;
     let organization_id = storage.local_organization_id().to_owned();
-    let storage = std::sync::Arc::new(std::sync::Mutex::new(storage));
     print_success("local SQLite storage", "ready", database_started.elapsed());
     let model_path = config.model.clone();
     let ort_library = config.ort_library.clone();

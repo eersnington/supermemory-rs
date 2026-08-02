@@ -44,6 +44,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         8,
         include_str!("../../../migrations/0008_v006_persistence.sql"),
     ),
+    (9, include_str!("../../../migrations/0009_memory_fts.sql")),
 ];
 const BASE58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const LOCAL_SLUG: &str = "local";
@@ -241,6 +242,16 @@ pub struct SearchOptions {
     pub filters: Option<FilterExpression>,
 }
 
+/// Narrow semantic memory candidate used before hydration and response projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryCandidate {
+    pub id: String,
+    /// Exact vector similarity when semantic retrieval produced this candidate.
+    pub semantic_score: Option<f64>,
+    /// FTS rank when lexical retrieval produced this candidate.
+    pub lexical_rank: Option<usize>,
+}
+
 /// Narrow semantic chunk candidate used before hydration and response projection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkCandidate {
@@ -248,7 +259,10 @@ pub struct ChunkCandidate {
     pub stable_id: String,
     pub document_id: String,
     pub ordinal: usize,
-    pub semantic_score: f64,
+    /// Exact vector similarity when semantic retrieval produced this candidate.
+    pub semantic_score: Option<f64>,
+    /// FTS rank when lexical retrieval produced this candidate.
+    pub lexical_rank: Option<usize>,
 }
 
 /// Controls optional chunk data loaded after ranking has selected final candidates.
@@ -352,6 +366,10 @@ pub struct MemoryHydration {
 
 /// Independent visibility controls for historical memory states.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent persisted visibility switches are a search contract"
+)]
 pub struct MemoryVisibility {
     pub include_forgotten: bool,
     pub include_expired: bool,
@@ -1581,6 +1599,10 @@ fn validate_existing_version(connection: &Connection, version: i64) -> Result<()
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "SQLite function registration is intentionally kept together"
+)]
 fn register_vector_functions(connection: &Connection) -> Result<(), StorageError> {
     connection
         .create_scalar_function(

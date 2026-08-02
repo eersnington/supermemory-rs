@@ -16,6 +16,10 @@ fn document() -> UpsertDocument {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "covers reconciliation and explicit hydration invariants"
+)]
 fn reconciliation_builds_version_lineage_and_invalidates_update_parent() {
     let mut storage = Storage::in_memory().expect("storage");
     let document = storage.upsert_document(document()).expect("document");
@@ -89,8 +93,8 @@ fn reconciliation_builds_version_lineage_and_invalidates_update_parent() {
     assert!(shallow[0].parents.is_empty());
     assert!(shallow[0].documents.is_empty());
 
-    let hydrated = storage
-        .search_memories_for(
+    let candidates = storage
+        .search_memory_candidates(
             &organization,
             &[0.8, 0.6],
             "fixture-model",
@@ -98,12 +102,33 @@ fn reconciliation_builds_version_lineage_and_invalidates_update_parent() {
             10,
             0.0,
             storage::MemoryVisibility::default(),
+        )
+        .expect("narrow candidates");
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.id == memories[1].id || candidate.id == memories[0].id)
+    );
+    let hydrated = storage
+        .hydrate_memories(
+            &candidates,
             MemoryHydration {
                 relations: true,
                 documents: true,
             },
         )
-        .expect("hydrated search");
+        .expect("explicit hydration");
+    assert_eq!(
+        hydrated
+            .iter()
+            .map(|hit| &hit.record.id)
+            .collect::<Vec<_>>(),
+        candidates
+            .iter()
+            .map(|candidate| &candidate.id)
+            .collect::<Vec<_>>(),
+        "hydration must preserve the selected rank order"
+    );
     assert_eq!(hydrated[0].parents.len(), 1);
     assert_eq!(hydrated[0].documents.len(), 1);
 }
