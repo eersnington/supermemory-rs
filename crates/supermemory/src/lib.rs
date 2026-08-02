@@ -117,8 +117,9 @@ async fn start(config: Config) -> Result<(), StartupError> {
         |home| PathBuf::from(home).join(".supermemory"),
     );
     let mut provider_values = credentials::load_or_import(data_dir, &legacy_data_dir)?;
-    let provider_models =
-        memory_engine::ProviderModels::from(model_config::load_or_create(data_dir)?);
+    let model_config = model_config::load_or_create(data_dir)?;
+    let provider_models = memory_engine::ProviderModels::from(model_config.clone());
+    let runtime_limits = runtime_limits(&model_config.performance);
     if provider_config(&provider_values, &provider_models).is_none()
         && io::stdin().is_terminal()
         && io::stdout().is_terminal()
@@ -173,12 +174,13 @@ async fn start(config: Config) -> Result<(), StartupError> {
     let database = config.database.clone();
     let monitor = MemoryMonitor::new(config.monitor && io::stdout().is_terminal());
     let ready_monitor = monitor.clone();
-    let result = server::serve_with_services_ready(
+    let result = server::serve_with_services_limits_ready(
         address,
         Some(api_key),
         storage,
         Some(embeddings),
         provider,
+        runtime_limits,
         move || {
             print_success(
                 "http server",
@@ -193,6 +195,43 @@ async fn start(config: Config) -> Result<(), StartupError> {
     monitor.stop().await;
     result?;
     Ok(())
+}
+
+fn runtime_limits(performance: &model_config::Performance) -> server::RuntimeLimits {
+    server::RuntimeLimits {
+        provider_concurrency: environment_limit(
+            "SUPERMEMORY_PROVIDER_CONCURRENCY",
+            performance.provider_concurrency,
+            1,
+            16,
+        ),
+        embedding_queue_capacity: environment_limit(
+            "SUPERMEMORY_EMBEDDING_QUEUE_CAPACITY",
+            performance.embedding_queue_capacity,
+            1,
+            1_024,
+        ),
+        embedding_max_items: environment_limit(
+            "SUPERMEMORY_EMBEDDING_MAX_ITEMS",
+            performance.embedding_max_items,
+            1,
+            128,
+        ),
+        embedding_max_padded_tokens: environment_limit(
+            "SUPERMEMORY_EMBEDDING_MAX_PADDED_TOKENS",
+            performance.embedding_max_padded_tokens,
+            512,
+            32_768,
+        ),
+    }
+}
+
+fn environment_limit(name: &str, default: usize, minimum: usize, maximum: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| (minimum..=maximum).contains(value))
+        .unwrap_or(default)
 }
 
 fn provider_config(

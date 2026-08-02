@@ -306,7 +306,7 @@ async fn run(
             requests = requests.len(),
             items,
             padded_tokens = items * longest,
-            estimated_tokens = requests
+            token_count = requests
                 .iter()
                 .map(|(_, request)| request.estimated_tokens)
                 .sum::<usize>(),

@@ -18,6 +18,7 @@ use routes::documents::{create_document, get_document};
 use ui::{api_reference, landing_page, openapi};
 
 use health::ServiceHealth;
+pub use runtime::RuntimeLimits;
 pub use runtime::ServerRuntime;
 use runtime::{StorageReaderError, StorageReaders};
 
@@ -194,12 +195,37 @@ pub async fn serve_with_services_ready(
     provider: Option<Arc<memory_engine::MemoryProvider>>,
     ready: impl FnOnce(),
 ) -> Result<(), ServerError> {
+    serve_with_services_limits_ready(
+        address,
+        api_key,
+        storage,
+        embeddings,
+        provider,
+        RuntimeLimits::default(),
+        ready,
+    )
+    .await
+}
+
+/// Serves with explicit runtime resource limits.
+///
+/// # Errors
+/// Returns an error if the listener, runtime services, or HTTP server fail.
+pub async fn serve_with_services_limits_ready(
+    address: SocketAddr,
+    api_key: Option<String>,
+    storage: Storage,
+    embeddings: Option<Arc<memory_engine::EmbeddingModel>>,
+    provider: Option<Arc<memory_engine::MemoryProvider>>,
+    limits: RuntimeLimits,
+    ready: impl FnOnce(),
+) -> Result<(), ServerError> {
     let listener = TcpListener::bind(address)
         .await
         .map_err(|source| ServerError::Bind { address, source })?;
     ready();
     let health = Arc::new(ServiceHealth::default());
-    let runtime = ServerRuntime::new(storage, embeddings);
+    let runtime = ServerRuntime::with_limits(storage, embeddings, limits);
     let worker = tokio::spawn(
         indexing_coordinator::IndexingCoordinator::new(
             runtime.writer(),
@@ -219,6 +245,7 @@ pub async fn serve_with_services_ready(
                         runtime.readers(),
                         executor.clone(),
                         Arc::clone(provider),
+                        limits.provider_concurrency,
                     )
                     .run(Arc::clone(&health)),
                 )

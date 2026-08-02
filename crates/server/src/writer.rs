@@ -16,7 +16,10 @@ use storage::{
 type WriteOperation = Box<dyn FnOnce(&mut Storage) + Send + 'static>;
 
 enum Command {
-    Run(WriteOperation),
+    Run {
+        operation: WriteOperation,
+        submitted_at: Instant,
+    },
 }
 
 /// Bounded owner for serialized `SQLite` writes and durable-work notifications.
@@ -37,11 +40,16 @@ impl StorageWriter {
             // This binding owns the sole application write connection. It is not
             // wrapped in a mutex because this task is its serialization boundary.
             let mut storage = storage;
-            while let Some(Command::Run(operation)) = receiver.recv().await {
+            while let Some(Command::Run {
+                operation,
+                submitted_at,
+            }) = receiver.recv().await
+            {
                 let started = Instant::now();
                 operation(&mut storage);
                 tracing::debug!(
                     stage = "sqlite_write",
+                    queue_wait_ms = started.duration_since(submitted_at).as_millis(),
                     elapsed_ms = started.elapsed().as_millis(),
                     "writer command completed"
                 );
@@ -143,9 +151,12 @@ impl StorageWriter {
     {
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(Command::Run(Box::new(move |storage| {
-                let _ = reply.send(operation(storage));
-            })))
+            .send(Command::Run {
+                operation: Box::new(move |storage| {
+                    let _ = reply.send(operation(storage));
+                }),
+                submitted_at: Instant::now(),
+            })
             .await
             .map_err(|_| WriterError::Closed)?;
         response.await.map_err(|_| WriterError::Closed)

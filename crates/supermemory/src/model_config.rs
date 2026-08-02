@@ -15,6 +15,29 @@ use thiserror::Error;
 #[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
     pub providers: Providers,
+    pub performance: Performance,
+}
+
+/// Resource limits that keep local embedding and provider work bounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Performance {
+    pub provider_concurrency: usize,
+    pub embedding_queue_capacity: usize,
+    pub embedding_max_items: usize,
+    pub embedding_max_padded_tokens: usize,
+}
+
+impl Default for Performance {
+    fn default() -> Self {
+        Self {
+            provider_concurrency: 8,
+            embedding_queue_capacity: 64,
+            // This held peak indexing RSS below 320 MiB in the initial LoCoMo runs.
+            embedding_max_items: 4,
+            embedding_max_padded_tokens: 1_024,
+        }
+    }
 }
 
 /// Configuration for each supported provider.
@@ -129,11 +152,30 @@ fn validate(path: PathBuf, config: ModelConfig) -> Result<ModelConfig, ModelConf
     if let Some((field, _)) = values.iter().find(|(_, value)| value.trim().is_empty()) {
         return Err(ModelConfigError::EmptyValue { path, field });
     }
+    let performance = &config.performance;
+    if !(1..=16).contains(&performance.provider_concurrency)
+        || !(1..=1_024).contains(&performance.embedding_queue_capacity)
+        || !(1..=128).contains(&performance.embedding_max_items)
+        || !(512..=32_768).contains(&performance.embedding_max_padded_tokens)
+    {
+        return Err(ModelConfigError::InvalidPerformance { path });
+    }
     Ok(config)
 }
 
 fn write_new(path: &Path, config: &ModelConfig) -> Result<(), ModelConfigError> {
-    let contents = toml::to_string_pretty(config).map_err(ModelConfigError::Serialize)?;
+    let serialized = toml::to_string_pretty(config).map_err(ModelConfigError::Serialize)?;
+    let (providers, _) = serialized
+        .split_once("[performance]")
+        .ok_or(ModelConfigError::SerializeDefault)?;
+    let performance = &config.performance;
+    let contents = format!(
+        "{providers}# Limits concurrent provider and local embedding work. Smaller embedding batches use less memory.\n[performance]\n# Number of provider requests allowed at the same time.\nprovider_concurrency = {}\n# Number of embedding requests allowed to wait for the local model.\nembedding_queue_capacity = {}\n# Maximum texts sent to the local embedding model in one batch.\nembedding_max_items = {}\n# Maximum padded tokens in one embedding batch. This is the main memory limit.\nembedding_max_padded_tokens = {}\n",
+        performance.provider_concurrency,
+        performance.embedding_queue_capacity,
+        performance.embedding_max_items,
+        performance.embedding_max_padded_tokens,
+    );
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -172,8 +214,12 @@ pub enum ModelConfigError {
     },
     #[error("model configuration {path} has an empty {field}; set a non-empty value and restart")]
     EmptyValue { path: PathBuf, field: &'static str },
+    #[error("performance limits in {path} are out of range; use the documented ranges and restart")]
+    InvalidPerformance { path: PathBuf },
     #[error("failed to serialize default model configuration: {0}")]
     Serialize(#[source] toml::ser::Error),
+    #[error("failed to render default performance configuration")]
+    SerializeDefault,
     #[error("failed to write model configuration to {path}: {source}")]
     Write {
         path: PathBuf,

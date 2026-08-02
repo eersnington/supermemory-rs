@@ -6,6 +6,29 @@ use tokio::sync::Semaphore;
 use crate::writer::StorageWriter;
 
 const SEARCH_CONNECTIONS: usize = 5;
+const DEFAULT_EMBEDDING_QUEUE_CAPACITY: usize = 64;
+const DEFAULT_EMBEDDING_MAX_ITEMS: usize = 32;
+const DEFAULT_EMBEDDING_MAX_PADDED_TOKENS: usize = 8_192;
+
+/// Runtime bounds for provider and embedding work.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeLimits {
+    pub provider_concurrency: usize,
+    pub embedding_queue_capacity: usize,
+    pub embedding_max_items: usize,
+    pub embedding_max_padded_tokens: usize,
+}
+
+impl Default for RuntimeLimits {
+    fn default() -> Self {
+        Self {
+            provider_concurrency: 8,
+            embedding_queue_capacity: DEFAULT_EMBEDDING_QUEUE_CAPACITY,
+            embedding_max_items: DEFAULT_EMBEDDING_MAX_ITEMS,
+            embedding_max_padded_tokens: DEFAULT_EMBEDDING_MAX_PADDED_TOKENS,
+        }
+    }
+}
 
 /// A process/runtime-scoped owner of mutable services. Construction prepares
 /// immutable startup metadata and read connections before moving the only write
@@ -84,6 +107,14 @@ impl ServerRuntime {
         storage: storage::Storage,
         model: Option<Arc<memory_engine::EmbeddingModel>>,
     ) -> Self {
+        Self::with_limits(storage, model, RuntimeLimits::default())
+    }
+    #[must_use]
+    pub fn with_limits(
+        storage: storage::Storage,
+        model: Option<Arc<memory_engine::EmbeddingModel>>,
+        limits: RuntimeLimits,
+    ) -> Self {
         let local_org_id = storage.local_organization_id().to_owned();
         let api_key_identities = storage.api_key_identities().unwrap_or_else(|error| {
             tracing::error!(%error, "failed to load API key identities");
@@ -106,10 +137,23 @@ impl ServerRuntime {
             permits: Arc::new(Semaphore::new(readers.len().max(1))),
             connections: Arc::new(Mutex::new(readers)),
         };
+        let (queue_capacity, max_items, max_padded_tokens) = embedding_limits(limits);
+        tracing::info!(
+            queue_capacity,
+            max_items,
+            max_padded_tokens,
+            "embedding executor limits configured"
+        );
         Self {
             writer,
-            embeddings: model
-                .map(|model| memory_engine::EmbeddingExecutor::with_limits(model, 64, 32, 8_192)),
+            embeddings: model.map(|model| {
+                memory_engine::EmbeddingExecutor::with_limits(
+                    model,
+                    queue_capacity,
+                    max_items,
+                    max_padded_tokens,
+                )
+            }),
             local_org_id,
             api_key_identities,
             readers,
@@ -129,5 +173,41 @@ impl ServerRuntime {
     }
     pub(crate) fn readers(&self) -> StorageReaders {
         self.readers.clone()
+    }
+}
+
+fn embedding_limits(limits: RuntimeLimits) -> (usize, usize, usize) {
+    (
+        bounded_environment_usize(
+            "SUPERMEMORY_EMBEDDING_QUEUE_CAPACITY",
+            limits.embedding_queue_capacity,
+            1,
+            1_024,
+        ),
+        bounded_environment_usize(
+            "SUPERMEMORY_EMBEDDING_MAX_ITEMS",
+            limits.embedding_max_items,
+            1,
+            128,
+        ),
+        bounded_environment_usize(
+            "SUPERMEMORY_EMBEDDING_MAX_PADDED_TOKENS",
+            limits.embedding_max_padded_tokens,
+            512,
+            32_768,
+        ),
+    )
+}
+
+fn bounded_environment_usize(name: &str, default: usize, minimum: usize, maximum: usize) -> usize {
+    match std::env::var(name) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(value) if (minimum..=maximum).contains(&value) => value,
+            _ => {
+                tracing::warn!(%name, %value, minimum, maximum, "ignoring invalid performance setting");
+                default
+            }
+        },
+        Err(_) => default,
     }
 }

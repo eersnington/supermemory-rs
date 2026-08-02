@@ -7,7 +7,6 @@ use tokio::{task::JoinSet, time::interval};
 
 use super::{WorkerError, health::ServiceHealth, runtime::StorageReaders, writer::StorageWriter};
 
-const PROVIDER_CONCURRENCY: usize = 8;
 const DURABILITY_RESCAN: Duration = Duration::from_secs(5);
 
 /// Coordinates claim, provider extraction, cached recovery, embedding, and atomic
@@ -18,6 +17,7 @@ pub(super) struct MemoryExtractionCoordinator {
     readers: StorageReaders,
     embeddings: memory_engine::EmbeddingExecutor,
     provider: Arc<memory_engine::MemoryProvider>,
+    maximum_concurrency: usize,
 }
 
 impl MemoryExtractionCoordinator {
@@ -26,12 +26,14 @@ impl MemoryExtractionCoordinator {
         readers: StorageReaders,
         embeddings: memory_engine::EmbeddingExecutor,
         provider: Arc<memory_engine::MemoryProvider>,
+        maximum_concurrency: usize,
     ) -> Self {
         Self {
             writer,
             readers,
             embeddings,
             provider,
+            maximum_concurrency,
         }
     }
 
@@ -87,7 +89,12 @@ impl MemoryExtractionCoordinator {
         let notify = self.writer.memory_available();
         let mut rescan = interval(DURABILITY_RESCAN);
         let mut jobs = JoinSet::new();
-        let mut concurrency = PROVIDER_CONCURRENCY;
+        let maximum_concurrency = self.maximum_concurrency;
+        let mut concurrency = maximum_concurrency;
+        tracing::info!(
+            maximum_concurrency,
+            "memory extraction provider concurrency configured"
+        );
         loop {
             if health.is_degraded() {
                 break;
@@ -121,7 +128,7 @@ impl MemoryExtractionCoordinator {
                     () = notify.notified() => {},
                     _ = rescan.tick() => {
                         // Restore capacity gradually after transient provider throttling.
-                        concurrency = (concurrency + 1).min(PROVIDER_CONCURRENCY);
+                        concurrency = (concurrency + 1).min(maximum_concurrency);
                     }
                 }
                 continue;
@@ -154,7 +161,7 @@ impl MemoryExtractionCoordinator {
                 }
                 () = notify.notified() => {},
                 _ = rescan.tick() => {
-                    concurrency = (concurrency + 1).min(PROVIDER_CONCURRENCY);
+                    concurrency = (concurrency + 1).min(maximum_concurrency);
                 }
             }
         }
@@ -182,12 +189,13 @@ impl MemoryExtractionCoordinator {
             .into_iter()
             .map(|memory| (memory.id, memory.content))
             .collect::<Vec<_>>();
-        let candidates = match self
+        let provider_started = std::time::Instant::now();
+        let outcome = match self
             .provider
-            .extract_once(&job.content, job.document_date.as_deref(), &context)
+            .extract_once_with_usage(&job.content, job.document_date.as_deref(), &context)
             .await
         {
-            Ok(candidates) => candidates,
+            Ok(outcome) => outcome,
             Err(error) => {
                 let failure = error.failure();
                 self.retry(
@@ -200,6 +208,16 @@ impl MemoryExtractionCoordinator {
                 return Err(WorkerError::Provider(error));
             }
         };
+        tracing::info!(
+            document_id = %job.document_id,
+            context_memories = context.len(),
+            candidates = outcome.memories.len(),
+            input_tokens = outcome.usage.input_tokens,
+            output_tokens = outcome.usage.output_tokens,
+            provider_ms = provider_started.elapsed().as_millis(),
+            "memory extraction completed"
+        );
+        let candidates = outcome.memories;
         let cached = serde_json::to_string(&candidates).map_err(WorkerError::CachedExtraction)?;
         let job = job.clone();
         self.writer
