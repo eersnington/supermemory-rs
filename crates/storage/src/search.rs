@@ -1,6 +1,7 @@
 use super::{
-    MemoryHydration, MemorySearchHit, SearchHit, SearchOptions, Storage, StorageError,
-    hydrate_memory_hits, json, params, parse_json, read_memory, validate_vector, vector_bytes,
+    ChunkCandidate, ChunkHydration, HashMap, MemoryHydration, MemorySearchHit, SearchHit,
+    SearchOptions, Storage, StorageError, hydrate_memory_hits, json, params, parse_json,
+    read_memory, validate_vector, vector_bytes,
 };
 
 impl Storage {
@@ -184,5 +185,114 @@ impl Storage {
             .map_err(StorageError::Read)?;
         hydrate_memory_hits(&self.connection, &mut hits, hydration)?;
         Ok(hits)
+    }
+
+    /// Ranks document chunks without materializing chunk text or document records.
+    ///
+    /// # Errors
+    /// Returns an error for malformed vectors, filters, or database reads.
+    pub fn search_chunk_candidates(
+        &self,
+        query: &[f32],
+        model_id: &str,
+        limit: usize,
+        threshold: f32,
+        options: &SearchOptions,
+    ) -> Result<Vec<ChunkCandidate>, StorageError> {
+        validate_vector(query, query.len())?;
+        let organization_id = options
+            .organization_id
+            .as_deref()
+            .unwrap_or(&self.local_org_id);
+        let container_tags = json(&options.container_tags)?;
+        let metadata_filter = options.filters.as_ref().map(json).transpose()?;
+        let mut statement = self.connection.prepare(
+            "SELECT document_chunks.id, document_chunks.stable_id, documents.id, document_chunks.ordinal, cosine_similarity(chunk_embeddings.vector, ?1, ?2) AS score FROM chunk_embeddings JOIN document_chunks ON document_chunks.id=chunk_embeddings.chunk_id JOIN documents ON documents.id=document_chunks.document_id WHERE chunk_embeddings.model_id=?3 AND chunk_embeddings.dimensions=?2 AND documents.org_id=?4 AND documents.status='done' AND (?5='[]' OR EXISTS(SELECT 1 FROM json_each(documents.container_tags) stored JOIN json_each(?5) requested ON stored.value=requested.value)) AND (?6 IS NULL OR documents.id=?6 OR documents.custom_id=?6) AND (?7 IS NULL OR documents.filepath=?7 OR (substr(?7, -1)='/' AND substr(documents.filepath, 1, length(?7)-1)=substr(?7, 1, length(?7)-1))) AND (?8 IS NULL OR matches_metadata_filter(documents.metadata, ?8)) AND cosine_similarity(chunk_embeddings.vector, ?1, ?2)>=?9 ORDER BY score DESC, documents.id, document_chunks.ordinal, document_chunks.stable_id LIMIT ?10",
+        ).map_err(StorageError::Read)?;
+        statement
+            .query_map(
+                params![
+                    vector_bytes(query),
+                    query.len(),
+                    model_id,
+                    organization_id,
+                    container_tags,
+                    options.document_id,
+                    options.filepath,
+                    metadata_filter,
+                    threshold,
+                    limit
+                ],
+                |row| {
+                    Ok(ChunkCandidate {
+                        chunk_id: row.get(0)?,
+                        stable_id: row.get(1)?,
+                        document_id: row.get(2)?,
+                        ordinal: row.get(3)?,
+                        semantic_score: row.get(4)?,
+                    })
+                },
+            )
+            .map_err(StorageError::Read)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::Read)
+    }
+
+    /// Hydrates selected chunk candidates while preserving their ranked order.
+    ///
+    /// # Errors
+    /// Returns an error if a selected chunk cannot be loaded or decoded.
+    pub fn hydrate_chunks(
+        &self,
+        candidates: &[ChunkCandidate],
+        policy: ChunkHydration,
+    ) -> Result<Vec<SearchHit>, StorageError> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = candidates
+            .iter()
+            .map(|candidate| candidate.chunk_id)
+            .collect::<Vec<_>>();
+        let scores = candidates
+            .iter()
+            .map(|candidate| (candidate.chunk_id, candidate.semantic_score))
+            .collect::<HashMap<_, _>>();
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let document_content = if policy.full_document {
+            "documents.content"
+        } else {
+            "''"
+        };
+        let sql = format!(
+            "SELECT document_chunks.id, document_chunks.stable_id, documents.id, document_chunks.content, document_chunks.ordinal, documents.custom_id, documents.metadata, documents.filepath, documents.created_at, documents.updated_at, {document_content} FROM document_chunks JOIN documents ON documents.id=document_chunks.document_id WHERE document_chunks.id IN ({placeholders})"
+        );
+        let mut statement = self.connection.prepare(&sql).map_err(StorageError::Read)?;
+        let mut hits = statement
+            .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                let chunk_id: i64 = row.get(0)?;
+                Ok((
+                    chunk_id,
+                    SearchHit {
+                        id: row.get(1)?,
+                        document_id: row.get(2)?,
+                        chunk: row.get(3)?,
+                        score: *scores.get(&chunk_id).unwrap_or(&0.0),
+                        position: row.get(4)?,
+                        custom_id: row.get(5)?,
+                        metadata: parse_json(&row.get::<_, String>(6)?, 6)?,
+                        filepath: row.get(7)?,
+                        created_at: row.get(8)?,
+                        updated_at: row.get(9)?,
+                        document_content: row.get(10)?,
+                    },
+                ))
+            })
+            .map_err(StorageError::Read)?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(StorageError::Read)?;
+        Ok(ids.into_iter().filter_map(|id| hits.remove(&id)).collect())
     }
 }

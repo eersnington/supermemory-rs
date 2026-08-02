@@ -1,8 +1,9 @@
 //! HTTP boundary and durable worker lifecycle with sticky fatal health degradation.
 
 mod auth;
-mod context_budget;
 mod health;
+mod search_engine;
+mod search_projection;
 mod ui;
 mod routes {
     pub(super) mod documents;
@@ -16,6 +17,7 @@ use health::ServiceHealth;
 
 use std::{
     net::SocketAddr,
+    num::NonZeroUsize,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -498,6 +500,9 @@ async fn v3_search(
 ) -> Result<Json<V3SearchResponse>, ApiError> {
     let started = std::time::Instant::now();
     validate_search_basics(&request.q, request.limit, request.chunk_threshold)?;
+    if request.rerank {
+        return Err(ApiError::RerankingUnavailable);
+    }
     if !request.document_threshold.is_finite() || !(0.0..=1.0).contains(&request.document_threshold)
     {
         return Err(ApiError::Validation(
@@ -688,7 +693,7 @@ struct SearchInclude {
     chunks: bool,
 }
 
-#[derive(Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SearchMode {
     #[default]
@@ -782,10 +787,6 @@ struct SearchDocument {
     updated_at: String,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "v4 search contract validation and orchestration stay together"
-)]
 async fn search(
     State(state): State<AppState>,
     Extension(organization): Extension<OrganizationId>,
@@ -795,48 +796,24 @@ async fn search(
     if request.q.trim().is_empty() {
         return Err(ApiError::Validation("q must not be empty"));
     }
-    if !(1..=100).contains(&request.limit) {
-        return Err(ApiError::Validation("limit must be between 1 and 100"));
-    }
+    let limit = NonZeroUsize::new(request.limit)
+        .filter(|limit| limit.get() <= 100)
+        .ok_or(ApiError::Validation("limit must be between 1 and 100"))?;
     if !request.threshold.is_finite() || !(0.0..=1.0).contains(&request.threshold) {
         return Err(ApiError::Validation(
             "threshold must be a finite number between 0 and 1",
         ));
     }
-    if request.aggregate && request.rerank {
-        return Err(ApiError::AggregateAndRerank);
+    if request.rerank {
+        return Err(ApiError::RerankingUnavailable);
     }
     validate_container_tag(request.container_tag.as_deref())?;
     let filters = request.filters.as_ref().map(parse_filter).transpose()?;
-    let search_mode = if request.include.chunks && request.search_mode == SearchMode::Memories {
+    let mode = if request.include.chunks && request.search_mode == SearchMode::Memories {
         SearchMode::Hybrid
     } else {
         request.search_mode
     };
-    let query = request.q.trim().to_owned();
-    let query_vector = if let Some(embeddings) = state.embeddings.as_ref() {
-        let embeddings = Arc::clone(embeddings);
-        let value = query.clone();
-        Some(
-            tokio::task::spawn_blocking(move || embeddings.embed(&[value]))
-                .await
-                .map_err(ApiError::DatabaseExecutor)?
-                .map_err(ApiError::Embedding)?
-                .into_iter()
-                .next()
-                .ok_or(ApiError::EmptyEmbedding)?,
-        )
-    } else {
-        None
-    };
-    let limit = request.limit;
-    let threshold = request.threshold;
-    let include_forgotten = request.include.forgotten_memories;
-    let include_documents = request.include.documents;
-    let include_summaries = request.include.summaries;
-    let include_related = request.include.related_memories;
-    let memory_mode = search_mode != SearchMode::Documents;
-    let document_mode = search_mode != SearchMode::Memories;
     let options = storage::SearchOptions {
         organization_id: Some(organization.0.clone()),
         container_tags: vec![
@@ -848,86 +825,26 @@ async fn search(
         filepath: request.filepath,
         filters,
     };
-    let candidate_limit = limit.saturating_mul(if request.aggregate { 5 } else { 3 });
-    let (memory_hits, chunk_hits) = run_search(&state, move |storage| {
-        if let Some(vector) = query_vector.as_ref() {
-            let memories = if memory_mode {
-                storage
-                    .search_memories_for(
-                        &organization.0,
-                        vector.as_slice(),
-                        memory_engine::BGE_MODEL_ID,
-                        options
-                            .container_tags
-                            .first()
-                            .map_or("sm_project_default", String::as_str),
-                        candidate_limit,
-                        threshold,
-                        include_forgotten,
-                        storage::MemoryHydration {
-                            relations: include_related,
-                            documents: include_documents,
-                        },
-                    )
-                    .map_err(ApiError::Storage)?
-            } else {
-                Vec::new()
-            };
-            let chunks = if document_mode {
-                storage
-                    .search_semantic(
-                        vector.as_slice(),
-                        memory_engine::BGE_MODEL_ID,
-                        candidate_limit,
-                        threshold,
-                        &options,
-                    )
-                    .map_err(ApiError::Storage)?
-            } else {
-                Vec::new()
-            };
-            Ok((memories, chunks))
-        } else {
-            let chunks = if document_mode {
-                storage
-                    .search_for(&organization.0, &query, candidate_limit)
-                    .map_err(ApiError::Storage)?
-            } else {
-                Vec::new()
-            };
-            Ok((Vec::new(), chunks))
-        }
-    })
-    .await?;
-    let memory_boost = if search_mode == SearchMode::Hybrid {
-        1.15
-    } else {
-        1.0
-    };
-    let mut results: Vec<_> = memory_hits
-        .into_iter()
-        .map(|hit| {
-            SearchResult::Memory(memory_search_result(
-                hit,
-                memory_boost,
-                include_documents,
-                include_summaries,
-                include_related,
-            ))
-        })
-        .chain(
-            chunk_hits
-                .into_iter()
-                .map(|hit| SearchResult::Chunk(chunk_search_result(hit))),
+    let outcome = search_engine::SearchEngine::new(state)
+        .search(
+            &organization.0,
+            search_engine::SearchQuery {
+                text: request.q.trim().to_owned(),
+                mode,
+                limit,
+                threshold: request.threshold,
+                options,
+                include_forgotten: request.include.forgotten_memories,
+                include_documents: request.include.documents,
+                include_summaries: request.include.summaries,
+                include_related: request.include.related_memories,
+                aggregate: request.aggregate,
+            },
         )
-        .collect();
-    results.retain(|result| result.similarity() >= f64::from(threshold));
-    results.sort_by(|left, right| right.similarity().total_cmp(&left.similarity()));
-    results.truncate(limit);
-    results = context_budget::fit_search_context(results);
-    let total = results.len();
+        .await?;
+    let total = outcome.results.len();
     Ok(Json(SearchResponse {
-        results,
+        results: outcome.results,
         timing: started.elapsed().as_secs_f64() * 1_000.0,
         total,
     }))
@@ -1351,7 +1268,7 @@ async fn profile_search(
             .map_err(ApiError::Storage)
     })
     .await?;
-    let results = context_budget::fit_search_context(
+    let results = search_projection::fit_search_context(
         hits.into_iter()
             .map(|hit| SearchResult::Memory(memory_search_result(hit, 1.0, false, false, false)))
             .collect(),
@@ -2116,8 +2033,8 @@ enum ApiError {
     Embedding(#[source] memory_engine::EmbeddingError),
     #[error("query embedding returned no vector")]
     EmptyEmbedding,
-    #[error("cannot aggregate and rerank the same search")]
-    AggregateAndRerank,
+    #[error("reranking is not configured")]
+    RerankingUnavailable,
     #[error("memory not found")]
     MemoryNotFound,
 }
@@ -2150,11 +2067,11 @@ impl IntoResponse for ApiError {
                 }),
             )
                 .into_response(),
-            Self::AggregateAndRerank => (
-                StatusCode::BAD_REQUEST,
+            Self::RerankingUnavailable => (
+                StatusCode::NOT_IMPLEMENTED,
                 Json(ErrorBody {
-                    error: "Cannot use both aggregate and rerank simultaneously",
-                    details: None,
+                    error: "Reranking is not configured",
+                    details: Some("Configure a reranker before using rerank=true"),
                 }),
             )
                 .into_response(),

@@ -241,6 +241,23 @@ pub struct SearchOptions {
     pub filters: Option<FilterExpression>,
 }
 
+/// Narrow semantic chunk candidate used before hydration and response projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkCandidate {
+    pub chunk_id: i64,
+    pub stable_id: String,
+    pub document_id: String,
+    pub ordinal: usize,
+    pub semantic_score: f64,
+}
+
+/// Controls optional chunk data loaded after ranking has selected final candidates.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChunkHydration {
+    /// Load complete document content for the selected chunk's document.
+    pub full_document: bool,
+}
+
 /// Boolean metadata filter tree used by V3 and V4 search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FilterExpression {

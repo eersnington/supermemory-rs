@@ -60,6 +60,20 @@ async fn body(response: Response) -> Value {
 }
 
 #[tokio::test]
+async fn rerank_returns_an_explicit_unsupported_error() {
+    let response = request(
+        "POST",
+        "/v4/search",
+        json!({ "q": "fact", "rerank": true }),
+        true,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(body(response).await["error"], "Reranking is not configured");
+}
+
+#[tokio::test]
 async fn health_is_public() {
     assert_eq!(
         request("GET", "/health", json!({}), false).await.status(),
@@ -80,11 +94,7 @@ async fn landing_page_exposes_local_examples_without_caching_the_key() {
     )
     .expect("HTML");
     assert!(html.contains("supermemory<span class=\"rs\">-RS</span>"));
-    assert!(
-        html.contains(
-            "Supermemory</span><span class=\"rs-gradient\">-RS</span> is live"
-        )
-    );
+    assert!(html.contains("Supermemory</span><span class=\"rs-gradient\">-RS</span> is live"));
     assert!(html.contains("--rs:#ff8700"));
     assert!(html.contains("Bearer secret"));
     assert!(html.contains("https://github.com/eersnington/supermemory-rs"));
