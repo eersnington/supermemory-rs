@@ -341,7 +341,7 @@ impl SearchEngine {
             semantic_chunks,
             lexical_chunks,
         );
-        ranked.sort_by(|left, right| right.score().total_cmp(&left.score()));
+        ranked.sort_by(compare_ranked_candidates);
         let selected = select_diverse(ranked, query.limit.get(), query.aggregate);
         let memory_selection = selected
             .iter()
@@ -412,6 +412,23 @@ impl SearchEngine {
             results: search_projection::fit_search_context(results),
         })
     }
+}
+
+fn compare_ranked_candidates(
+    left: &RankedCandidate,
+    right: &RankedCandidate,
+) -> std::cmp::Ordering {
+    right
+        .score()
+        .total_cmp(&left.score())
+        // Extracted memories are denser evidence than source chunks. Prefer them
+        // when independent modality rankings produce the same RRF score.
+        .then_with(|| match (left, right) {
+            (RankedCandidate::Memory(_), RankedCandidate::Chunk(_)) => std::cmp::Ordering::Less,
+            (RankedCandidate::Chunk(_), RankedCandidate::Memory(_)) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| left.id().cmp(&right.id()))
 }
 
 /// Lexical ranking is valuable for identifiers and exact facts, but needlessly
@@ -570,5 +587,28 @@ mod tests {
         );
         assert_eq!(results.len(), 1);
         assert!(results[0].score() > 0.03);
+    }
+
+    #[test]
+    fn equal_rrf_scores_prefer_memory_evidence_deterministically() {
+        let mut results = [
+            RankedCandidate::Chunk(storage::ChunkCandidate {
+                chunk_id: 1,
+                stable_id: "chunk".to_owned(),
+                document_id: "document".to_owned(),
+                ordinal: 0,
+                semantic_score: Some(0.5),
+                lexical_rank: None,
+            }),
+            RankedCandidate::Memory(storage::MemoryCandidate {
+                id: "memory".to_owned(),
+                semantic_score: Some(0.5),
+                lexical_rank: None,
+            }),
+        ];
+
+        results.sort_by(compare_ranked_candidates);
+
+        assert!(matches!(results[0], RankedCandidate::Memory(_)));
     }
 }

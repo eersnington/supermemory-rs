@@ -37,6 +37,30 @@ Environment variables override the file for an experiment:
 | `SUPERMEMORY_EMBEDDING_MAX_ITEMS` | 1-128 |
 | `SUPERMEMORY_EMBEDDING_MAX_PADDED_TOKENS` | 512-32768 |
 
+## Frozen search gate
+
+Before changing retrieval, record the ranked responses from a populated run:
+
+```sh
+scripts/run-frozen-search-benchmark.sh record \
+  .performance/runs/RUN/data/supermemory.db \
+  .performance/memorybench/data/runs/RUN/results \
+  .performance/frozen-search-baseline.json
+```
+
+Then check candidate changes against the same database and questions:
+
+```sh
+scripts/run-frozen-search-benchmark.sh check \
+  .performance/runs/RUN/data/supermemory.db \
+  .performance/memorybench/data/runs/RUN/results \
+  .performance/frozen-search-baseline.json
+```
+
+The check fails if any ranked response changes or search p95 exceeds 75 ms.
+This is a non-regression gate, not a relevance score: record the baseline only
+from a run whose retrieval quality has already been reviewed.
+
 ## Reproduce
 
 Set `GOOGLE_API_KEY` and ensure the local BGE model and ONNX Runtime paths exist. Each command builds a release binary, creates a fresh database, and writes artifacts under `.performance/runs/<run-id>/`.
