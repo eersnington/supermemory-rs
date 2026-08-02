@@ -1,88 +1,45 @@
 # supermemory-rs
 
-<img width="1468" height="807" alt="image" src="https://github.com/user-attachments/assets/7c86ad07-9a88-4262-acd9-fd5e47986037" />
+<img width="1468" height="807" alt="supermemory-rs landing page" src="https://github.com/user-attachments/assets/7c86ad07-9a88-4262-acd9-fd5e47986037" />
 
----
+`supermemory-rs` is a low-memory Rust implementation of [Supermemory Local](https://github.com/supermemoryai/supermemory), based on `supermemory-server` v0.0.6. It keeps the local API and memory model while replacing the JavaScript runtime, PGlite, and workflow engine with Tokio, Axum, SQLite, and ONNX Runtime.
 
-A low-memory Rust reimplementation of [Supermemory Local](https://github.com/supermemoryai/supermemory), based on `supermemory-server` [v0.0.6 release](https://github.com/supermemoryai/supermemory/releases/tag/server-v0.0.6).
+It works with the JavaScript and Python SDK smoke flows. It is not yet a complete replacement. See [verification](docs/verification.md) and [compatibility limits](#compatibility-limits).
 
-The goal is to run the same local Supermemory service with a much smaller memory footprint. Instead of Bun, Hono, PGlite, Drizzle, Rivet, and Transformers.js, this port uses Tokio, Axum, SQLite, rusqlite, and ONNX Runtime in a single process. Supermemory's API and memory behavior should remain the same; the runtime underneath it is what changes.
+## Run it
 
-> ⚠️ Note: This is still a work in progress. The implemented routes work with the Supermemory SDKs, but some v0.0.6 behavior is not available yet.
-
-## Why this exists
-
-`supermemory-server` carries a large JavaScript runtime, an embedded Postgres database, and a separate workflow engine. That is expensive for a service meant to run on a small local machine.
-
-`supermemory-rs` replaces that infrastructure while preserving Supermemory-specific behavior:
-
-- V3 document ingestion and lookup
-- V3 and V4 semantic search
-- Memory extraction, reconciliation, versioning, and forgetting
-- Memory relationships and profile projection
-- Container tags, metadata filters, and organization-scoped data
-- Local BGE embeddings with the same 768-dimensional model
-- Migration from an existing `~/.supermemory` installation
-
-See the [semantic porting guidelines](docs/semantic-porting.md) for the compatibility rules that guide the implementation.
-
-## How it works
-
-1. Ingestion stores the document and a revision-scoped job in SQLite, then returns immediately.
-2. A document worker chunks the content, generates local BGE embeddings, and publishes the chunks and vectors together.
-3. With an LLM provider configured, ten memory workers extract memories concurrently. Provider calls run outside the database lock. SQLite stores retries and cached extraction output, then reconciles memory versions, relationships, and sources in a transaction.
-4. Search embeds the query locally and ranks normalized vector blobs with a registered SQLite cosine function. Filters run before ranking, and V4 responses use a 4,000-byte context budget.
-
-SQLite uses one controlled writer and five pooled search connections. Interrupted jobs resume after restart, and revision checks prevent stale workers from publishing over newer documents. Fatal storage failures put the service into a degraded state.
-
-## Requirements
+Requirements:
 
 - Rust 1.88 or newer
-- The BGE tokenizer and ONNX model under `~/.supermemory/models/Xenova/bge-base-en-v1.5`
-- The ONNX Runtime library used by Supermemory under `~/.supermemory/runtime/ort-native/`
-
-The model and runtime paths can be changed with `--model` and `--ort-library`, or with `SUPERMEMORY_MODEL` and `SUPERMEMORY_ORT_LIBRARY`.
-
-## Install and run
+- BGE model assets in `~/.supermemory/models/Xenova/bge-base-en-v1.5`
+- ONNX Runtime from `~/.supermemory/runtime/ort-native/`
 
 ```sh
 just install
 supermemory-rs
 ```
 
-Or install directly with Cargo:
-
-```sh
-cargo install --path crates/supermemory --locked
-```
-
-Both commands install the executable at `~/.cargo/bin/supermemory-rs`. Run the install command again after updating the source.
-
-To run directly from the checkout during development:
+Or, from a checkout:
 
 ```sh
 cargo run -p supermemory
 ```
 
-The server listens on `127.0.0.1:6767` and stores its database and configuration in `~/.supermemory-rs`.
+The service listens on `127.0.0.1:6767`. By default, data lives in `~/.supermemory-rs`.
 
-Other startup options:
+| Option | Environment variable | Purpose |
+| --- | --- | --- |
+| `--bind` | `SUPERMEMORY_BIND` | Listen address |
+| `--database` | `SUPERMEMORY_DATABASE` | SQLite database path |
+| `--model` | `SUPERMEMORY_MODEL` | BGE model directory |
+| `--ort-library` | `SUPERMEMORY_ORT_LIBRARY` | ONNX Runtime library |
+| `--monitor` | `SUPERMEMORY_MONITOR` | Show live RSS in an interactive terminal |
 
-```text
---bind <address>          SUPERMEMORY_BIND
---database <path>        SUPERMEMORY_DATABASE
---model <path>           SUPERMEMORY_MODEL
---ort-library <path>     SUPERMEMORY_ORT_LIBRARY
---monitor                SUPERMEMORY_MONITOR
-```
+Open [localhost:6767](http://localhost:6767) for the local page. API reference: `/v4/reference`; OpenAPI: `/v4/openapi`.
 
-Use `--monitor` in an interactive terminal to show current and peak process memory below the startup summary.
+## Use it
 
-Open [http://localhost:6767](http://localhost:6767) for the local landing page. The API reference is available at `/v4/reference`, and the OpenAPI document is at `/v4/openapi`.
-
-## Add and search documents
-
-Local requests do not need an authorization header when the TCP connection comes directly from an IPv4 or IPv6 loopback address.
+Loopback requests do not need a bearer token.
 
 ```sh
 curl -X POST http://127.0.0.1:6767/v3/documents \
@@ -94,72 +51,43 @@ curl -X POST http://127.0.0.1:6767/v4/search \
   -d '{"q":"kingfisher","limit":10,"searchMode":"documents"}'
 ```
 
-Document ingestion is asynchronous. `POST /v3/documents` returns the document ID and its current status; use `GET /v3/documents/:id` to follow processing.
+Ingestion returns before background indexing finishes. Poll `GET /v3/documents/:id` for status.
 
-V4 search supports three modes:
+V4 search modes:
 
-- `memories` searches extracted memories
-- `documents` searches document chunks
-- `hybrid` searches both and gives memory results a small ranking boost
+- `memories`: extracted facts
+- `documents`: document chunks
+- `hybrid`: both
 
-The executable loads the local embedding model at startup. Document and memory search both require it.
+## Memory extraction and configuration
 
-## Memory extraction
+An LLM provider is optional. Without one, the service still stores, embeds, and searches documents but does not extract memories.
 
-An LLM provider is optional. Without one, the server still chunks, embeds, stores, and searches documents, but it does not extract memories.
-
-On an interactive first run, choose OpenAI, Anthropic, Gemini, or skip provider setup. The selected key is encrypted in `~/.supermemory-rs/env.enc` with owner-only file permissions.
-
-For unattended startup, set one of these variables:
+On an interactive first run, choose a provider. For unattended startup, set one key:
 
 | Provider | Environment variable |
 | --- | --- |
-| OpenAI or OpenAI-compatible | `OPENAI_API_KEY` |
+| OpenAI or compatible endpoint | `OPENAI_API_KEY` |
 | Anthropic | `ANTHROPIC_API_KEY` |
 | Gemini | `GEMINI_API_KEY` |
 | Groq | `GROQ_API_KEY` |
 
-When several keys are present, the server chooses OpenAI, Anthropic, Gemini, then Groq. Set `OPENAI_BASE_URL` for an OpenAI-compatible endpoint.
+When more than one key is present, the order is OpenAI, Anthropic, Gemini, then Groq. Use `OPENAI_BASE_URL` for a compatible OpenAI endpoint.
 
-Provider models live in `~/.supermemory-rs/config.toml`:
+`~/.supermemory-rs/config.toml` is created on first run. It contains provider model names and bounded performance settings with inline comments. The default embedding batch is deliberately small (`4` items, `1024` padded tokens) to keep indexing memory bounded. See [performance experiments](docs/performance.md) before changing it.
 
-```toml
-[providers.openai]
-model = "gpt-5.6-luna"
-reasoning_effort = "medium"
+## Authentication and migration
 
-[providers.anthropic]
-model = "claude-haiku-4-5"
-
-[providers.gemini]
-model = "gemini-3.5-flash"
-
-[providers.groq]
-model = "openai/gpt-oss-120b"
-```
-
-Model names are read from this file rather than environment variables.
-
-## Authentication
-
-The server creates a local API key in `~/.supermemory-rs/api-key`. Set `SUPERMEMORY_API_KEY` to supply your own key, especially when binding to a non-loopback address.
-
-Send the key as a bearer token:
+The server creates an API key at `~/.supermemory-rs/api-key`. Set `SUPERMEMORY_API_KEY` when binding beyond loopback, then send it as a bearer token:
 
 ```sh
 curl http://127.0.0.1:6767/v3/documents/doc_id \
   -H "Authorization: Bearer $SUPERMEMORY_API_KEY"
 ```
 
-Loopback authentication is based on the TCP peer address. A reverse proxy on the same machine appears to be a local client, so do not expose an unauthenticated local proxy.
+Loopback access is based on the TCP peer address. Do not expose a local reverse proxy without authentication.
 
-## Move from Supermemory Local
-
-On first startup, `supermemory-rs` imports compatible organizations, API keys, documents, chunks, vectors, memories, relations, sources, spaces, and provider credentials from `~/.supermemory`. It writes the imported data to `~/.supermemory-rs` and leaves the original Supermemory Local data unchanged.
-
-## Document identity
-
-Custom IDs are scoped by the exact ordered `containerTags` array used during creation. `GET /v3/documents/:id` cannot accept tags and falls back from an internal ID to a custom ID. If the same custom ID exists under more than one ordered tag array, which matching document is returned is unspecified.
+On first startup, the service imports compatible data and credentials from `~/.supermemory`, writes the result under `~/.supermemory-rs`, and leaves the source data unchanged.
 
 ## Development
 
@@ -168,13 +96,10 @@ cargo fmt --all --check
 cargo check --workspace --locked
 cargo lint
 cargo test --workspace --locked
-cargo nextest run --workspace --locked
 ```
 
-`cargo lint` runs Clippy across the workspace with warnings denied. `cargo nextest` requires a separate installation.
+See [semantic porting guidelines](docs/semantic-porting.md) for compatibility rules.
 
 ## Compatibility limits
 
-This is not a complete replacement for `supermemory-server` yet. Missing work includes file and URL extraction, temporal query parsing, provider-backed query rewriting, adjacent-chunk context, Workers AI reranking, batch forgetting, direct memory mutation routes, and parts of profile generation. Sentence and Markdown splitting also differ in some edge cases.
-
-The current compatibility and resource measurements are documented in [docs/verification.md](docs/verification.md).
+Missing work includes file and URL extraction, temporal query parsing, provider-backed query rewriting, adjacent-chunk context, Workers AI reranking, batch forgetting, direct memory mutation routes, and parts of profile generation. Some sentence and Markdown chunking edge cases also differ from `supermemory-server`.

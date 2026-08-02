@@ -1,177 +1,69 @@
-# Performance Experiment Protocol
+# Performance
 
-Do not alter more than one runtime policy in a run. A result is comparable only
-when it uses the pinned MemoryBench commit, the same episode set, provider
-model, answer model, machine, and release binary.
+This project optimizes for bounded memory first, then indexing time. Do not compare runs that use different code, models, episode/question sets, machine load, or cache state.
 
-## Runtime Controls
+## Current result
 
-The server logs the selected limits at startup. These environment variables are
-intended for experiments; invalid values fall back to `config.toml`.
+These one-off runs used the pinned five-question LoCoMo sample, 95 episodes, Gemini 2.5 Flash extraction, local BGE embeddings, and provider concurrency 8 on August 2, 2026.
 
-New installations write these defaults to `~/.supermemory-rs/config.toml` (or
-next to an explicitly configured database). They are explained inline in the
-file. The `4 / 1024` embedding default is the memory-safe choice from the
-initial measurements; it remains subject to the repeat protocol below.
+| Embedding batch | Indexing mean | Mean RSS | Peak RSS |
+| --- | ---: | ---: | ---: |
+| Old default: `32 / 8192` | 434 s | 286 MiB | 849 MiB |
+| `8 / 2048` | 433 s | 206 MiB | 420 MiB |
+| Current default: `4 / 1024` | 441 s | 249 MiB | 264 MiB |
 
-| Variable | Default | Allowed range | Purpose |
-| --- | ---: | ---: | --- |
-| `SUPERMEMORY_PROVIDER_CONCURRENCY` | 8 | 1-16 | In-flight provider extraction requests |
-| `SUPERMEMORY_EMBEDDING_QUEUE_CAPACITY` | 64 | 1-1024 | Bounded embedding requests waiting for inference |
-| `SUPERMEMORY_EMBEDDING_MAX_ITEMS` | 32 | 1-128 | Maximum inputs in one ONNX batch |
-| `SUPERMEMORY_EMBEDDING_MAX_PADDED_TOKENS` | 8192 | 512-32768 | Maximum batch item-count times longest token length |
+Large batches did not improve end-to-end indexing, because provider extraction dominated the run. Smaller batches cut the memory peak sharply. The current default is `4 / 1024` because it had the lowest observed peak.
 
-The server emits structured events for `memory extraction completed`,
-`embedding_batch`, and `sqlite_write`. Run with `RUST_LOG=server=debug,memory_engine=info`
-to retain writer queue wait observations.
+These are single runs, not a final benchmark result. Provider output varies, so the retrieval and answer scores from these runs are not evidence that batch size affects quality.
 
-## Objective
+## Configure
 
-Reject a configuration when any hard constraint fails:
+New installations write these settings, with comments, to `~/.supermemory-rs/config.toml` or beside a custom database:
 
-| Constraint | Initial limit |
+```toml
+[performance]
+provider_concurrency = 8
+embedding_queue_capacity = 64
+embedding_max_items = 4
+embedding_max_padded_tokens = 1024
+```
+
+Environment variables override the file for an experiment:
+
+| Variable | Range |
 | --- | ---: |
-| Ready RSS | <= 225 MiB |
-| Mean workload RSS | <= 320 MiB |
-| Peak workload RSS | <= 500 MiB |
-| Search p95 | <= 75 ms |
-| Retrieval quality | Non-inferior on frozen questions |
+| `SUPERMEMORY_PROVIDER_CONCURRENCY` | 1-16 |
+| `SUPERMEMORY_EMBEDDING_QUEUE_CAPACITY` | 1-1024 |
+| `SUPERMEMORY_EMBEDDING_MAX_ITEMS` | 1-128 |
+| `SUPERMEMORY_EMBEDDING_MAX_PADDED_TOKENS` | 512-32768 |
 
-Among qualifying configurations, minimize indexing wall time. Then minimize
-search p95 and provider token use. Do not use Gemini answer correctness from a
-five-question sample as an optimization signal.
+## Reproduce
 
-## Run Record
-
-Store one directory per run with:
-
-```text
-configuration.env
-server.log
-rss.csv                 # timestamp, rss_kib
-memorybench-report.json
-rss-summary.json
-```
-
-The run record must include the git commit, binary hash, benchmark commit,
-machine model, provider model, answer model, question IDs, episode IDs, start
-and end timestamps, and all runtime controls.
-
-Run one experiment with:
-
-```sh
-bash scripts/run-locomo-experiment.sh
-```
-
-Set `SUPERMEMORY_RUN_ID` to an explicit identifier. The runner creates a fresh
-database at `.performance/runs/<run-id>/`, persists server logs and RSS samples,
-and never deletes another run's artifacts.
-
-## Initial Batch-Geometry Results
-
-These single runs used the pinned five-question LoCoMo sample, 95 episodes,
-Gemini 2.5 Flash extraction, local BGE embeddings, and provider concurrency 8
-on August 2, 2026. They establish that the ONNX padded-token limit controls the
-workload memory peak. They do not select a production default: provider output
-and latency vary between runs, and each configuration needs randomized repeats.
-
-| Batch geometry | Indexing mean | Mean RSS | Peak RSS | Largest padded batch |
-| --- | ---: | ---: | ---: | ---: |
-| Default: 32 items / 8192 tokens | 434 s | 286 MiB | 849 MiB | 8140 tokens |
-| 8 items / 2048 tokens | 433 s | 206 MiB | 420 MiB | 2028 tokens |
-| 4 items / 1024 tokens | 441 s | 249 MiB | 264 MiB | 1014 tokens |
-
-The large default batch showed no indexing-time benefit over either bounded
-configuration. Provider extraction, rather than local embedding, dominated the
-end-to-end wall time. Writer queue waits were negligible in these runs.
-
-Artifacts are retained locally under `.performance/runs/` and intentionally
-ignored by version control.
-
-### Reproduce
-
-Set `GOOGLE_API_KEY`, ensure the local model and ONNX Runtime paths from the
-runner exist, then run each command from the repository root. Use new run IDs
-for every repetition.
+Set `GOOGLE_API_KEY` and ensure the local BGE model and ONNX Runtime paths exist. Each command builds a release binary, creates a fresh database, and writes artifacts under `.performance/runs/<run-id>/`.
 
 ```sh
 SUPERMEMORY_RUN_ID=default-r1 \
   bash scripts/run-locomo-experiment.sh
 
-SUPERMEMORY_RUN_ID=geometry-8x2048-r1 \
+SUPERMEMORY_RUN_ID=batch-8x2048-r1 \
 SUPERMEMORY_EMBEDDING_MAX_ITEMS=8 \
 SUPERMEMORY_EMBEDDING_MAX_PADDED_TOKENS=2048 \
   bash scripts/run-locomo-experiment.sh
-
-SUPERMEMORY_RUN_ID=geometry-4x1024-r1 \
-SUPERMEMORY_EMBEDDING_MAX_ITEMS=4 \
-SUPERMEMORY_EMBEDDING_MAX_PADDED_TOKENS=1024 \
-  bash scripts/run-locomo-experiment.sh
 ```
 
-Each run writes `configuration.env`, `binary.sha256`, `server.log`, `rss.csv`,
-`rss-summary.json`, and `memorybench-report.json`. Compare medians only after
-at least three randomized repetitions per geometry.
+The run directory contains the effective configuration, binary hash, server log, RSS samples, restart RSS, and MemoryBench report. It is ignored by version control.
 
-## Experiment Sequence
+For all LoCoMo questions, set `SUPERMEMORY_BENCH_LIMIT=1986`. This has significant provider cost.
 
-### 1. Establish a Reference
+## Before changing defaults
 
-Run the current defaults three times on the pinned 95-episode corpus. Randomize
-run order in every later experiment. Record median and range; never compare a
-single run to a different single run.
+Use at least three randomized repetitions per configuration. Reject a configuration if it exceeds any of these initial limits:
 
-### 2. Attribute Embedding Memory
+| Metric | Limit |
+| --- | ---: |
+| Ready RSS | 225 MiB |
+| Mean workload RSS | 320 MiB |
+| Peak workload RSS | 500 MiB |
+| Search p95 | 75 ms |
 
-Keep provider concurrency fixed at 8. Run each configuration at least three
-times:
-
-```text
-items/padded tokens
-4/1024
-8/2048
-16/4096
-32/8192
-32/2048
-8/8192
-```
-
-Inspect `embedding_batch` events alongside `rss.csv`.
-
-- RSS tracks padded tokens: ONNX sequence workspace dominates.
-- RSS tracks item count: per-item intermediates dominate.
-- RSS stays high after one batch: ONNX arena retention dominates.
-- RSS grows before inference: queued prepared inputs dominate.
-
-Choose the smallest memory-safe geometry before changing provider concurrency.
-
-### 3. Find the Provider-Concurrency Knee
-
-Fix the selected embedding geometry. Test provider concurrency `1, 2, 4, 6, 8,
-10`, three randomized repetitions each. Record provider p50/p95 duration,
-rate-limit retries, input/output tokens, indexing wall time, and RSS.
-
-Choose the smallest value within 5% of the fastest median indexing time that
-does not violate a hard constraint.
-
-### 4. Freeze Search Evaluation
-
-Build one database snapshot and execute the same fixed question set for every
-search policy. Use at least 100 questions while selecting policies and the full
-available set for final acceptance. Measure Hit@K, precision, recall, MRR,
-NDCG, duplicate@K, complete-fact coverage, context tokens, and p50/p95/p99.
-
-Compare semantic only, lexical only, always hybrid, and conditional hybrid.
-Retain a policy only when it is non-inferior on retrieval quality and improves a
-measured resource or latency metric.
-
-## Non-Comparable Runs
-
-Do not compare runs that differ in any of these conditions:
-
-- cold versus warm model or SQLite page cache
-- source build time included in workload time
-- changed question or episode IDs
-- changed provider, model, prompt, or rate-limit state
-- concurrent unrelated machine load
-- answer-model correctness without fixed retrieval artifacts
+Among qualifying configurations, choose the fastest median indexing time. Then test provider concurrency `1, 2, 4, 6, 8, 10` with the selected embedding geometry. Retrieval policy changes need a frozen corpus of at least 100 questions; do not use a five-question Gemini answer score to select them.
