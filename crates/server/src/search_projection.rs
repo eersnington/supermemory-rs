@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use super::SearchResult;
 
-const SEARCH_CONTEXT_BUDGET_BYTES: usize = 4_000;
+const SEARCH_CONTEXT_BUDGET_BYTES: usize = 5_000;
 // Reserve enough budget for at least one later complete result.
 const MAX_RESULT_CONTEXT_BYTES: usize = SEARCH_CONTEXT_BUDGET_BYTES / 2;
 
@@ -95,7 +95,7 @@ impl std::io::Write for ByteCounter {
 mod tests {
     use serde_json::Map;
 
-    use super::{super::*, fit_search_context};
+    use super::{super::*, MAX_RESULT_CONTEXT_BYTES, fit_search_context};
 
     fn memory(text: String) -> SearchResult {
         SearchResult::Memory(MemorySearchResult {
@@ -145,8 +145,10 @@ mod tests {
 
     #[test]
     fn budgeting_considers_later_facts_after_an_oversized_fact() {
-        let results =
-            fit_search_context(vec![memory("a".repeat(2_100)), memory("kept".to_owned())]);
+        let results = fit_search_context(vec![
+            memory("a".repeat(MAX_RESULT_CONTEXT_BYTES + 1)),
+            memory("kept".to_owned()),
+        ]);
 
         assert!(matches!(
             &results[0],
